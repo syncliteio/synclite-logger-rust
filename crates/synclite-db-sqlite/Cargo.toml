@@ -1,0 +1,18 @@
+[package]
+name = "synclite-db-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SQLite backend for the SyncLite logger."
+
+[dependencies]
+synclite-core.workspace = true
+synclite-db-traits.workspace = true
+synclite-log.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

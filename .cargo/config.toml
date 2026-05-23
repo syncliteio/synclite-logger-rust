@@ -1,0 +1,3 @@
+[env]
+# Always use prebuilt/downloaded native libraries for fast builds.
+DUCKDB_DOWNLOAD_LIB = "true"

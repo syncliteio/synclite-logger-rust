@@ -1,0 +1,15 @@
+[package]
+name = "synclite-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+synclite-core.workspace = true
+synclite-config.workspace = true
+synclite-db-traits.workspace = true
+synclite.workspace = true

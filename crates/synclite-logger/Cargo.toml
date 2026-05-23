@@ -1,0 +1,37 @@
+[package]
+name = "synclite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Top-level facade that wires a SyncLite device, shipper, and archivers from a single config file."
+
+[lib]
+name = "synclite"
+
+[features]
+default = []
+# Enable the S3 archiver via synclite-archiver's matching feature.
+s3 = ["synclite-archiver/s3"]
+# Enable the SFTP archiver via synclite-archiver's matching feature.
+sftp = ["synclite-archiver/sftp"]
+
+[dependencies]
+synclite-core.workspace = true
+synclite-config.workspace = true
+synclite-db-traits.workspace = true
+synclite-db-sqlite.workspace = true
+synclite-db-duckdb.workspace = true
+synclite-archiver.workspace = true
+synclite-shipper.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+duckdb.workspace = true
+uuid.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true

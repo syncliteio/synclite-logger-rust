@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/synclite-core",
+    "crates/synclite-config",
+    "crates/synclite-metadata",
+    "crates/synclite-db-traits",
+    "crates/synclite-log",
+    "crates/synclite-db-sqlite",
+    "crates/synclite-db-duckdb",
+    "crates/synclite-archiver",
+    "crates/synclite-shipper",
+    "crates/synclite-logger",
+    "crates/synclite-runtime",
+    "crates/synclite-bindings-c",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "Apache-2.0"
+authors = ["SyncLite contributors"]
+repository = "https://github.com/synclite/synclite"
+homepage = "https://www.synclite.io"
+
+[workspace.dependencies]
+# Core
+thiserror = "1.0"
+anyhow = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+regex = "1.11"
+
+# Config
+serde = { version = "1.0", features = ["derive"] }
+java-properties = "2.0"
+
+# Metadata DB (Cargo-managed bundled SQLite; much lighter than DuckDB source builds)
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# DuckDB (linked/prebuilt only; no bundled native source builds)
+# Pin exact duckdb-rs release that maps to DuckDB 1.5.2 (Java uses 1.5.2.0).
+duckdb = { version = "=1.10502.0" }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Concurrency
+parking_lot = "0.12"
+
+# Filesystem
+fs2 = "0.4"
+
+# Async runtime + AWS SDK (S3 archiver, optional)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-credential-types = { version = "1", default-features = false }
+aws-smithy-types = { version = "1", default-features = false }
+
+# SFTP archiver (optional)
+russh = { version = "0.45" }
+russh-sftp = { version = "2.0" }
+russh-keys = { version = "0.45" }
+async-trait = "0.1"
+
+# Internal crates (path deps resolved at workspace root)
+synclite-core = { path = "crates/synclite-core" }
+synclite-config = { path = "crates/synclite-config" }
+synclite-metadata = { path = "crates/synclite-metadata" }
+synclite-db-traits = { path = "crates/synclite-db-traits" }
+synclite-log = { path = "crates/synclite-log" }
+synclite-db-sqlite = { path = "crates/synclite-db-sqlite" }
+synclite-db-duckdb = { path = "crates/synclite-db-duckdb" }
+synclite-archiver = { path = "crates/synclite-archiver" }
+synclite-shipper = { path = "crates/synclite-shipper" }
+synclite = { path = "crates/synclite-logger", package = "synclite" }
+synclite-logger = { path = "crates/synclite-logger", package = "synclite" }
+synclite-runtime = { path = "crates/synclite-runtime" }
+
+# Test-only
+tempfile = "3.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

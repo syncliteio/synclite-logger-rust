@@ -1,0 +1,15 @@
+[package]
+name = "synclite-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Configuration loader for the SyncLite logger (synclite_logger.conf)."
+
+[dependencies]
+synclite-core.workspace = true
+serde.workspace = true
+java-properties.workspace = true
+thiserror.workspace = true
