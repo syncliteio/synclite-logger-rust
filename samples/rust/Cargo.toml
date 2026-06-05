@@ -1,0 +1,54 @@
+[package]
+name = "synclite-logger-rust-samples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone package (not part of the workspace) so building the samples does
+# not perturb the main workspace. Path deps point at the in-tree crates.
+# If you copy this folder out of the platform repo, replace the path
+# dependencies with published versions:
+#
+#   synclite = "0.1"
+#
+[workspace]
+
+[dependencies]
+synclite = { path = "../../crates/synclite" }
+logger-core = { path = "../../crates/logger/core" }
+logger-db-traits = { path = "../../crates/logger/db-traits" }
+rusqlite = { version = "0.39", features = ["bundled"] }
+duckdb = { version = "1.4", features = ["bundled"] }
+postgres = "0.19"
+
+[[example]]
+name = "synclite_rusqlite"
+path = "synclite_rusqlite.rs"
+
+[[example]]
+name = "synclite_rusqlite_postgres"
+path = "synclite_rusqlite_postgres.rs"
+
+[[example]]
+name = "synclite_rusqlite_store"
+path = "synclite_rusqlite_store.rs"
+
+[[example]]
+name = "synclite_duckdb"
+path = "synclite_duckdb.rs"
+
+[[example]]
+name = "synclite_duckdb_store"
+path = "synclite_duckdb_store.rs"
+
+[[example]]
+name = "synclite_streaming"
+path = "synclite_streaming.rs"
+
+[[example]]
+name = "synclite_device_artifacts_demo"
+path = "synclite_device_artifacts_demo.rs"
+
+[[example]]
+name = "synclite_reinitialize"
+path = "synclite_reinitialize.rs"

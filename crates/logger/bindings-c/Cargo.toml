@@ -1,0 +1,22 @@
+[package]
+name = "synclite-c"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "synclite_c"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+logger-runtime.workspace = true
+logger-db-traits.workspace = true
+logger-core.workspace = true
+synclite.workspace = true
+
+
+

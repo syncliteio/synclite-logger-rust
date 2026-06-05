@@ -1,0 +1,18 @@
+[package]
+name = "synclite-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+file-rotate = "0.7"
+time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "logger-db-duckdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "DuckDB backend for the SyncLite logger."
+
+[dependencies]
+logger-core.workspace = true
+logger-db-traits.workspace = true
+logger-log.workspace = true
+duckdb.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+duckdb.workspace = true
+rusqlite.workspace = true
+
+
+

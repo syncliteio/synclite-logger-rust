@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "synclite"
+version = "0.1.0"
+description = "Python bindings for the SyncLite Rust runtime (logger + embedded consolidator)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SyncLite contributors" }]
+requires-python = ">=3.8"
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://www.synclite.io"
+Repository = "https://github.com/synclite/synclite"
+
+[tool.maturin]
+manifest-path = "../crates/logger/bindings-python/Cargo.toml"
+module-name = "synclite._native"
+python-source = "src"
+features = []
+strip = true
