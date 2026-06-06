@@ -1,0 +1,20 @@
+[package]
+name = "logger-bindings-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+synclite.workspace = true
+logger-db-traits.workspace = true
+logger-core.workspace = true
+logger-config.workspace = true
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }

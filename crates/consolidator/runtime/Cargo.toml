@@ -1,0 +1,28 @@
+[package]
+name = "consolidator-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Consolidator worker runtime and destination apply engine."
+
+[lib]
+name = "consolidator_runtime"
+
+[dependencies]
+consolidator-core.workspace = true
+consolidator-state.workspace = true
+logger-core.workspace = true
+tracing.workspace = true
+synclite-observability.workspace = true
+rusqlite.workspace = true
+duckdb.workspace = true
+postgres.workspace = true
+fs2.workspace = true
+libloading = "0.8"
+prometheus.workspace = true
+
+

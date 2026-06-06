@@ -1,0 +1,53 @@
+[package]
+name = "synclite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Top-level facade that wires a SyncLite device, shipper, and archivers from a single config file."
+include = [
+    "src/**/*",
+    "build.rs",
+    "native/libsynclitecdc_x86_64.so",
+    "native/libsynclitecdc_x86.so",
+    "native/synclitecdc_x86_64.dll",
+    "native/synclitecdc_x86.dll",
+    "Cargo.toml",
+    "README.md",
+]
+
+[lib]
+name = "synclite"
+
+[features]
+default = []
+# Enable the S3 archiver via logger-archiver's matching feature.
+s3 = ["logger-archiver/s3"]
+# Enable the SFTP archiver via logger-archiver's matching feature.
+sftp = ["logger-archiver/sftp"]
+
+[dependencies]
+logger-core.workspace = true
+logger-config.workspace = true
+logger-db-traits.workspace = true
+logger-db-sqlite.workspace = true
+logger-db-duckdb.workspace = true
+logger-archiver.workspace = true
+logger-shipper.workspace = true
+consolidator-core.workspace = true
+consolidator-runtime.workspace = true
+tracing.workspace = true
+synclite-observability.workspace = true
+rusqlite.workspace = true
+duckdb.workspace = true
+postgres.workspace = true
+uuid.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+
+

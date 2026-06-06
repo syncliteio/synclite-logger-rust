@@ -1,18 +1,26 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "samples",
+]
 members = [
-    "crates/synclite-core",
-    "crates/synclite-config",
-    "crates/synclite-metadata",
-    "crates/synclite-db-traits",
-    "crates/synclite-log",
-    "crates/synclite-db-sqlite",
-    "crates/synclite-db-duckdb",
-    "crates/synclite-archiver",
-    "crates/synclite-shipper",
-    "crates/synclite-logger",
-    "crates/synclite-runtime",
-    "crates/synclite-bindings-c",
+    "crates/logger/core",
+    "crates/logger/config",
+    "crates/logger/metadata",
+    "crates/logger/db-traits",
+    "crates/logger/log",
+    "crates/logger/db-sqlite",
+    "crates/logger/db-duckdb",
+    "crates/logger/archiver",
+    "crates/logger/shipper",
+    "crates/consolidator/core",
+    "crates/consolidator/state",
+    "crates/consolidator/runtime",
+    "crates/synclite",
+    "crates/logger/runtime",
+    "crates/logger/bindings-c",
+    "crates/logger/bindings-python",
+    "crates/observability",
 ]
 
 [workspace.package]
@@ -33,7 +41,14 @@ regex = "1.11"
 
 # Config
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 java-properties = "2.0"
+
+# Prometheus exposition library. We do NOT enable the `push` feature: it
+# transitively pulls reqwest -> native-tls -> openssl-sys, which is a
+# nightmare to cross-compile. Monitor (consolidator-runtime) ships its own
+# tiny raw-TCP pusher in `monitor::send_http_post`.
+prometheus = { version = "0.13", default-features = false }
 
 # Metadata DB (Cargo-managed bundled SQLite; much lighter than DuckDB source builds)
 rusqlite = { version = "0.39", features = ["bundled"] }
@@ -41,6 +56,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # DuckDB (linked/prebuilt only; no bundled native source builds)
 # Pin exact duckdb-rs release that maps to DuckDB 1.5.2 (Java uses 1.5.2.0).
 duckdb = { version = "=1.10502.0" }
+postgres = "0.19"
 
 # Logging / tracing
 tracing = "0.1"
@@ -66,18 +82,21 @@ russh-keys = { version = "0.45" }
 async-trait = "0.1"
 
 # Internal crates (path deps resolved at workspace root)
-synclite-core = { path = "crates/synclite-core" }
-synclite-config = { path = "crates/synclite-config" }
-synclite-metadata = { path = "crates/synclite-metadata" }
-synclite-db-traits = { path = "crates/synclite-db-traits" }
-synclite-log = { path = "crates/synclite-log" }
-synclite-db-sqlite = { path = "crates/synclite-db-sqlite" }
-synclite-db-duckdb = { path = "crates/synclite-db-duckdb" }
-synclite-archiver = { path = "crates/synclite-archiver" }
-synclite-shipper = { path = "crates/synclite-shipper" }
-synclite = { path = "crates/synclite-logger", package = "synclite" }
-synclite-logger = { path = "crates/synclite-logger", package = "synclite" }
-synclite-runtime = { path = "crates/synclite-runtime" }
+logger-core = { package = "logger-core", path = "crates/logger/core" }
+logger-config = { package = "logger-config", path = "crates/logger/config" }
+logger-metadata = { package = "logger-metadata", path = "crates/logger/metadata" }
+logger-db-traits = { package = "logger-db-traits", path = "crates/logger/db-traits" }
+logger-log = { package = "logger-log", path = "crates/logger/log" }
+logger-db-sqlite = { package = "logger-db-sqlite", path = "crates/logger/db-sqlite" }
+logger-db-duckdb = { package = "logger-db-duckdb", path = "crates/logger/db-duckdb" }
+logger-archiver = { package = "logger-archiver", path = "crates/logger/archiver" }
+logger-shipper = { package = "logger-shipper", path = "crates/logger/shipper" }
+consolidator-core = { path = "crates/consolidator/core" }
+consolidator-state = { path = "crates/consolidator/state" }
+consolidator-runtime = { path = "crates/consolidator/runtime" }
+synclite = { path = "crates/synclite", package = "synclite" }
+logger-runtime = { package = "logger-runtime", path = "crates/logger/runtime" }
+synclite-observability = { path = "crates/observability" }
 
 # Test-only
 tempfile = "3.10"
@@ -86,3 +105,5 @@ tempfile = "3.10"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+

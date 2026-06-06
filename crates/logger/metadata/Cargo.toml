@@ -1,0 +1,18 @@
+[package]
+name = "logger-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Metadata manager (status, sequence numbers) for the SyncLite logger."
+
+[dependencies]
+logger-core.workspace = true
+rusqlite.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+
+
+

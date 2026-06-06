@@ -1,0 +1,39 @@
+[package]
+name = "logger-archiver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pluggable staging archivers for the SyncLite logger."
+
+[features]
+default = ["fs"]
+# Each remote backend lives behind its own feature so embedders pull only
+# the dependencies they actually use.
+fs = []
+s3 = ["dep:tokio", "dep:aws-config", "dep:aws-sdk-s3", "dep:aws-credential-types", "dep:aws-smithy-types"]
+sftp = ["dep:tokio", "dep:russh", "dep:russh-sftp", "dep:russh-keys", "dep:async-trait"]
+# Placeholders to be implemented in later phases:
+# kafka = []
+
+[dependencies]
+logger-core.workspace = true
+tracing.workspace = true
+
+tokio = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+russh-keys = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+
+

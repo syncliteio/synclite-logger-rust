@@ -1,0 +1,27 @@
+[package]
+name = "logger-shipper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Background worker that ships finalized log segments through one or more archivers."
+
+[dependencies]
+logger-core.workspace = true
+logger-archiver.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+logger-archiver = { workspace = true, features = ["fs"] }
+logger-db-sqlite.workspace = true
+logger-db-traits.workspace = true
+logger-core.workspace = true
+tempfile.workspace = true
+rusqlite.workspace = true
+
+
+
