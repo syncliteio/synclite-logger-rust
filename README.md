@@ -594,10 +594,7 @@ to `SyncLite::initialize`, the runtime extracts the binary to
 `SYNCLITE_CDC_LIB_DIR`. No extra files to bundle, no extra steps for
 your end users — `cargo add synclite` is enough.
 
-If you want to override the bundled binary (e.g., to ship a patched
-build or pin a known location), set `SYNCLITE_CDC_LIB_DIR` yourself
-before calling `initialize`; the runtime honors the override and skips
-extraction. On hosts without an embedded prebuilt (e.g., macOS today),
+On hosts without an embedded prebuilt (e.g., macOS today),
 the loader falls back to its standard search path: `SYNCLITE_CDC_LIB_DIR`,
 the workspace `native/` directory, then the system loader path.
 
