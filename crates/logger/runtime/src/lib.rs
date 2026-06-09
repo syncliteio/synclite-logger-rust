@@ -405,27 +405,27 @@ mod tests {
     #[test]
     fn transactional_device_defaults_to_async() {
         let cfg = SyncLiteConfig::default();
-        assert!(should_use_async_logger(DeviceType::Sqlite, &cfg));
+        assert!(should_use_async_logger(DeviceType::SQLITE, &cfg));
     }
 
     #[test]
     fn transactional_device_honors_disable_async_flag() {
         let mut cfg = SyncLiteConfig::default();
         cfg.disable_async_logging_for_txn_device = Some(true);
-        assert!(!should_use_async_logger(DeviceType::DuckDb, &cfg));
+        assert!(!should_use_async_logger(DeviceType::DUCKDB, &cfg));
     }
 
     #[test]
     fn appender_device_defaults_to_sync() {
         let cfg = SyncLiteConfig::default();
-        assert!(!should_use_async_logger(DeviceType::SqliteStore, &cfg));
+        assert!(!should_use_async_logger(DeviceType::SQLITE_STORE, &cfg));
     }
 
     #[test]
     fn appender_device_honors_enable_async_flag() {
         let mut cfg = SyncLiteConfig::default();
         cfg.enable_async_logging_for_appender_device = Some(true);
-        assert!(should_use_async_logger(DeviceType::SqliteStore, &cfg));
+        assert!(should_use_async_logger(DeviceType::SQLITE_STORE, &cfg));
     }
 }
 

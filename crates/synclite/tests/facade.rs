@@ -67,7 +67,7 @@ fn user_home_dir() -> PathBuf {
 }
 
 fn test_home() -> PathBuf {
-    user_home_dir().join("synclite").join("tests")
+    user_home_dir().join("synclite").join("test").join("rustruntime")
 }
 
 fn rm_rf(path: &Path) {
@@ -224,7 +224,7 @@ fn testrustSqliteSqliteShip() {
     .unwrap();
 
     synclite::initialize(
-        logger_core::DeviceType::Sqlite,
+        logger_core::DeviceType::SQLITE,
         "testdevice",
         &db,
         None,
@@ -317,7 +317,7 @@ fn testrustDuckdbDuckdbShip() {
     .unwrap();
 
     synclite::initialize(
-        logger_core::DeviceType::DuckDb,
+        logger_core::DeviceType::DUCKDB,
         "testdevice",
         &db,
         None,
@@ -381,7 +381,7 @@ fn testrustSqliteSqliteNoDestination() {
     .unwrap();
 
     synclite::initialize(
-        logger_core::DeviceType::Sqlite,
+        logger_core::DeviceType::SQLITE,
         "testdevice",
         &db,
         None,
@@ -544,7 +544,7 @@ fn testrustSqlitestoreSqliteConsolidate() {
     .unwrap();
 
     synclite::initialize(
-        logger_core::DeviceType::SqliteStore,
+        logger_core::DeviceType::SQLITE_STORE,
         "testdevice",
         &db,
         None,
@@ -620,18 +620,22 @@ fn testrustSqlitestoreSqliteConsolidate() {
 
     let checkpoint_seq: i64 = dst
         .query_row(
-            "SELECT cdc_log_segment_sequence_number FROM synclite_metadata",
+            "SELECT cdc_log_segment_sequence_number FROM synclite_checkpoint",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert!(checkpoint_seq >= 0);
 
-    wait_for_min_row_count(&dest_db, "synclite_table_schema", 1);
+    wait_for_min_i64(
+        &dest_db,
+        "SELECT COUNT(*) FROM synclite_consolidator_table_metadata WHERE prop_key = 'create_sql'",
+        1,
+    );
 
     let init_status: i64 = dst
         .query_row(
-            "SELECT initialization_status FROM synclite_metadata ORDER BY commit_id DESC LIMIT 1",
+            "SELECT initialization_status FROM synclite_checkpoint ORDER BY commit_id DESC LIMIT 1",
             [],
             |r| r.get(0),
         )
@@ -766,7 +770,7 @@ fn testrustSqliteSqliteFanoutIndexed() {
     .unwrap();
 
     synclite::initialize(
-        logger_core::DeviceType::Sqlite,
+        logger_core::DeviceType::SQLITE,
         "testdevice",
         &db,
     None,
@@ -816,7 +820,7 @@ fn testrustSqliteSqliteNativeLock() {
     .unwrap();
 
     synclite::initialize(
-        logger_core::DeviceType::Sqlite,
+        logger_core::DeviceType::SQLITE,
         "testdevice",
         &db,
         None,

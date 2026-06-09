@@ -233,7 +233,14 @@ fn sqlite_tables(c: &SqlConn) -> Result<Vec<String>> {
     let mut s = c
         .prepare(
             "SELECT name FROM sqlite_master \
-             WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+             WHERE type='table' \
+               AND name NOT IN ( \
+                   'synclite_txn', \
+                   'synclite_dbreader_checkpoint', \
+                   'synclite_logreader_checkpoint', \
+                   'replay_checkpoint', \
+                   'sqlite_sequence' \
+               )",
         )
         .map_err(map_sql_err)?;
     let mapped = s

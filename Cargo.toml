@@ -20,6 +20,7 @@ members = [
     "crates/logger/runtime",
     "crates/logger/bindings-c",
     "crates/logger/bindings-python",
+    "crates/logger/bindings-java",
     "crates/observability",
 ]
 

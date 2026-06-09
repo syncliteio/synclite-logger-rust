@@ -22,7 +22,7 @@ local-data-stage-directory=synclite-stage\n"
 
     // Explicit initialize variant with device type + config path.
     synclite::initialize(
-        DeviceType::DuckDbStore,
+        DeviceType::DUCKDB_STORE,
         DEVICE_NAME,
         DB_PATH,
         None,
@@ -33,11 +33,11 @@ local-data-stage-directory=synclite-stage\n"
     )?;
 
     // Destination-aware shape:
-    // synclite::initialize(DeviceType::DuckDbStore, DEVICE_NAME, DB_PATH, None, synclite::SyncLiteOptions::default())?;
+    // synclite::initialize(DeviceType::DUCKDB_STORE, DEVICE_NAME, DB_PATH, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDbStore,
+    //     DeviceType::DUCKDB_STORE,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {
@@ -50,7 +50,7 @@ local-data-stage-directory=synclite-stage\n"
 
     // SQLite destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDbStore,
+    //     DeviceType::DUCKDB_STORE,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {
@@ -63,7 +63,7 @@ local-data-stage-directory=synclite-stage\n"
 
     // DuckDB destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDbStore,
+    //     DeviceType::DUCKDB_STORE,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {

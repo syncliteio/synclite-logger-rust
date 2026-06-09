@@ -20,7 +20,7 @@ fn fresh_workspace(tag: &str) -> (PathBuf, PathBuf) {
 
 fn init_session(name: &str, db: &Path, dst: &Path) {
     synclite::initialize(
-        DeviceType::Sqlite,
+        DeviceType::SQLITE,
         name,
         db,
         Some(DestinationOptions {

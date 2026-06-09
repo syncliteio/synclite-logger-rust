@@ -45,7 +45,7 @@ impl Connection {
     pub fn initialize<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let device_name = derive_device_name(db_path.as_ref());
         crate::initialize(
-            DeviceType::Sqlite,
+            DeviceType::SQLITE,
             &device_name,
             db_path.as_ref(),
             None,
@@ -76,7 +76,7 @@ impl Connection {
             .clone()
             .unwrap_or_else(|| derive_device_name(&db_path));
         crate::initialize(
-            DeviceType::Sqlite,
+            DeviceType::SQLITE,
             &device_name,
             db_path,
             None,

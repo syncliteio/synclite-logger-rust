@@ -1,13 +1,17 @@
 //! Reinitialize integration tests.
 //!
 //! Drives `synclite::reinitialize` end-to-end for all five
-//! `DeviceType` values (Sqlite, SqliteStore, DuckDb, DuckDbStore,
-//! Streaming) under both `clean_destination={false,true}`, plus a
-//! trigger-file variant. After each reinit the test resumes the
-//! *normal* initialize → write → flush → await_sync → close flow
-//! and confirms the destination receives the new rows. SQLite-backed
-//! devices ship to a SQLite destination; DuckDB-backed devices ship
-//! to a DuckDB destination.
+//! `DeviceType` values under both `DstSyncMode::Replication` and
+//! `DstSyncMode::Consolidation`. Reinit wipes synclite footprint and
+//! drops a `.reinit` sentinel that forces the next initialize to
+//! re-seed with `dst-object-init-mode-1=OVERWRITE_OBJECT` —
+//! REPLICATION drops and recreates destination tables, CONSOLIDATION
+//! truncates this device's rows. Either way the post-reinit re-seed
+//! is duplicate-free. Each test seeds, reinits, then resumes the
+//! normal initialize → write → flush → await_sync → close flow and
+//! confirms the destination contains exactly the source rows.
+//! SQLite-backed devices ship to SQLite; DuckDB-backed devices ship
+//! to DuckDB.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,8 +32,8 @@ enum Backend {
 
 fn backend_for(dt: DeviceType) -> Backend {
     match dt {
-        DeviceType::Sqlite | DeviceType::SqliteStore | DeviceType::Streaming => Backend::Sqlite,
-        DeviceType::DuckDb | DeviceType::DuckDbStore => Backend::DuckDb,
+        DeviceType::SQLITE | DeviceType::SQLITE_STORE | DeviceType::STREAMING => Backend::Sqlite,
+        DeviceType::DUCKDB | DeviceType::DUCKDB_STORE => Backend::DuckDb,
     }
 }
 
@@ -80,10 +84,6 @@ fn init_session_with_mode(
         SyncLiteOptions::default(),
     )
     .expect("initialize");
-}
-
-fn init_session(dt: DeviceType, device_name: &str, db: &Path, dst: &Path) {
-    init_session_with_mode(dt, device_name, db, dst, DstSyncMode::Consolidation);
 }
 
 fn write_rows(dt: DeviceType, db: &Path, rows: &[(i64, &str)]) {
@@ -177,120 +177,124 @@ fn dst_count(dt: DeviceType, dst: &Path, table: &str) -> i64 {
     }
 }
 
-/// Seed → reinit(preserve) → re-run normal flow with disjoint ids.
-fn run_preserve(dt: DeviceType, name: &str) {
-    let (db, dst) = fresh_workspace(&format!("preserve-{name}"), dt);
+/// Seed (2 rows) → reinit → re-init → write (2 more rows). The
+/// user's source DB still holds the original 2 rows, so the
+/// post-reinit re-seed pushes them through the initial backup again
+/// (`OVERWRITE_OBJECT` ensures no duplicates against any residue),
+/// then the 2 new writes flow over CDC. Final destination row count
+/// is the full 4-row source snapshot in both modes.
+fn run_reinit(dt: DeviceType, name: &str, mode: DstSyncMode) {
+    let (db, dst) = fresh_workspace(&format!("reinit-{name}"), dt);
 
-    init_session(dt, name, &db, &dst);
+    init_session_with_mode(dt, name, &db, &dst, mode);
     write_rows(dt, &db, &[(1, "a"), (2, "b")]);
     let uuid_before = read_uuid(&db);
     assert_eq!(dst_count(dt, &dst, "items"), 2, "{name} initial seed");
 
-    synclite::reinitialize(&db, false).expect("reinitialize");
+    synclite::reinitialize(&db).expect("reinitialize");
     assert_eq!(read_uuid(&db), uuid_before, "{name} uuid must survive");
-    assert!(dst_table_exists(dt, &dst, "items"), "{name} table preserved");
 
-    init_session(dt, name, &db, &dst);
+    init_session_with_mode(dt, name, &db, &dst, mode);
     write_rows(dt, &db, &[(5, "x"), (6, "y")]);
-    let total = dst_count(dt, &dst, "items");
-    assert!(
-        total >= 4,
-        "{name} post-reinit re-seed: expected >=4 rows in dst, got {total}"
-    );
-}
-
-/// Seed → reinit(clean) in REPLICATION mode → owned user tables gone
-/// → re-run normal flow. In replication mode the destination belongs
-/// to a single device, so dropping is safe and expected.
-fn run_clean(dt: DeviceType, name: &str) {
-    let (db, dst) = fresh_workspace(&format!("clean-{name}"), dt);
-
-    init_session_with_mode(dt, name, &db, &dst, DstSyncMode::Replication);
-    write_rows(dt, &db, &[(1, "a"), (2, "b")]);
-    let uuid_before = read_uuid(&db);
-
-    synclite::reinitialize(&db, true).expect("reinitialize");
-    assert_eq!(read_uuid(&db), uuid_before, "{name} uuid must survive");
-    assert!(
-        !dst_table_exists(dt, &dst, "items"),
-        "{name} items must be dropped in replication mode"
-    );
-
-    init_session_with_mode(dt, name, &db, &dst, DstSyncMode::Replication);
-    write_rows(dt, &db, &[(10, "x"), (11, "y")]);
-    assert_eq!(dst_count(dt, &dst, "items"), 2, "{name} clean re-seed");
-}
-
-/// In CONSOLIDATION mode the destination is shared across multiple
-/// devices, so `clean_destination=true` MUST NOT drop user tables —
-/// that would be catastrophic for sibling devices. The metadata
-/// rows for this device are still cleaned.
-fn run_clean_consolidation_is_noop(dt: DeviceType, name: &str) {
-    let (db, dst) = fresh_workspace(&format!("clean-cons-{name}"), dt);
-
-    init_session(dt, name, &db, &dst);
-    write_rows(dt, &db, &[(1, "a"), (2, "b")]);
-
-    synclite::reinitialize(&db, true).expect("reinitialize");
     assert!(
         dst_table_exists(dt, &dst, "items"),
-        "{name} items must survive a clean reinit in consolidation mode"
+        "{name} items must be present after re-seed"
+    );
+    assert_eq!(
+        dst_count(dt, &dst, "items"),
+        4,
+        "{name} post-reinit re-seed should land exactly the 4-row source snapshot"
     );
 }
 
 #[test]
-fn sqlite_reinit_preserve() {
-    run_preserve(DeviceType::Sqlite, "sqlitedev");
+fn sqlite_reinit_consolidation() {
+    run_reinit(DeviceType::SQLITE, "sqlitedev", DstSyncMode::Consolidation);
 }
 
 #[test]
-fn sqlite_reinit_clean() {
-    run_clean(DeviceType::Sqlite, "sqlitedev");
+fn sqlite_reinit_replication() {
+    run_reinit(
+        DeviceType::SQLITE,
+        "sqlitedevrep",
+        DstSyncMode::Replication,
+    );
 }
 
 #[test]
-fn sqlitestore_reinit_preserve() {
-    run_preserve(DeviceType::SqliteStore, "sqlitestoredev");
+fn sqlitestore_reinit_consolidation() {
+    run_reinit(
+        DeviceType::SQLITE_STORE,
+        "sqlitestoredev",
+        DstSyncMode::Consolidation,
+    );
 }
 
 #[test]
-fn sqlitestore_reinit_clean() {
-    run_clean(DeviceType::SqliteStore, "sqlitestoredev");
+fn sqlitestore_reinit_replication() {
+    run_reinit(
+        DeviceType::SQLITE_STORE,
+        "sqlitestoredevrep",
+        DstSyncMode::Replication,
+    );
 }
 
 #[test]
-fn duckdb_reinit_preserve() {
-    run_preserve(DeviceType::DuckDb, "duckdbdev");
+fn duckdb_reinit_consolidation() {
+    run_reinit(DeviceType::DUCKDB, "duckdbdev", DstSyncMode::Consolidation);
 }
 
 #[test]
-fn duckdb_reinit_clean() {
-    run_clean(DeviceType::DuckDb, "duckdbdev");
+fn duckdb_reinit_replication() {
+    run_reinit(
+        DeviceType::DUCKDB,
+        "duckdbdevrep",
+        DstSyncMode::Replication,
+    );
 }
 
 #[test]
-fn duckdbstore_reinit_preserve() {
-    run_preserve(DeviceType::DuckDbStore, "duckdbstoredev");
+fn duckdbstore_reinit_consolidation() {
+    run_reinit(
+        DeviceType::DUCKDB_STORE,
+        "duckdbstoredev",
+        DstSyncMode::Consolidation,
+    );
 }
 
 #[test]
-fn duckdbstore_reinit_clean() {
-    run_clean(DeviceType::DuckDbStore, "duckdbstoredev");
+fn duckdbstore_reinit_replication() {
+    run_reinit(
+        DeviceType::DUCKDB_STORE,
+        "duckdbstoredevrep",
+        DstSyncMode::Replication,
+    );
 }
 
 #[test]
-fn streaming_reinit_preserve() {
-    run_preserve(DeviceType::Streaming, "streamingdev");
+fn streaming_reinit_consolidation() {
+    run_reinit(
+        DeviceType::STREAMING,
+        "streamingdev",
+        DstSyncMode::Consolidation,
+    );
 }
 
 #[test]
-fn streaming_reinit_clean() {
-    run_clean(DeviceType::Streaming, "streamingdev");
+fn streaming_reinit_replication() {
+    run_reinit(
+        DeviceType::STREAMING,
+        "streamingdevrep",
+        DstSyncMode::Replication,
+    );
 }
 
+/// A trigger file `reinitialize.<device-name>` dropped alongside the
+/// device DB must cause the next `synclite::initialize` to fire
+/// reinit before bringing the logger up, then remove the trigger.
 #[test]
-fn trigger_file_runs_clean_reinit_on_next_initialize() {
-    let dt = DeviceType::Sqlite;
+fn trigger_file_runs_reinit_on_next_initialize() {
+    let dt = DeviceType::SQLITE;
     let name = "trigdev";
     let (db, dst) = fresh_workspace("trigger", dt);
 
@@ -299,24 +303,19 @@ fn trigger_file_runs_clean_reinit_on_next_initialize() {
     let uuid_before = read_uuid(&db);
     assert!(dst_table_exists(dt, &dst, "items"));
 
-    let trigger = db
-        .parent()
-        .unwrap()
-        .join(format!("reinitialize_with_clean_destination.{name}"));
+    let trigger = db.parent().unwrap().join(format!("reinitialize.{name}"));
     std::fs::write(&trigger, b"").unwrap();
 
     init_session_with_mode(dt, name, &db, &dst, DstSyncMode::Replication);
     assert!(!trigger.exists(), "trigger file must be removed");
     assert_eq!(read_uuid(&db), uuid_before);
-    assert!(!dst_table_exists(dt, &dst, "items"));
 
     write_rows(dt, &db, &[(42, "z")]);
-    assert_eq!(dst_count(dt, &dst, "items"), 1);
-}
-
-#[test]
-fn sqlite_reinit_clean_consolidation_is_noop() {
-    run_clean_consolidation_is_noop(DeviceType::Sqlite, "sqlitedevcons");
+    assert_eq!(
+        dst_count(dt, &dst, "items"),
+        3,
+        "post-trigger re-seed should land the full 3-row source snapshot"
+    );
 }
 
 /// Disambiguator: drive a DuckDbStore device but ship to a SQLite
@@ -325,7 +324,7 @@ fn sqlite_reinit_clean_consolidation_is_noop() {
 /// the gap is on the store-device pipeline regardless of destination.
 #[test]
 fn duckdbstore_to_sqlite_dst_preserve() {
-    let dt = DeviceType::DuckDbStore;
+    let dt = DeviceType::DUCKDB_STORE;
     let name = "duckdbstoredevsql";
     let base = std::env::temp_dir()
         .join("synclite-reinit-it")
