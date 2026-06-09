@@ -1,4 +1,4 @@
-﻿//! Parser for SyncLite properties config files.
+//! Parser for SyncLite properties config files.
 //!
 //! The Java logger accepts a Java-properties-style file with keys such as
 //! `device-name`, `local-data-stage-directory`, `device-stage-type`, etc. We
@@ -312,6 +312,25 @@ fn move_alias(props: &mut HashMap<String, String>, from: &str, to: &str) {
 }
 
 fn normalize_key_aliases(props: &mut HashMap<String, String>) {
+    // `<key>-1` is treated as an alias for `<key>` (the bare/canonical
+    // form used for destination 1). Users picking either spelling get
+    // the same behavior. Multi-destination configs keep using `-2`,
+    // `-3`, ... as before. Java parity: `SyncLiteOptions` already lets
+    // destination 1 be addressed by bare keys.
+    let one_suffix_keys: Vec<String> = props
+        .keys()
+        .filter(|k| k.ends_with("-1"))
+        .cloned()
+        .collect();
+    for k in one_suffix_keys {
+        let bare = &k[..k.len() - "-1".len()];
+        // Don't shadow legitimate bare keys, or per-destination keys
+        // whose suffix happens to numerically equal 1 only by accident
+        // (e.g. nothing in the current schema is like that, but the
+        // `move_alias` "to-present-wins" rule covers it either way).
+        move_alias(props, &k, bare);
+    }
+
     // Accept `db-type` (used by other SyncLite tooling) as alias for the
     // canonical `db-engine`.
     move_alias(props, "db-type", "db-engine");
@@ -381,7 +400,7 @@ mod tests {
         m.insert("device-type".into(), "duckdb_store".into());
 
         let cfg = SyncLiteConfig::from_map(m).unwrap();
-        assert_eq!(cfg.device_type, Some(DeviceType::DuckDbStore));
+        assert_eq!(cfg.device_type, Some(DeviceType::DUCKDB_STORE));
     }
 
     #[test]
@@ -390,6 +409,39 @@ mod tests {
         m.insert("db-engine".into(), "h2".into());
         let err = SyncLiteConfig::from_map(m).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn one_suffix_keys_alias_to_bare() {
+        let mut m = HashMap::new();
+        m.insert("device-name".into(), "d".into());
+        m.insert("db-engine".into(), "sqlite".into());
+        m.insert("local-data-stage-directory-1".into(), "/tmp/stage1".into());
+        m.insert("device-stage-type-1".into(), "FS".into());
+
+        let cfg = SyncLiteConfig::from_map(m).unwrap();
+        assert_eq!(
+            cfg.local_stage_dir,
+            Some(PathBuf::from("/tmp/stage1"))
+        );
+        assert_eq!(
+            cfg.extra.get("device-stage-type").map(String::as_str),
+            Some("FS")
+        );
+        assert!(!cfg.extra.contains_key("device-stage-type-1"));
+        assert!(!cfg.extra.contains_key("local-data-stage-directory-1"));
+    }
+
+    #[test]
+    fn bare_key_wins_when_both_forms_present() {
+        let mut m = HashMap::new();
+        m.insert("device-name".into(), "d".into());
+        m.insert("db-engine".into(), "sqlite".into());
+        m.insert("local-data-stage-directory".into(), "/tmp/bare".into());
+        m.insert("local-data-stage-directory-1".into(), "/tmp/one".into());
+
+        let cfg = SyncLiteConfig::from_map(m).unwrap();
+        assert_eq!(cfg.local_stage_dir, Some(PathBuf::from("/tmp/bare")));
     }
 }
 

@@ -49,7 +49,7 @@ fn run_sqlite_demo(root: &Path) -> Result<()> {
     );
 
     synclite::initialize(
-        DeviceType::Sqlite,
+        DeviceType::SQLITE,
         device_name,
         &db_path,
         None,
@@ -60,11 +60,11 @@ fn run_sqlite_demo(root: &Path) -> Result<()> {
     )?;
 
     // Destination-aware shape:
-    // synclite::initialize(DeviceType::Sqlite, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
+    // synclite::initialize(DeviceType::SQLITE, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -77,7 +77,7 @@ fn run_sqlite_demo(root: &Path) -> Result<()> {
 
     // SQLite destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -90,7 +90,7 @@ fn run_sqlite_demo(root: &Path) -> Result<()> {
 
     // DuckDB destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -141,7 +141,7 @@ fn run_duckdb_demo(root: &Path) -> Result<()> {
     );
 
     synclite::initialize(
-        DeviceType::DuckDb,
+        DeviceType::DUCKDB,
         device_name,
         &db_path,
         None,
@@ -152,11 +152,11 @@ fn run_duckdb_demo(root: &Path) -> Result<()> {
     )?;
 
     // Destination-aware shape:
-    // synclite::initialize(DeviceType::DuckDb, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
+    // synclite::initialize(DeviceType::DUCKDB, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -169,7 +169,7 @@ fn run_duckdb_demo(root: &Path) -> Result<()> {
 
     // SQLite destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -182,7 +182,7 @@ fn run_duckdb_demo(root: &Path) -> Result<()> {
 
     // DuckDB destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -233,7 +233,7 @@ fn run_sqlite_bulk_demo(root: &Path) -> Result<()> {
     );
 
     synclite::initialize(
-        DeviceType::Sqlite,
+        DeviceType::SQLITE,
         device_name,
         &db_path,
         None,
@@ -244,11 +244,11 @@ fn run_sqlite_bulk_demo(root: &Path) -> Result<()> {
     )?;
 
     // Destination-aware shape:
-    // synclite::initialize(DeviceType::Sqlite, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
+    // synclite::initialize(DeviceType::SQLITE, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -261,7 +261,7 @@ fn run_sqlite_bulk_demo(root: &Path) -> Result<()> {
 
     // SQLite destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -274,7 +274,7 @@ fn run_sqlite_bulk_demo(root: &Path) -> Result<()> {
 
     // DuckDB destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -358,7 +358,7 @@ fn run_duckdb_bulk_demo(root: &Path) -> Result<()> {
     );
 
     synclite::initialize(
-        DeviceType::DuckDb,
+        DeviceType::DUCKDB,
         device_name,
         &db_path,
         None,
@@ -369,11 +369,11 @@ fn run_duckdb_bulk_demo(root: &Path) -> Result<()> {
     )?;
 
     // Destination-aware shape:
-    // synclite::initialize(DeviceType::DuckDb, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
+    // synclite::initialize(DeviceType::DUCKDB, device_name, &db_path, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -386,7 +386,7 @@ fn run_duckdb_bulk_demo(root: &Path) -> Result<()> {
 
     // SQLite destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {
@@ -399,7 +399,7 @@ fn run_duckdb_bulk_demo(root: &Path) -> Result<()> {
 
     // DuckDB destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     device_name,
     //     &db_path,
     //     Some(synclite::DestinationOptions {

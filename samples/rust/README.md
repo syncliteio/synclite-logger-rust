@@ -76,7 +76,7 @@ SELECT * FROM syncschema.users ORDER BY id;
 
 ```rust
 synclite::initialize(
-    DeviceType::Sqlite,
+    DeviceType::SQLITE,
     DEVICE_NAME,
     DB_PATH,
     Some(DestinationOptions {

@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     const DEVICE_NAME: &str = "sampledevice";
 
     synclite::initialize(
-        DeviceType::DuckDb,
+        DeviceType::DUCKDB,
         DEVICE_NAME,
         DB_PATH,
         None,
@@ -17,11 +17,11 @@ fn main() -> Result<()> {
     )?;
 
     // Destination-aware shape:
-    // synclite::initialize(DeviceType::DuckDb, DEVICE_NAME, DB_PATH, None, synclite::SyncLiteOptions::default())?;
+    // synclite::initialize(DeviceType::DUCKDB, DEVICE_NAME, DB_PATH, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {
@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 
     // SQLite destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
 
     // DuckDB destination example:
     // synclite::initialize(
-    //     DeviceType::DuckDb,
+    //     DeviceType::DUCKDB,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {

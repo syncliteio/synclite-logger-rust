@@ -1113,6 +1113,30 @@ fn rewrite_consolidation_ddl_sql(layout: &ConsolidatorLayout, mapped: &MappedOpe
 
     let upper = sql.trim_start().to_ascii_uppercase();
 
+    // Java consolidation mapper semantics: ADD COLUMN. The raw SQL from
+    // the source backend (Derby / H2 / HSQL / DuckDB / SQLite multi-writer)
+    // may carry destination-incompatible clauses such as `NOT NULL`
+    // without a DEFAULT — SQLite rejects this. Rebuild via
+    // build_add_column_sql which applies destination-dialect quoting,
+    // schema qualification, DataTypeMapper, and drops unsupported
+    // constraint clauses.
+    if op == "ADDCOLUMN" && !table_name.is_empty() {
+        let col_opt = mapped
+            .ddl_columns
+            .iter()
+            .find(|c| !c.column_name.is_empty())
+            .cloned()
+            .or_else(|| parse_add_column_column(sql));
+        if let Some(col) = col_opt {
+            return build_add_column_sql(
+                layout,
+                table_name,
+                &col.column_name,
+                col.column_type.as_deref(),
+            );
+        }
+    }
+
     // Java consolidation mapper semantics: RENAME COLUMN behaves like ADD COLUMN.
     if upper.starts_with("ALTER TABLE") && upper.contains(" RENAME COLUMN ") {
         if let Some(table_name) = extract_table_name_for_operation(sql) {
@@ -1363,11 +1387,10 @@ fn quote_table(layout: &ConsolidatorLayout, name: &str) -> String {
 
 /// Postgres-only: schema-qualify a system metadata table name when
 /// `dst_use_schema_scope_resolution` is on and `dst_schema` is set.
-/// Used for the consolidator-owned bookkeeping tables (`synclite_metadata`,
-/// `synclite_table_schema`, `synclite_consolidator_metadata`,
-/// `synclite_consolidator_table_metadata`) so they live in the same
-/// destination schema as user tables and never collide with stale objects
-/// in `public`.
+/// Used for the consolidator-owned bookkeeping tables (`synclite_checkpoint`,
+/// `synclite_consolidator_metadata`, `synclite_consolidator_table_metadata`)
+/// so they live in the same destination schema as user tables and never
+/// collide with stale objects in `public`.
 fn pg_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
     if layout.dst_use_schema_scope_resolution {
         if let Some(schema) = layout.dst_schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -1687,6 +1710,40 @@ fn collect_stage_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Locate a paired `<dbName>.synclite.backup` + `<dbName>.synclite.metadata`
+/// in the per-device stage directory. The shipper writes both files using
+/// the full DB filename (e.g. `test.db.synclite.backup`), which does not
+/// always match `ConsolidatorLayout.database_name` (the Java helper
+/// `databaseNameOf` strips the trailing extension). Returning `(backup,
+/// metadata)` lets the worker synthesize a `Msg::BootstrapReady` without
+/// the caller knowing the exact name.
+fn find_stage_bootstrap_pair(stage_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let entries = std::fs::read_dir(stage_dir).ok()?;
+    let mut backup: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".synclite.backup") {
+            backup = Some(path);
+            break;
+        }
+    }
+    let backup = backup?;
+    let backup_name = backup.file_name()?.to_str()?;
+    let stem = backup_name.strip_suffix(".synclite.backup")?;
+    let metadata = stage_dir.join(format!("{}.synclite.metadata", stem));
+    if metadata.is_file() {
+        Some((backup, metadata))
+    } else {
+        None
+    }
+}
+
 fn migrate_legacy_state_db(layout: &ConsolidatorLayout) -> Result<()> {
     if layout.metadata_store != MetadataStore::Local {
         return Ok(());
@@ -1769,6 +1826,9 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
     if let Err(e) = consolidator_state::seed_consolidator_identity(&layout, layout.dst_index) {
         tracing::warn!(error = %e, "failed to seed consolidator identity metadata");
     }
+    if let Err(e) = consolidator_state::seed_consolidator_metadata_version(&layout, layout.dst_index) {
+        tracing::warn!(error = %e, "failed to seed consolidator metadata-schema version");
+    }
     match consolidator_state::get_consolidator_property_long(&layout, layout.dst_index, "initialization_status") {
         Ok(Some(1)) => {
             bootstrap_initialized = true;
@@ -1781,10 +1841,10 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
     // segments here instead of applying them. On resume we drain in
     // arrival order through the normal apply path.
     let mut paused_stage_paths: Vec<PathBuf> = Vec::new();
-    let poll_interval = std::time::Duration::from_millis(500);
+    let poll_interval = std::time::Duration::from_millis(layout.device_polling_interval_ms.max(1));
 
     loop {
-        let msg = match rx.recv_timeout(poll_interval) {
+        let mut msg: Option<Msg> = match rx.recv_timeout(poll_interval) {
             Ok(msg) => Some(msg),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1808,9 +1868,77 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
             }
         }
 
-        let Some(msg) = msg else {
-            continue;
-        };
+        if msg.is_none() {
+            // Periodic scan: walk the per-device stage directory and
+            // re-apply any segment that hasn't been consumed yet.
+            // `process_stage_path_ready` is idempotent against the
+            // state DB (already-applied segments are no-ops), so this
+            // is safe to run on every tick. Acts as the safety floor
+            // for push notifications missed by the OS WatchService
+            // or by Java shipping paths that don't fire the JNI
+            // notify hook.
+            if !paused {
+                if let Some(stage_dir) = layout.stage_dir.as_deref() {
+                    if stage_dir.is_dir() {
+                        // Auto-detect bootstrap when the upstream
+                        // logger has shipped both the snapshot and
+                        // metadata into stage but nobody has called
+                        // `notify_bootstrap_ready` yet (Java init
+                        // happens before any files exist, and there
+                        // is no post-ship hook that synthesizes the
+                        // bootstrap notification). The shipped file
+                        // names use the full DB filename
+                        // (e.g. `test.db.synclite.backup`), which
+                        // does not always match `database_name`
+                        // (Java strips the extension), so we glob
+                        // for any matching pair instead of computing
+                        // a name.
+                        if !bootstrap_initialized {
+                            if let Some((backup_candidate, metadata_candidate)) =
+                                find_stage_bootstrap_pair(stage_dir)
+                            {
+                                msg = Some(Msg::BootstrapReady {
+                                    backup_path: backup_candidate,
+                                    metadata_path: metadata_candidate,
+                                });
+                            }
+                        }
+                        if msg.is_none() && bootstrap_initialized {
+                            let mut staged: Vec<PathBuf> = Vec::new();
+                            collect_stage_files_recursive(stage_dir, &mut staged);
+                            staged.sort();
+                            for path in staged {
+                                if is_sqllog_txn_sidecar_path(&path) {
+                                    continue;
+                                }
+                                if !is_apply_candidate_segment(&path) {
+                                    continue;
+                                }
+                                if let Err(e) = process_stage_path_ready(
+                                    &layout,
+                                    &state_conn,
+                                    &stats_conn,
+                                    &consolidator_stats_conn,
+                                    &path,
+                                ) {
+                                    tracing::error!(
+                                        error = %e,
+                                        path = %path.display(),
+                                        "periodic stage scan: failed to apply segment"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if msg.is_none() {
+                continue;
+            }
+            // Fall through with synthesized BootstrapReady so the
+            // existing match arm runs unchanged.
+        }
+        let msg = msg.expect("msg must be Some here");
 
         match msg {
             Msg::BootstrapReady {
@@ -1850,11 +1978,36 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
                 let work_backup_path = if !layout.is_transactional_device() {
                     bootstrap_backup_path.clone()
                 } else {
-                    match mirror_stage_artifact_to_work(&layout, &bootstrap_backup_path) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!(error = %e, path = %bootstrap_backup_path.display(), "failed to mirror staged backup into consolidator work dir");
-                            continue;
+                    // Java parity: the device-shipped `.synclite.backup` is
+                    // the INITIAL snapshot used to seed the destination at
+                    // bootstrap time. After bootstrap the same file in
+                    // workDir doubles as the replicator's working replica:
+                    // sqllog replay (CREATE TABLE / INSERT / UPDATE /
+                    // DELETE) commits into it so preupdate hooks can fire
+                    // on subsequent segments. If we re-copy from stage on
+                    // every BootstrapReady the accumulated replica state is
+                    // wiped, which breaks UPDATE/DELETE replay for SQL
+                    // devices. Only mirror the snapshot the first time;
+                    // afterwards trust the work copy as the live replica.
+                    let file_name = bootstrap_backup_path
+                        .file_name()
+                        .map(|n| n.to_owned())
+                        .unwrap_or_default();
+                    let stage_container = bootstrap_backup_path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("synclite-{}-{}", layout.device_name, layout.device_id));
+                    let work_path = layout.work_dir.join(&stage_container).join(&file_name);
+                    if work_path.exists() {
+                        work_path
+                    } else {
+                        match mirror_stage_artifact_to_work(&layout, &bootstrap_backup_path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!(error = %e, path = %bootstrap_backup_path.display(), "failed to mirror staged backup into consolidator work dir");
+                                continue;
+                            }
                         }
                     }
                 };
@@ -2050,6 +2203,18 @@ fn process_stage_path_ready(
     // cleaned the stage file (e.g. resume-from-pause path).
     let work_path = mirror_stage_artifact_to_work(layout, stage_path)?;
 
+    // Idempotency: if the work copy is already marked APPLIED, the segment
+    // (or the cdclog derived from it for SQL devices) has already been
+    // consolidated into the destination. Skip re-applying — re-running
+    // the apply pipeline would double-count rows. Still run the cleaner
+    // so a re-notification (e.g. shipper `on_shipped` after the work copy
+    // was applied earlier in the same job) can prune stale work artifacts.
+    if segment_metadata_status_is_applied(&work_path) {
+        record_event(state_conn, "stage-path-already-applied", stage_path)?;
+        cleanup_processed_sqllog(layout, state_conn, stage_path, &work_path)?;
+        return Ok(());
+    }
+
     if is_sqllog_path(&work_path) && !last_txn_fate_decided(&work_path)? {
         record_event(state_conn, "stage-path-deferred-undecided-fate", stage_path)?;
         return Ok(());
@@ -2118,6 +2283,28 @@ fn process_stage_path_ready(
     // Cleaner runs after successful apply, matching Java sequencing.
     cleanup_processed_sqllog(layout, state_conn, stage_path, &work_path)?;
     Ok(())
+}
+
+/// Java parity: `LogSegment.isApplied()` — read `metadata.status` from a
+/// segment file (`.sqllog` or `.cdclog`) and return `true` iff it equals
+/// `APPLIED`. Best-effort: a missing file, missing table, missing row, or
+/// any SQLite error returns `false`, matching the Java side's tolerance
+/// for in-flight segments. Used to make the apply pipeline idempotent
+/// across re-notifications (mover, shipper `on_shipped`, restart catch-up).
+fn segment_metadata_status_is_applied(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let conn = match Connection::open(path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT value FROM metadata WHERE key = 'status'",
+        [],
+        |r| r.get(0),
+    );
+    matches!(row, Ok(ref v) if v == "APPLIED")
 }
 
 /// Java parity: `LogSegment.markApplied()` — upsert
@@ -2226,29 +2413,74 @@ fn mark_segment_applied_best_effort(path: &Path) {
     }
 }
 
+// Device-type classification mirrors Java's `SyncLiteLoggerInfo` taxonomy
+// (see synclite-consolidator/.../SyncLiteLoggerInfo.java). The Rust logger
+// only emits artifacts for SQLITE/DUCKDB (sqllog) and SQLITE_STORE/
+// DUCKDB_STORE/STREAMING (cdclog), but the consolidator must accept every
+// Java-recognized device type because shipped artifacts share the same
+// on-disk format regardless of producer.
+//
+// Buckets:
+//   * transactional/SQL  → sqllog, needs DeviceReplicator
+//       SQLITE, DUCKDB, DERBY, H2, HYPERSQL
+//   * appender/store/dblogger/streaming → cdclog (or equivalent),
+//       fed directly to the consolidator with no replicator pass
+//       SQLITE_APPENDER, DUCKDB_APPENDER, DERBY_APPENDER, H2_APPENDER,
+//       HYPERSQL_APPENDER, SQLITE_STORE, DUCKDB_STORE, DERBY_STORE,
+//       H2_STORE, HYPERSQL_STORE, DBLOGGER, STREAMING
 fn is_store_or_streaming_device(layout: &ConsolidatorLayout) -> bool {
     let device_type = layout.device_type.trim().to_ascii_uppercase();
     matches!(
         device_type.as_str(),
-        "SQLITE_STORE" | "DUCKDB_STORE" | "STREAMING"
+        "SQLITE_STORE"
+            | "DUCKDB_STORE"
+            | "DERBY_STORE"
+            | "H2_STORE"
+            | "HYPERSQL_STORE"
+            | "SQLITE_APPENDER"
+            | "DUCKDB_APPENDER"
+            | "DERBY_APPENDER"
+            | "H2_APPENDER"
+            | "HYPERSQL_APPENDER"
+            | "DBLOGGER"
+            | "STREAMING"
     )
 }
 
 #[allow(dead_code)]
 fn is_store_device(layout: &ConsolidatorLayout) -> bool {
     let device_type = layout.device_type.trim().to_ascii_uppercase();
-    matches!(device_type.as_str(), "SQLITE_STORE" | "DUCKDB_STORE")
+    matches!(
+        device_type.as_str(),
+        "SQLITE_STORE" | "DUCKDB_STORE" | "DERBY_STORE" | "H2_STORE" | "HYPERSQL_STORE"
+    )
+}
+
+#[allow(dead_code)]
+fn is_appender_device(layout: &ConsolidatorLayout) -> bool {
+    let device_type = layout.device_type.trim().to_ascii_uppercase();
+    matches!(
+        device_type.as_str(),
+        "SQLITE_APPENDER"
+            | "DUCKDB_APPENDER"
+            | "DERBY_APPENDER"
+            | "H2_APPENDER"
+            | "HYPERSQL_APPENDER"
+    )
 }
 
 #[allow(dead_code)]
 fn is_streaming_device(layout: &ConsolidatorLayout) -> bool {
     let device_type = layout.device_type.trim().to_ascii_uppercase();
-    matches!(device_type.as_str(), "STREAMING")
+    matches!(device_type.as_str(), "STREAMING" | "DBLOGGER")
 }
 
 fn is_sql_device(layout: &ConsolidatorLayout) -> bool {
     let device_type = layout.device_type.trim().to_ascii_uppercase();
-    matches!(device_type.as_str(), "SQLITE" | "DUCKDB")
+    matches!(
+        device_type.as_str(),
+        "SQLITE" | "DUCKDB" | "DERBY" | "H2" | "HYPERSQL"
+    )
 }
 
 fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Path) -> Result<PathBuf> {
@@ -2266,18 +2498,86 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
             work_command_log_path.display()
         ))
     })?;
-    let replay = replay_segment_with_native_cdc(&replica_path, work_command_log_path, seg_seq as i64)?;
 
     let cdc_log_path = layout.device_work_dir.join(format!("{seg_seq}.cdclog"));
-    write_cdclog_segment(&cdc_log_path, &replay.entries, Some(&replay.events))?;
+
+    // Idempotency: if the cdclog for this segment was already produced by an
+    // earlier worker_loop poll, skip the replay. Re-running the replay against
+    // the now-mutated replica produces zero events and would wipe a valid
+    // cdclog (NativeCdcLogWriter::new unconditionally removes its target
+    // file). Detect "already produced" by either (a) status=APPLIED metadata
+    // (destination already consumed it) or (b) any rows in the cdclog table
+    // (writer succeeded; either pending apply or apply in progress).
+    let existing_rows = if cdc_log_path.exists() {
+        Connection::open(&cdc_log_path)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM cdclog", [], |r| r.get::<_, i64>(0)))
+            .ok()
+    } else {
+        None
+    };
+
+    if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+        let exists = cdc_log_path.exists();
+        let pre_rows = existing_rows
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| if exists { "err".to_string() } else { "(no file)".to_string() });
+        let line = format!("[replicator-call] seg={seg_seq} cdclog_exists={exists} pre_rows={pre_rows} cmdlog={}\n",
+            work_command_log_path.display());
+        eprintln!("{}", line.trim_end());
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    if let Some(rows) = existing_rows {
+        if rows > 0 {
+            with_device_tracer(|t| {
+                tracer_info!(
+                    t,
+                    "DeviceReplicator",
+                    "Skipping replicate (cdclog already produced) segment={} rows={} cdcLogPath={}",
+                    work_command_log_path.display(),
+                    rows,
+                    cdc_log_path.display()
+                )
+            });
+            if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+                let line = format!("[replicator-call] skip seg={seg_seq} rows={rows}\n");
+                eprintln!("{}", line.trim_end());
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                    use std::io::Write;
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+            return Ok(cdc_log_path);
+        }
+    }
+
+    // Java parity: when the native CDC library is present, we drive cdclog
+    // writes through `NativeCdcLogWriter` (mirrors
+    // DeviceReplicator+CDCLogger+CDCLogSegmentWriter using bindNativeValue
+    // pointer pass-through). If the library is missing or initialization
+    // fails, we fall back to the legacy rusqlite-based `write_cdclog_segment`.
+    let replay = replay_segment_with_native_cdc(
+        &replica_path,
+        work_command_log_path,
+        seg_seq as i64,
+        &cdc_log_path,
+    )?;
+
+    if !replay.writer_used {
+        write_cdclog_segment(&cdc_log_path, &replay.entries, Some(&replay.events), &replica_path)?;
+    }
     with_device_tracer(|t| {
         tracer_info!(
             t,
             "DeviceReplicator",
-            "Replicated {} command logs from segment : {} (cdcLogPath={})",
+            "Replicated {} command logs from segment : {} (cdcLogPath={}, writer={})",
             replay.entries.len(),
             work_command_log_path.display(),
-            cdc_log_path.display()
+            cdc_log_path.display(),
+            if replay.writer_used { "native" } else { "legacy" }
         )
     });
     Ok(cdc_log_path)
@@ -2326,6 +2626,7 @@ fn resolve_replicator_replica_path(layout: &ConsolidatorLayout) -> Result<PathBu
 struct ReplayOutput {
     entries: Vec<SegmentEntry>,
     events: Vec<CdcEvent>,
+    writer_used: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2354,10 +2655,17 @@ struct CdcEvent {
     commit_id: i64,
     op_type: String,
     table_name: String,
+    before_count: usize,
+    after_count: usize,
     args: Vec<SqlValue>,
 }
 
-fn replay_segment_with_native_cdc(replica_path: &Path, segment_path: &Path, command_log_segment_seq: i64) -> Result<ReplayOutput> {
+fn replay_segment_with_native_cdc(
+    replica_path: &Path,
+    segment_path: &Path,
+    command_log_segment_seq: i64,
+    cdc_log_path: &Path,
+) -> Result<ReplayOutput> {
     let seg_conn = Connection::open(segment_path).map_err(map_sql_err)?;
     let (_first_commit, mut entries) = read_segment_entries(&seg_conn)?;
 
@@ -2372,6 +2680,17 @@ fn replay_segment_with_native_cdc(replica_path: &Path, segment_path: &Path, comm
                 resume.cdc_log_segment_sequence_number
             )
         });
+        if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+            let line = format!("[replay-resume] seg={command_log_segment_seq} resume.cmdSeq={} resume.commit={} resume.cdcSeq={}\n",
+                resume.command_log_segment_sequence_number,
+                resume.commit_id,
+                resume.cdc_log_segment_sequence_number);
+            eprintln!("{}", line.trim_end());
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                use std::io::Write;
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
         // Resume by CDC segment sequence when available; fallback to command-log
         // sequence for legacy checkpoints.
         let resume_segment_seq = if resume.cdc_log_segment_sequence_number > 0 {
@@ -2384,6 +2703,7 @@ fn replay_segment_with_native_cdc(replica_path: &Path, segment_path: &Path, comm
             return Ok(ReplayOutput {
                 entries: Vec::new(),
                 events: Vec::new(),
+                writer_used: false,
             });
         }
         if resume_segment_seq == command_log_segment_seq {
@@ -2391,24 +2711,93 @@ fn replay_segment_with_native_cdc(replica_path: &Path, segment_path: &Path, comm
         }
     }
 
+    let raw_entries_len = entries.len();
     entries = retain_committed_entries(entries);
+    let committed_len = entries.len();
     entries = expand_replay_txn_entries(entries, segment_path, command_log_segment_seq)?;
+    let expanded_len = entries.len();
+    let debug_callback = env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1");
+    if debug_callback {
+        let line = format!("[replay-entries] seg={command_log_segment_seq} raw={raw_entries_len} committed={committed_len} expanded={expanded_len} segment={}\n",
+            segment_path.display());
+        eprintln!("{}", line.trim_end());
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
     if entries.is_empty() {
         return Ok(ReplayOutput {
             entries: Vec::new(),
             events: Vec::new(),
+            writer_used: false,
         });
     }
-
-    let debug_callback = env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1");
 
     match NativeCdc::load() {
         Ok(native) => {
             if debug_callback {
                 eprintln!("[synclite-rust] native CDC library loaded");
             }
-            let events = native.replay(replica_path, &entries, command_log_segment_seq, segment_path)?;
-            Ok(ReplayOutput { entries, events })
+            // Java parity: try to bring up a NativeCdcLogWriter so the cdclog
+            // file is written via prepared statements + bindNativeValue. Fall
+            // back to event-buffering + post-replay assembly if the writer
+            // cannot be created (e.g. file permission or native error).
+            let writer_attempt = NativeCdcLogWriter::new(native.stmt_api(), cdc_log_path);
+            match writer_attempt {
+                Ok(writer) => {
+                    let writer_mutex = Mutex::new(writer);
+                    let replay_res = native.replay(
+                        replica_path,
+                        &entries,
+                        command_log_segment_seq,
+                        segment_path,
+                        Some(&writer_mutex),
+                    );
+                    // Always finalize the writer regardless of replay outcome.
+                    let writer = writer_mutex.into_inner().map_err(|_| {
+                        Error::Internal("cdclog writer mutex poisoned".into())
+                    })?;
+                    let close_res = writer.close();
+                    let events = replay_res?;
+                    close_res?;
+                    if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+                        let n = Connection::open(cdc_log_path)
+                            .and_then(|c| c.query_row("SELECT COUNT(*) FROM cdclog", [], |r| r.get::<_, i64>(0)))
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|e| format!("err: {e}"));
+                        let line = format!("[cdclog-after-close] cdclog rows={} ({})\n", n, cdc_log_path.display());
+                        eprintln!("{}", line.trim_end());
+                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                            use std::io::Write;
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                    }
+                    Ok(ReplayOutput {
+                        entries,
+                        events,
+                        writer_used: true,
+                    })
+                }
+                Err(writer_err) => {
+                    tracing::warn!(
+                        error = %writer_err,
+                        "NativeCdcLogWriter init failed; falling back to legacy cdclog writer"
+                    );
+                    let events = native.replay(
+                        replica_path,
+                        &entries,
+                        command_log_segment_seq,
+                        segment_path,
+                        None,
+                    )?;
+                    Ok(ReplayOutput {
+                        entries,
+                        events,
+                        writer_used: false,
+                    })
+                }
+            }
         }
         Err(load_err) => {
             if debug_callback {
@@ -2421,6 +2810,7 @@ fn replay_segment_with_native_cdc(replica_path: &Path, segment_path: &Path, comm
             Ok(ReplayOutput {
                 entries,
                 events: Vec::new(),
+                writer_used: false,
             })
         }
     }
@@ -2553,7 +2943,7 @@ fn read_replica_resume_checkpoint(replica_path: &Path) -> Result<Option<ReplicaR
 
 fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Option<DestinationResumeCheckpoint>> {
     let sql = "SELECT cdc_log_segment_sequence_number, cdc_change_number \
-               FROM synclite_metadata \
+               FROM synclite_checkpoint \
                WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 \
                ORDER BY commit_id DESC LIMIT 1";
     match layout.dst_type {
@@ -2564,7 +2954,7 @@ fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Opt
             let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
             let has_table = conn
                 .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='synclite_metadata' LIMIT 1",
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='synclite_checkpoint' LIMIT 1",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2592,7 +2982,7 @@ fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Opt
             let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
             let has_table: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'synclite_metadata'",
+                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'synclite_checkpoint'",
                     [],
                     |row| row.get(0),
                 )
@@ -2621,7 +3011,7 @@ fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Opt
             let conn_str = build_postgres_connection_string(layout);
             let mut client = PgClient::connect(&conn_str, NoTls).map_err(map_pg_err)?;
             // Brand-new destination: the consolidator-owned bookkeeping
-            // tables (`synclite_metadata` et al.) only get CREATEd on
+            // tables (`synclite_checkpoint` et al.) only get CREATEd on
             // the first successful apply via `ensure_postgres_metadata_seeded`.
             // Probing before they exist would surface as `42P01
             // undefined_table` and abort the very first segment apply,
@@ -2641,7 +3031,7 @@ fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Opt
                 client
                     .query_one(
                         "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
-                         WHERE table_schema = $1 AND table_name = 'synclite_metadata')",
+                         WHERE table_schema = $1 AND table_name = 'synclite_checkpoint')",
                         &[&schema],
                     )
                     .map_err(map_pg_err)?
@@ -2650,7 +3040,7 @@ fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Opt
                 client
                     .query_one(
                         "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
-                         WHERE table_name = 'synclite_metadata')",
+                         WHERE table_name = 'synclite_checkpoint')",
                         &[],
                     )
                     .map_err(map_pg_err)?
@@ -2659,7 +3049,7 @@ fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Opt
             if !has_table {
                 return Ok(None);
             }
-            let meta = pg_meta_table(layout, "synclite_metadata");
+            let meta = pg_meta_table(layout, "synclite_checkpoint");
             let select_sql = format!(
                 "SELECT cdc_log_segment_sequence_number, cdc_change_number \
                  FROM {meta} \
@@ -2726,6 +3116,7 @@ fn write_cdclog_segment(
     cdclog_path: &Path,
     entries: &[SegmentEntry],
     native_events: Option<&[CdcEvent]>,
+    replica_path: &Path,
 ) -> Result<()> {
     if cdclog_path.exists() {
         std::fs::remove_file(cdclog_path)?;
@@ -2779,7 +3170,8 @@ fn write_cdclog_segment(
     }
 
     let mut next_change_number: i64 = 0;
-    let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut table_columns: HashMap<String, Vec<String>> = load_replica_table_columns(replica_path)?;
+    let mut last_callback_sql: Option<String> = None;
 
     for entry in entries {
         if entry.sql.trim_start().eq_ignore_ascii_case("REPLAY_TXN") {
@@ -2851,6 +3243,11 @@ fn write_cdclog_segment(
             }
         }
 
+        if !matches!(op_type, "INSERT" | "UPDATE" | "DELETE") {
+            // Java parity: callback SQL de-dup cache resets around non-DML transitions.
+            last_callback_sql = None;
+        }
+
         if matches!(op_type, "INSERT" | "UPDATE" | "DELETE") {
             let mut matched_event: Option<CdcEvent> = None;
             if let Some(queue) = events_by_commit.get_mut(&entry.commit_id) {
@@ -2903,14 +3300,25 @@ fn write_cdclog_segment(
                 }
 
                 for (idx, ev) in rows_to_emit.into_iter().enumerate() {
+                    validate_callback_event_shape(&ev, &table_columns)?;
                     let cols = table_columns
                         .get(&ev.table_name.to_ascii_lowercase())
                         .cloned()
                         .unwrap_or_default();
                     let sql_for_event = build_callback_sql(&ev, &entry.sql, &cols);
-                    let row_args = adjust_callback_args_for_sql(&ev);
+                    let row_args = callback_args_java_order(&ev);
+                    let sql_for_event_owned = if last_callback_sql
+                        .as_deref()
+                        .map(|s| s == sql_for_event)
+                        .unwrap_or(false)
+                    {
+                        None
+                    } else {
+                        last_callback_sql = Some(sql_for_event.clone());
+                        Some(sql_for_event)
+                    };
                     let sql_for_event_ref = if idx == 0 {
-                        Some(sql_for_event.as_str())
+                        sql_for_event_owned.as_deref()
                     } else {
                         None
                     };
@@ -2930,14 +3338,25 @@ fn write_cdclog_segment(
 
             if let Some(ev_rows) = events_by_change.remove(&entry.change_number) {
                 for (idx, ev) in ev_rows.into_iter().enumerate() {
+                    validate_callback_event_shape(&ev, &table_columns)?;
                     let cols = table_columns
                         .get(&ev.table_name.to_ascii_lowercase())
                         .cloned()
                         .unwrap_or_default();
                     let sql_for_event = build_callback_sql(&ev, &entry.sql, &cols);
-                    let row_args = adjust_callback_args_for_sql(&ev);
+                    let row_args = callback_args_java_order(&ev);
+                    let sql_for_event_owned = if last_callback_sql
+                        .as_deref()
+                        .map(|s| s == sql_for_event)
+                        .unwrap_or(false)
+                    {
+                        None
+                    } else {
+                        last_callback_sql = Some(sql_for_event.clone());
+                        Some(sql_for_event)
+                    };
                     let sql_for_event_ref = if idx == 0 {
-                        Some(sql_for_event.as_str())
+                        sql_for_event_owned.as_deref()
                     } else {
                         None
                     };
@@ -3228,15 +3647,138 @@ fn build_callback_sql(ev: &CdcEvent, fallback_sql: &str, columns: &[String]) -> 
     fallback_sql.to_string()
 }
 
-fn adjust_callback_args_for_sql(ev: &CdcEvent) -> Vec<SqlValue> {
-    if ev.op_type.eq_ignore_ascii_case("UPDATE") && ev.args.len() % 2 == 0 {
-        let n = ev.args.len() / 2;
-        let mut out = Vec::with_capacity(ev.args.len());
-        out.extend(ev.args[n..].iter().cloned());
-        out.extend(ev.args[..n].iter().cloned());
-        return out;
-    }
+fn callback_args_java_order(ev: &CdcEvent) -> Vec<SqlValue> {
+    // Java parity: UPDATE rows persist before-image values first, then after-image values.
     ev.args.clone()
+}
+
+fn validate_callback_event_shape(
+    ev: &CdcEvent,
+    table_columns: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    let table_key = ev.table_name.to_ascii_lowercase();
+    let cols = table_columns.get(&table_key).ok_or_else(|| {
+        Error::Internal(format!(
+            "native CDC callback received changes for missing table '{}': schema not available",
+            ev.table_name
+        ))
+    })?;
+
+    let op = ev.op_type.to_ascii_uppercase();
+    match op.as_str() {
+        "INSERT" => {
+            if ev.after_count != cols.len() {
+                return Err(Error::Internal(format!(
+                    "native CDC callback after-image width mismatch for table '{}': received {}, expected {}",
+                    ev.table_name,
+                    ev.after_count,
+                    cols.len()
+                )));
+            }
+            if ev.args.len() != ev.after_count {
+                return Err(Error::Internal(format!(
+                    "native CDC callback INSERT argument width mismatch for table '{}': received {}, expected {}",
+                    ev.table_name,
+                    ev.args.len(),
+                    ev.after_count
+                )));
+            }
+        }
+        "UPDATE" => {
+            if ev.before_count != cols.len() {
+                return Err(Error::Internal(format!(
+                    "native CDC callback before-image width mismatch for table '{}': received {}, expected {}",
+                    ev.table_name,
+                    ev.before_count,
+                    cols.len()
+                )));
+            }
+            if ev.after_count != cols.len() {
+                return Err(Error::Internal(format!(
+                    "native CDC callback after-image width mismatch for table '{}': received {}, expected {}",
+                    ev.table_name,
+                    ev.after_count,
+                    cols.len()
+                )));
+            }
+            let expected = ev.before_count + ev.after_count;
+            if ev.args.len() != expected {
+                return Err(Error::Internal(format!(
+                    "native CDC callback UPDATE argument width mismatch for table '{}': received {}, expected {}",
+                    ev.table_name,
+                    ev.args.len(),
+                    expected
+                )));
+            }
+        }
+        "DELETE" => {
+            if ev.before_count != cols.len() {
+                return Err(Error::Internal(format!(
+                    "native CDC callback before-image width mismatch for table '{}': received {}, expected {}",
+                    ev.table_name,
+                    ev.before_count,
+                    cols.len()
+                )));
+            }
+            if ev.args.len() != ev.before_count {
+                return Err(Error::Internal(format!(
+                    "native CDC callback DELETE argument width mismatch for table '{}': received {}, expected {}",
+                    ev.table_name,
+                    ev.args.len(),
+                    ev.before_count
+                )));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn load_replica_table_columns(replica_path: &Path) -> Result<HashMap<String, Vec<String>>> {
+    if !replica_path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let conn = Connection::open(replica_path).map_err(map_sql_err)?;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Exclude SyncLite/replicator internal tables only. Filtering by name
+    // prefix (LIKE 'sqlite\_%') is fragile: `_` is a single-char LIKE
+    // wildcard, so a pattern like 'sqlite_%' silently drops legitimate
+    // user tables such as `sqlitetransactional_table`.
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' \
+               AND name NOT IN ( \
+                   'synclite_txn', \
+                   'synclite_dbreader_checkpoint', \
+                   'synclite_logreader_checkpoint', \
+                   'replay_checkpoint', \
+                   'sqlite_sequence' \
+               )",
+        )
+        .map_err(map_sql_err)?;
+    let mut rows = stmt.query([]).map_err(map_sql_err)?;
+    while let Some(row) = rows.next().map_err(map_sql_err)? {
+        let table_name: String = row.get(0).map_err(map_sql_err)?;
+        let pragma_sql = format!("PRAGMA table_info({})", quote_sqlite_ident(&table_name));
+        let mut p = conn.prepare(&pragma_sql).map_err(map_sql_err)?;
+        let mut pr = p.query([]).map_err(map_sql_err)?;
+        let mut cols = Vec::new();
+        while let Some(crow) = pr.next().map_err(map_sql_err)? {
+            let col_name: String = crow.get(1).map_err(map_sql_err)?;
+            cols.push(col_name);
+        }
+        out.insert(table_name.to_ascii_lowercase(), cols);
+    }
+
+    Ok(out)
+}
+
+fn quote_sqlite_ident(raw: &str) -> String {
+    format!("\"{}\"", raw.replace('"', "\"\""))
 }
 
 fn map_cdclog_op_type(sql: &str) -> &'static str {
@@ -3301,6 +3843,21 @@ struct NativeCdc {
     value_double: unsafe extern "C" fn(*const c_void) -> f64,
     value_text: unsafe extern "C" fn(*const c_void) -> *const c_char,
     value_blob: unsafe extern "C" fn(*const c_void, *mut c_int) -> *const c_void,
+    // Java-parity prepared-statement surface (mirrors
+    // com.synclite.consolidator.nativedb.PreparedStatement JNI methods):
+    prepare: unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> c_int,
+    finalize_stmt: unsafe extern "C" fn(*mut c_void) -> c_int,
+    reset: unsafe extern "C" fn(*mut c_void) -> c_int,
+    clear_bindings: unsafe extern "C" fn(*mut c_void) -> c_int,
+    step: unsafe extern "C" fn(*mut c_void) -> c_int,
+    bind_int: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int,
+    bind_int64: unsafe extern "C" fn(*mut c_void, c_int, i64) -> c_int,
+    bind_double: unsafe extern "C" fn(*mut c_void, c_int, f64) -> c_int,
+    bind_text: unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int,
+    bind_blob: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int) -> c_int,
+    bind_null: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
+    // Java parity: bindNativeValue(int index, long value) — sqlite3_bind_value(sqlite3_value*).
+    bind_value: unsafe extern "C" fn(*mut c_void, c_int, *const c_void) -> c_int,
 }
 
 type NativeChangeCallback = unsafe extern "C" fn(
@@ -3332,6 +3889,19 @@ struct ReplayContext {
     callback_invocations: Mutex<i64>,
     callback_ops: Mutex<HashMap<String, i64>>,
     last_error: Mutex<Option<String>>,
+
+    // Java parity: native writer plumbing. When `writer_ptr` is non-null the
+    // change callback writes cdclog rows directly using `bindNativeValue`
+    // (pointer pass-through), exactly mirroring
+    // `DeviceReplicator.getChanges -> CDCLogger.log -> CDCLogSegment.writeCDCLog`.
+    //
+    // The pointer references a `Mutex<NativeCdcLogWriter>` owned by the caller
+    // of `NativeCdc::replay`; lifetime safety is enforced by the caller (the
+    // writer outlives the replay).
+    writer_ptr: *mut Mutex<NativeCdcLogWriter>,
+    table_columns: Mutex<HashMap<String, Vec<String>>>,
+    last_callback_sql: Mutex<Option<String>>,
+    next_change_number: Mutex<i64>,
 }
 
 unsafe extern "C" fn native_change_callback(
@@ -3352,17 +3922,146 @@ unsafe extern "C" fn native_change_callback(
 
     let op = cstr_to_string(operation).unwrap_or_else(|| "UNKNOWN".to_string());
     let table = cstr_to_string(table_name).unwrap_or_default();
-    let _database = cstr_to_string(database_name).unwrap_or_else(|| "main".to_string());
+    let database = cstr_to_string(database_name).unwrap_or_else(|| "main".to_string());
 
     if table.eq_ignore_ascii_case("replay_checkpoint") {
         return 0;
     }
 
-    let change_number = match ctx.current_change.lock() {
+    let commit_id = match ctx.current_commit.lock() {
         Ok(v) => *v,
         Err(_) => return 1,
     };
-    let commit_id = match ctx.current_commit.lock() {
+
+    if let Ok(mut invocations) = ctx.callback_invocations.lock() {
+        *invocations += 1;
+    }
+    if let Ok(mut op_counts) = ctx.callback_ops.lock() {
+        *op_counts.entry(op.clone()).or_insert(0) += 1;
+    }
+
+    // Java parity: when a writer is configured, write the cdclog row directly
+    // from this callback using pointer pass-through. Values are sqlite3_value*
+    // duped by the native preupdate hook and freed immediately after this
+    // callback returns, so the write must complete before we return.
+    if !ctx.writer_ptr.is_null() {
+        // SAFETY: writer_ptr points to a Mutex<NativeCdcLogWriter> owned by
+        // the caller of replay() and guaranteed to outlive this callback.
+        let writer_mtx = unsafe { &*ctx.writer_ptr };
+
+        // Build raw pointer slices viewing the native arrays directly.
+        let before_slice: &[*const c_void] = if before_image.is_null() || before_count <= 0 {
+            &[]
+        } else {
+            // SAFETY: native preupdate hook hands us an array of before_count entries.
+            unsafe { std::slice::from_raw_parts(before_image, before_count as usize) }
+        };
+        let after_slice: &[*const c_void] = if after_image.is_null() || after_count <= 0 {
+            &[]
+        } else {
+            // SAFETY: native preupdate hook hands us an array of after_count entries.
+            unsafe { std::slice::from_raw_parts(after_image, after_count as usize) }
+        };
+
+        // Width validation against current table schema (Java parity).
+        let cols_for_table: Vec<String> = match ctx.table_columns.lock() {
+            Ok(g) => g
+                .get(&table.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+
+        let op_upper = op.to_ascii_uppercase();
+        if !cols_for_table.is_empty() {
+            let width = cols_for_table.len();
+            let ok = match op_upper.as_str() {
+                "INSERT" => after_slice.len() == width,
+                "UPDATE" => before_slice.len() == width && after_slice.len() == width,
+                "DELETE" => before_slice.len() == width,
+                _ => true,
+            };
+            if !ok {
+                if let Ok(mut err) = ctx.last_error.lock() {
+                    *err = Some(format!(
+                        "native CDC callback width mismatch table='{}' op={} before={} after={} expected={}",
+                        table, op_upper, before_slice.len(), after_slice.len(), width
+                    ));
+                }
+                return 1;
+            }
+        }
+
+        // Synthesized SQL (mirrors DeviceReplicator.buildCallbackSql).
+        let sql_for_event = build_callback_sql_from_pointers(
+            &op_upper,
+            &table,
+            &cols_for_table,
+            before_slice.len(),
+            after_slice.len(),
+        );
+
+        // De-dup: only persist sql when it differs from the prior callback
+        // (Java's lastCallbackSql cache).
+        let sql_text_to_persist: Option<String> = match ctx.last_callback_sql.lock() {
+            Ok(mut last) => {
+                if last.as_deref() == Some(sql_for_event.as_str()) {
+                    None
+                } else {
+                    *last = Some(sql_for_event.clone());
+                    Some(sql_for_event.clone())
+                }
+            }
+            Err(_) => Some(sql_for_event.clone()),
+        };
+
+        let change_number = match ctx.next_change_number.lock() {
+            Ok(mut cn) => {
+                let v = *cn;
+                *cn = v + 1;
+                v
+            }
+            Err(_) => return 1,
+        };
+
+        let mut writer = match writer_mtx.lock() {
+            Ok(w) => w,
+            Err(_) => return 1,
+        };
+        if let Err(e) = writer.write_dml_record(
+            commit_id,
+            Some(&database),
+            None,
+            Some(&table),
+            &op_upper,
+            sql_text_to_persist.as_deref(),
+            change_number,
+            before_slice,
+            after_slice,
+        ) {
+            if let Ok(mut err) = ctx.last_error.lock() {
+                *err = Some(format!("native CDC writer failed: {e}"));
+            }
+            return 1;
+        }
+        // Stats-only event push so legacy callers/diagnostics still see counts.
+        if let Ok(mut events) = ctx.events.lock() {
+            events.push(CdcEvent {
+                change_number,
+                commit_id,
+                op_type: op_upper,
+                table_name: table,
+                before_count: before_slice.len(),
+                after_count: after_slice.len(),
+                args: Vec::new(),
+            });
+        }
+        return 0;
+    }
+
+    // Legacy path (no writer): materialize values and buffer events for
+    // post-replay reconciliation by `write_cdclog_segment`.
+    let change_number = match ctx.current_change.lock() {
         Ok(v) => *v,
         Err(_) => return 1,
     };
@@ -3378,25 +4077,61 @@ unsafe extern "C" fn native_change_callback(
         _ => Vec::new(),
     };
 
-    if let Ok(mut invocations) = ctx.callback_invocations.lock() {
-        *invocations += 1;
-    }
-    if let Ok(mut op_counts) = ctx.callback_ops.lock() {
-        *op_counts.entry(op.clone()).or_insert(0) += 1;
-    }
-
     match ctx.events.lock() {
         Ok(mut events) => events.push(CdcEvent {
             change_number,
             commit_id,
             op_type: op,
             table_name: table,
+            before_count: if before_count > 0 { before_count as usize } else { 0 },
+            after_count: if after_count > 0 { after_count as usize } else { 0 },
             args,
         }),
         Err(_) => return 1,
     }
 
     0
+}
+
+/// Java parity: build the synthesized SQL recorded in cdclog from the table
+/// schema, mirroring `DeviceReplicator.buildCallbackSql`. Returns the same
+/// fallback (qualified table reference) Java falls back to when no schema is
+/// available so de-dup behavior matches.
+fn build_callback_sql_from_pointers(
+    op_upper: &str,
+    table: &str,
+    columns: &[String],
+    before_len: usize,
+    after_len: usize,
+) -> String {
+    if op_upper == "INSERT" && after_len > 0 {
+        let placeholders = (0..after_len).map(|_| "?").collect::<Vec<_>>().join(", ");
+        if !columns.is_empty() && columns.len() == after_len {
+            return format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                table,
+                columns.join(", "),
+                placeholders
+            );
+        }
+        return format!("INSERT INTO {} VALUES ({})", table, placeholders);
+    }
+    if op_upper == "UPDATE" && before_len > 0 && after_len > 0 {
+        let cols = if columns.len() >= after_len { &columns[..after_len] } else { &[][..] };
+        if !cols.is_empty() {
+            let set_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(", ");
+            let where_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(" AND ");
+            return format!("UPDATE {} SET {} WHERE {}", table, set_clause, where_clause);
+        }
+    }
+    if op_upper == "DELETE" && before_len > 0 {
+        let cols = if columns.len() >= before_len { &columns[..before_len] } else { &[][..] };
+        if !cols.is_empty() {
+            let where_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(" AND ");
+            return format!("DELETE FROM {} WHERE {}", table, where_clause);
+        }
+    }
+    format!("{} {}", op_upper, table)
 }
 
 fn cstr_to_string(ptr: *const c_char) -> Option<String> {
@@ -3515,6 +4250,44 @@ impl NativeCdc {
                     .get::<unsafe extern "C" fn(*const c_void, *mut c_int) -> *const c_void>(b"synclite_rs_value_blob\0")
                     .map_err(|e| Error::Internal(format!("load synclite_rs_value_blob: {e}")))?;
 
+                // Prepared-statement / bind surface (Java-parity write path).
+                let prepare = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> c_int>(b"synclite_rs_prepare\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_prepare: {e}")))?;
+                let finalize_stmt = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_finalize\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_finalize: {e}")))?;
+                let reset = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_reset\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_reset: {e}")))?;
+                let clear_bindings = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_clear_bindings\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_clear_bindings: {e}")))?;
+                let step = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_step\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_step: {e}")))?;
+                let bind_int = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int>(b"synclite_rs_bind_int\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_bind_int: {e}")))?;
+                let bind_int64 = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, i64) -> c_int>(b"synclite_rs_bind_int64\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_bind_int64: {e}")))?;
+                let bind_double = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, f64) -> c_int>(b"synclite_rs_bind_double\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_bind_double: {e}")))?;
+                let bind_text = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int>(b"synclite_rs_bind_text\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_bind_text: {e}")))?;
+                let bind_blob = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int) -> c_int>(b"synclite_rs_bind_blob\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_bind_blob: {e}")))?;
+                let bind_null = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int) -> c_int>(b"synclite_rs_bind_null\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_bind_null: {e}")))?;
+                let bind_value = *lib
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_void) -> c_int>(b"synclite_rs_bind_value\0")
+                    .map_err(|e| Error::Internal(format!("load synclite_rs_bind_value: {e}")))?;
+
                 return Ok(Self {
                     _lib: lib,
                     open,
@@ -3529,6 +4302,18 @@ impl NativeCdc {
                     value_double,
                     value_text,
                     value_blob,
+                    prepare,
+                    finalize_stmt,
+                    reset,
+                    clear_bindings,
+                    step,
+                    bind_int,
+                    bind_int64,
+                    bind_double,
+                    bind_text,
+                    bind_blob,
+                    bind_null,
+                    bind_value,
                 });
             }
         }
@@ -3544,6 +4329,7 @@ impl NativeCdc {
         entries: &[SegmentEntry],
         command_log_segment_seq: i64,
         segment_path: &Path,
+        writer: Option<&Mutex<NativeCdcLogWriter>>,
     ) -> Result<Vec<CdcEvent>> {
         let replica_c = CString::new(replica_path.to_string_lossy().to_string())
             .map_err(|e| Error::Internal(format!("replica path contains NUL: {e}")))?;
@@ -3574,6 +4360,41 @@ impl NativeCdc {
                         "ALTER TABLE replay_checkpoint ADD COLUMN cdc_log_segment_sequence_number LONG NOT NULL DEFAULT 0",
                 )?;
 
+        let writer_ptr = writer
+            .map(|w| w as *const Mutex<NativeCdcLogWriter> as *mut Mutex<NativeCdcLogWriter>)
+            .unwrap_or(std::ptr::null_mut());
+        let initial_table_columns = if writer_ptr.is_null() {
+            HashMap::new()
+        } else {
+            match load_replica_table_columns(replica_path) {
+                Ok(m) => {
+                    if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+                        let summary: Vec<String> = m.iter().map(|(k, v)| format!("{}={}", k, v.len())).collect();
+                        let line = format!("[replay-init-cols] seg={command_log_segment_seq} replica={} tables=[{}]\n",
+                            replica_path.display(), summary.join(","));
+                        eprintln!("{}", line.trim_end());
+                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                            use std::io::Write;
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                    }
+                    m
+                }
+                Err(e) => {
+                    if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+                        let line = format!("[replay-init-cols] seg={command_log_segment_seq} replica={} ERR={}\n",
+                            replica_path.display(), e);
+                        eprintln!("{}", line.trim_end());
+                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                            use std::io::Write;
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                    }
+                    HashMap::new()
+                }
+            }
+        };
+
         let ctx = Box::new(ReplayContext {
             api: NativeValueApi {
                 value_type: self.value_type,
@@ -3589,6 +4410,10 @@ impl NativeCdc {
             callback_invocations: Mutex::new(0),
             callback_ops: Mutex::new(HashMap::new()),
             last_error: Mutex::new(None),
+            writer_ptr,
+            table_columns: Mutex::new(initial_table_columns),
+            last_callback_sql: Mutex::new(None),
+            next_change_number: Mutex::new(0),
         });
         let ctx_ptr = Box::into_raw(ctx);
 
@@ -3698,19 +4523,39 @@ impl NativeCdc {
                     self.exec_sql(db, "BEGIN TRANSACTION")?;
                     in_txn = true;
                 }
+                // Java parity: DeviceReplicator.beginTran emits a BEGINTRAN
+                // cdclog row (sql="BEGIN", no table/args) inside the writer txn.
+                // SAFETY: ctx_ptr valid for replay lifetime.
+                let ctx_ref = unsafe { &*ctx_ptr };
+                self.emit_txn_marker_via_writer(ctx_ref, "BEGINTRAN", "BEGIN", entry.commit_id)?;
                 continue;
             }
 
             if sql_norm.starts_with("COMMIT") {
                 if in_txn {
+                    // Java parity: DML cdclog rows are written from the
+                    // commit_hook callback during the dst-db COMMIT. The
+                    // COMMITTRAN marker must follow those DML rows. The
+                    // native commit_hook buffers preupdate entries and only
+                    // dispatches the Rust callback inside exec("COMMIT"),
+                    // so we exec the dst COMMIT first (firing DML writes
+                    // into the open writer txn), then emit COMMITTRAN and
+                    // flush the writer.
+                    // SAFETY: ctx_ptr valid for replay lifetime.
+                    let ctx_ref = unsafe { &*ctx_ptr };
                     apply_replay_checkpoint_update(entry.commit_id)?;
                     self.exec_sql(db, "COMMIT")?;
+                    self.emit_txn_marker_via_writer(ctx_ref, "COMMITTRAN", "COMMIT", entry.commit_id)?;
+                    self.flush_writer_via_ctx(ctx_ref)?;
                     in_txn = false;
                 }
                 continue;
             }
             if sql_norm.starts_with("ROLLBACK") {
                 if in_txn {
+                    // SAFETY: ctx_ptr valid for replay lifetime.
+                    let ctx_ref = unsafe { &*ctx_ptr };
+                    self.rollback_writer_via_ctx(ctx_ref)?;
                     self.exec_sql(db, "ROLLBACK")?;
                     in_txn = false;
                 }
@@ -3728,6 +4573,24 @@ impl NativeCdc {
                 continue;
             }
 
+            // Java parity: DDL records are emitted by the replay loop BEFORE
+            // the DDL is exec'd (mirrors `CDCLogger.logDDLRecord` ordering).
+            // DML records are emitted from the change callback during commit.
+            let op_type = map_cdclog_op_type(&entry.sql);
+            let table_name = extract_table_name_for_operation(&entry.sql);
+            // SAFETY: ctx_ptr valid for replay duration.
+            let ctx_ref = unsafe { &*ctx_ptr };
+            if !ctx_ref.writer_ptr.is_null()
+                && !matches!(
+                    op_type,
+                    "INSERT" | "UPDATE" | "DELETE"
+                        | "BEGINTRAN" | "COMMITTRAN" | "ROLLBACKTRAN" | "CHECKPOINTTRAN"
+                        | "NOOP"
+                )
+            {
+                self.emit_ddl_via_writer(ctx_ref, op_type, table_name.as_deref(), entry)?;
+            }
+
             let rendered = render_sql_with_args(&entry.sql, &entry.args);
             if !in_txn {
                 self.exec_sql(db, "BEGIN TRANSACTION")?;
@@ -3741,6 +4604,214 @@ impl NativeCdc {
         }
         Ok(())
     }
+
+    /// Java parity: write a transaction-boundary cdclog row (BEGINTRAN /
+    /// COMMITTRAN). Mirrors `DeviceReplicator.logBeginRecord` and the
+    /// COMMITTRAN portion of `DeviceReplicator.logCommitAndFlush`.
+    fn emit_txn_marker_via_writer(
+        &self,
+        ctx: &ReplayContext,
+        op_type: &str,
+        sql_text: &str,
+        commit_id: i64,
+    ) -> Result<()> {
+        if ctx.writer_ptr.is_null() {
+            return Ok(());
+        }
+        // SAFETY: writer_ptr lifetime guaranteed by caller of replay().
+        let writer_mtx = unsafe { &*ctx.writer_ptr };
+
+        let change_number = match ctx.next_change_number.lock() {
+            Ok(mut cn) => {
+                let v = *cn;
+                *cn = v + 1;
+                v
+            }
+            Err(_) => return Err(Error::Internal("txn change_number lock poisoned".into())),
+        };
+
+        let mut writer = writer_mtx
+            .lock()
+            .map_err(|_| Error::Internal("writer lock poisoned".into()))?;
+        writer.write_ddl_record(
+            commit_id,
+            Some("main"),
+            None,
+            None,
+            op_type,
+            Some(sql_text),
+            change_number,
+            &[],
+        )?;
+        // Reset DML dedup cache across txn boundaries.
+        if let Ok(mut last) = ctx.last_callback_sql.lock() {
+            *last = None;
+        }
+        Ok(())
+    }
+
+    /// Java parity: commit the writer's native cdclog txn (flushLogSegment).
+    fn flush_writer_via_ctx(&self, ctx: &ReplayContext) -> Result<()> {
+        if ctx.writer_ptr.is_null() {
+            return Ok(());
+        }
+        // SAFETY: writer_ptr lifetime guaranteed by caller of replay().
+        let writer_mtx = unsafe { &*ctx.writer_ptr };
+        let mut writer = writer_mtx
+            .lock()
+            .map_err(|_| Error::Internal("writer lock poisoned".into()))?;
+        writer.commit_tran()
+    }
+
+    /// Java parity: rollback the writer's native cdclog txn.
+    fn rollback_writer_via_ctx(&self, ctx: &ReplayContext) -> Result<()> {
+        if ctx.writer_ptr.is_null() {
+            return Ok(());
+        }
+        // SAFETY: writer_ptr lifetime guaranteed by caller of replay().
+        let writer_mtx = unsafe { &*ctx.writer_ptr };
+        let mut writer = writer_mtx
+            .lock()
+            .map_err(|_| Error::Internal("writer lock poisoned".into()))?;
+        writer.rollback_tran()
+    }
+
+    fn emit_ddl_via_writer(
+        &self,
+        ctx: &ReplayContext,
+        op_type: &str,
+        table_name: Option<&str>,
+        entry: &SegmentEntry,
+    ) -> Result<()> {
+        if ctx.writer_ptr.is_null() {
+            return Ok(());
+        }
+        // SAFETY: writer_ptr lifetime guaranteed by caller of replay().
+        let writer_mtx = unsafe { &*ctx.writer_ptr };
+
+        // Update in-memory table_columns map to match Java's logical schema
+        // tracking before forwarding to the writer.
+        let columns_for_schema: Vec<(String, String, i64)> = match op_type {
+            "CREATETABLE" => {
+                let cols = parse_create_table_columns(&entry.sql);
+                if let Some(tbl) = table_name {
+                    if let Ok(mut g) = ctx.table_columns.lock() {
+                        g.insert(
+                            tbl.to_ascii_lowercase(),
+                            cols.iter().map(|(c, _, _)| c.clone()).collect(),
+                        );
+                    }
+                }
+                cols
+            }
+            "ADDCOLUMN" => {
+                if let Some(tbl) = table_name {
+                    if let Some(col) = parse_alter_add_column_name(&entry.sql) {
+                        if let Ok(mut g) = ctx.table_columns.lock() {
+                            g.entry(tbl.to_ascii_lowercase()).or_default().push(col);
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            "DROPCOLUMN" => {
+                if let Some(tbl) = table_name {
+                    if let Some(col) = parse_alter_drop_column_name(&entry.sql) {
+                        if let Ok(mut g) = ctx.table_columns.lock() {
+                            if let Some(cols) = g.get_mut(&tbl.to_ascii_lowercase()) {
+                                cols.retain(|c| !c.eq_ignore_ascii_case(&col));
+                            }
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            "RENAMECOLUMN" => {
+                if let Some(tbl) = table_name {
+                    if let Some((old_col, new_col)) = parse_alter_rename_column_names(&entry.sql) {
+                        if let Ok(mut g) = ctx.table_columns.lock() {
+                            if let Some(cols) = g.get_mut(&tbl.to_ascii_lowercase()) {
+                                for c in cols.iter_mut() {
+                                    if c.eq_ignore_ascii_case(&old_col) {
+                                        *c = new_col.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            "RENAMETABLE" => {
+                if let Some(old_tbl) = table_name {
+                    if let Some(new_tbl) = parse_alter_rename_table_name(&entry.sql) {
+                        if let Ok(mut g) = ctx.table_columns.lock() {
+                            let old_key = old_tbl.to_ascii_lowercase();
+                            if let Some(cols) = g.remove(&old_key) {
+                                g.insert(new_tbl.to_ascii_lowercase(), cols);
+                            }
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            "DROPTABLE" => {
+                if let Some(tbl) = table_name {
+                    if let Ok(mut g) = ctx.table_columns.lock() {
+                        g.remove(&tbl.to_ascii_lowercase());
+                    }
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+
+        let change_number = match ctx.next_change_number.lock() {
+            Ok(mut cn) => {
+                let v = *cn;
+                *cn = v + 1;
+                v
+            }
+            Err(_) => return Err(Error::Internal("ddl change_number lock poisoned".into())),
+        };
+
+        // Build schema-column descriptors borrowing into local owned strings.
+        let schema_cols: Vec<CdcLogSchemaCol<'_>> = columns_for_schema
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, ty, pk_pos))| CdcLogSchemaCol {
+                column_index: idx as i64,
+                column_name: name.as_str(),
+                column_type: ty.as_str(),
+                not_null: false,
+                primary_key_pos: *pk_pos,
+                auto_increment: false,
+                old_table_name: None,
+                old_column_name: None,
+            })
+            .collect();
+
+        let mut writer = writer_mtx
+            .lock()
+            .map_err(|_| Error::Internal("writer lock poisoned".into()))?;
+        writer.write_ddl_record(
+            entry.commit_id,
+            Some("main"),
+            None,
+            table_name,
+            op_type,
+            Some(&entry.sql),
+            change_number,
+            &schema_cols,
+        )?;
+        // Java parity: dedup cache resets across DDL boundaries so the next
+        // DML row always persists its synthesized SQL.
+        if let Ok(mut last) = ctx.last_callback_sql.lock() {
+            *last = None;
+        }
+        Ok(())
+    }
+
 
     fn replay_staged_txn_sidecar(
         &self,
@@ -3820,6 +4891,597 @@ impl NativeCdc {
         // SAFETY: pointer is expected to remain valid long enough for conversion.
         unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
     }
+
+    fn stmt_api(&self) -> NativeStmtApi {
+        NativeStmtApi {
+            open: self.open,
+            close: self.close,
+            exec: self.exec,
+            errmsg: self.errmsg,
+            prepare: self.prepare,
+            finalize_stmt: self.finalize_stmt,
+            reset: self.reset,
+            clear_bindings: self.clear_bindings,
+            step: self.step,
+            bind_int: self.bind_int,
+            bind_int64: self.bind_int64,
+            bind_double: self.bind_double,
+            bind_text: self.bind_text,
+            bind_blob: self.bind_blob,
+            bind_null: self.bind_null,
+            bind_value: self.bind_value,
+        }
+    }
+}
+
+/// Java parity: subset of `synclite_rs_*` symbols required by the
+/// `NativeCdcLogWriter` (mirrors `com.synclite.consolidator.nativedb.PreparedStatement` JNI).
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct NativeStmtApi {
+    open: unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> c_int,
+    close: unsafe extern "C" fn(*mut c_void) -> c_int,
+    exec: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
+    errmsg: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    prepare: unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> c_int,
+    finalize_stmt: unsafe extern "C" fn(*mut c_void) -> c_int,
+    reset: unsafe extern "C" fn(*mut c_void) -> c_int,
+    clear_bindings: unsafe extern "C" fn(*mut c_void) -> c_int,
+    step: unsafe extern "C" fn(*mut c_void) -> c_int,
+    bind_int: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int,
+    bind_int64: unsafe extern "C" fn(*mut c_void, c_int, i64) -> c_int,
+    bind_double: unsafe extern "C" fn(*mut c_void, c_int, f64) -> c_int,
+    bind_text: unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int,
+    bind_blob: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int) -> c_int,
+    bind_null: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
+    bind_value: unsafe extern "C" fn(*mut c_void, c_int, *const c_void) -> c_int,
+}
+
+/// SQLite return codes (subset).
+const SQLITE_OK: c_int = 0;
+const SQLITE_DONE: c_int = 101;
+
+/// Java parity: per-segment CDC log writer that mirrors
+/// `com.synclite.consolidator.log.CDCLogSegment.CDCLogSegmentWriter`.
+///
+/// Owns a dedicated native sqlite handle for the cdclog file and a long-lived
+/// prepared INSERT statement so DML rows can be persisted by binding raw
+/// `sqlite3_value*` pointers received from the preupdate callback (`bindNativeValue`
+/// in Java) instead of materializing values in Rust.
+struct NativeCdcLogWriter {
+    api: NativeStmtApi,
+    db: *mut c_void,
+    insert_stmt: *mut c_void,
+    insert_schema_stmt: *mut c_void,
+    arg_capacity: usize,
+    in_txn: bool,
+    cdclog_path: PathBuf,
+}
+
+// SAFETY: writer owns raw native pointers but is only ever used from a single
+// thread at a time (the replay thread; callback fires synchronously inside it).
+// Synchronization is enforced externally by wrapping the writer in a Mutex.
+unsafe impl Send for NativeCdcLogWriter {}
+
+impl NativeCdcLogWriter {
+    const INITIAL_ARG_CAPACITY: usize = 16;
+    const METADATA_BIND_COUNT: usize = 8;
+
+    fn new(api: NativeStmtApi, cdclog_path: &Path) -> Result<Self> {
+        if cdclog_path.exists() {
+            std::fs::remove_file(cdclog_path).map_err(|e| {
+                Error::Internal(format!(
+                    "consolidator: failed to remove stale cdclog {}: {e}",
+                    cdclog_path.display()
+                ))
+            })?;
+        }
+
+        let path_c = CString::new(cdclog_path.to_string_lossy().to_string())
+            .map_err(|e| Error::Internal(format!("cdclog path contains NUL: {e}")))?;
+        let mut db: *mut c_void = std::ptr::null_mut();
+        // SAFETY: open writes the new handle into `db`.
+        let rc = unsafe { (api.open)(path_c.as_ptr(), &mut db as *mut *mut c_void) };
+        if rc != SQLITE_OK || db.is_null() {
+            return Err(Error::Internal(format!(
+                "synclite_rs_open(cdclog={}) failed rc={rc}",
+                cdclog_path.display()
+            )));
+        }
+
+        let mut writer = Self {
+            api,
+            db,
+            insert_stmt: std::ptr::null_mut(),
+            insert_schema_stmt: std::ptr::null_mut(),
+            arg_capacity: 0,
+            in_txn: false,
+            cdclog_path: cdclog_path.to_path_buf(),
+        };
+
+        // Create cdclog tables/indexes (mirrors CDCLogSegment.open()).
+        writer.exec_sql(
+            "CREATE TABLE IF NOT EXISTS cdclog(\
+             commit_id LONG, database_name TEXT, schema_name TEXT, table_name TEXT, \
+             op_type TEXT, sql TEXT, change_number INTEGER PRIMARY KEY, arg_cnt INTEGER\
+             )",
+        )?;
+        writer.exec_sql(
+            "CREATE TABLE IF NOT EXISTS cdclog_schemas(\
+             change_number INTEGER, database_name TEXT, schema_name TEXT, table_name TEXT, \
+             column_index LONG, column_name TEXT, column_type TEXT, column_not_null INTEGER, \
+             column_default_value BLOB, column_primary_key INTEGER, column_auto_increment INTEGER, \
+             old_table_name TEXT, old_column_name TEXT\
+             )",
+        )?;
+        writer.exec_sql("CREATE TABLE IF NOT EXISTS metadata(key TEXT, value TEXT)")?;
+        writer.exec_sql("CREATE INDEX IF NOT EXISTS commit_id_cdclog_index ON cdclog(commit_id)")?;
+        writer.exec_sql(
+            "CREATE INDEX IF NOT EXISTS change_number_cdclog_schemas_index \
+             ON cdclog_schemas(change_number)",
+        )?;
+
+        // Initial arg columns (grown on demand, matching Java addNewInlinedArgCols).
+        writer.add_arg_columns(0, Self::INITIAL_ARG_CAPACITY)?;
+        writer.arg_capacity = Self::INITIAL_ARG_CAPACITY;
+        writer.reprepare_insert_stmt()?;
+        writer.prepare_schema_stmt()?;
+
+        Ok(writer)
+    }
+
+    fn exec_sql(&self, sql: &str) -> Result<()> {
+        let c = CString::new(sql).map_err(|e| Error::Internal(format!("cdclog sql NUL: {e}")))?;
+        // SAFETY: db handle valid for writer lifetime.
+        let rc = unsafe { (self.api.exec)(self.db, c.as_ptr()) };
+        if rc != SQLITE_OK {
+            return Err(Error::Internal(format!(
+                "cdclog exec failed rc={rc} sql={sql}: {}",
+                self.errmsg()
+            )));
+        }
+        Ok(())
+    }
+
+    fn errmsg(&self) -> String {
+        // SAFETY: errmsg returns null or NUL-terminated C string valid briefly.
+        let p = unsafe { (self.api.errmsg)(self.db) };
+        if p.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        }
+    }
+
+    fn add_arg_columns(&self, start_inclusive: usize, end_exclusive: usize) -> Result<()> {
+        for i in (start_inclusive + 1)..=end_exclusive {
+            let sql = format!("ALTER TABLE cdclog ADD COLUMN arg{i} BLOB");
+            // Tolerate duplicates if a partial earlier run added the column.
+            let c = CString::new(sql.clone()).map_err(|e| Error::Internal(format!("ALTER NUL: {e}")))?;
+            let rc = unsafe { (self.api.exec)(self.db, c.as_ptr()) };
+            if rc != SQLITE_OK {
+                let msg = self.errmsg().to_ascii_lowercase();
+                if !(msg.contains("duplicate column") || msg.contains("already exists")) {
+                    return Err(Error::Internal(format!(
+                        "cdclog ALTER add column rc={rc} sql={sql}: {}",
+                        self.errmsg()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reprepare_insert_stmt(&mut self) -> Result<()> {
+        if !self.insert_stmt.is_null() {
+            // SAFETY: finalize on a previously prepared stmt.
+            let _ = unsafe { (self.api.finalize_stmt)(self.insert_stmt) };
+            self.insert_stmt = std::ptr::null_mut();
+        }
+
+        let mut cols = String::from(
+            "commit_id, database_name, schema_name, table_name, op_type, sql, change_number, arg_cnt",
+        );
+        for i in 1..=self.arg_capacity {
+            cols.push_str(", arg");
+            cols.push_str(&i.to_string());
+        }
+        let total = Self::METADATA_BIND_COUNT + self.arg_capacity;
+        let placeholders = (1..=total)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO cdclog({cols}) VALUES ({placeholders})");
+        let sql_c = CString::new(sql.clone()).map_err(|e| Error::Internal(format!("prepare NUL: {e}")))?;
+
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        // SAFETY: prepare writes new statement pointer.
+        let rc = unsafe { (self.api.prepare)(self.db, sql_c.as_ptr(), &mut stmt as *mut *mut c_void) };
+        if rc != SQLITE_OK || stmt.is_null() {
+            return Err(Error::Internal(format!(
+                "cdclog prepare insert rc={rc}: {}",
+                self.errmsg()
+            )));
+        }
+        self.insert_stmt = stmt;
+        Ok(())
+    }
+
+    fn prepare_schema_stmt(&mut self) -> Result<()> {
+        if !self.insert_schema_stmt.is_null() {
+            let _ = unsafe { (self.api.finalize_stmt)(self.insert_schema_stmt) };
+            self.insert_schema_stmt = std::ptr::null_mut();
+        }
+        let sql = "INSERT INTO cdclog_schemas(\
+                   change_number, database_name, schema_name, table_name, \
+                   column_index, column_name, column_type, column_not_null, \
+                   column_default_value, column_primary_key, column_auto_increment, \
+                   old_table_name, old_column_name\
+                   ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
+        let c = CString::new(sql).map_err(|e| Error::Internal(format!("prepare NUL: {e}")))?;
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        // SAFETY: writes statement pointer.
+        let rc = unsafe { (self.api.prepare)(self.db, c.as_ptr(), &mut stmt as *mut *mut c_void) };
+        if rc != SQLITE_OK || stmt.is_null() {
+            return Err(Error::Internal(format!(
+                "cdclog prepare schemas insert rc={rc}: {}",
+                self.errmsg()
+            )));
+        }
+        self.insert_schema_stmt = stmt;
+        Ok(())
+    }
+
+    fn ensure_arg_capacity(&mut self, needed: usize) -> Result<()> {
+        if needed <= self.arg_capacity {
+            return Ok(());
+        }
+        // Grow geometrically, matching Java behavior of expanding once instead
+        // of one column at a time when a wide row arrives.
+        let mut new_cap = self.arg_capacity.max(1);
+        while new_cap < needed {
+            new_cap *= 2;
+        }
+        self.add_arg_columns(self.arg_capacity, new_cap)?;
+        self.arg_capacity = new_cap;
+        self.reprepare_insert_stmt()
+    }
+
+    fn begin_tran(&mut self) -> Result<()> {
+        if !self.in_txn {
+            let r = self.exec_sql("BEGIN TRANSACTION");
+            if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+                eprintln!("[cdclog-writer] BEGIN ({}) -> {:?}", self.cdclog_path.display(), r.as_ref().map(|_| "ok"));
+            }
+            r?;
+            self.in_txn = true;
+        }
+        Ok(())
+    }
+
+    fn commit_tran(&mut self) -> Result<()> {
+        if self.in_txn {
+            let r = self.exec_sql("COMMIT");
+            if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+                eprintln!("[cdclog-writer] COMMIT ({}) -> {:?}", self.cdclog_path.display(), r.as_ref().map(|_| "ok"));
+            }
+            r?;
+            self.in_txn = false;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn rollback_tran(&mut self) -> Result<()> {
+        if self.in_txn {
+            self.exec_sql("ROLLBACK")?;
+            self.in_txn = false;
+        }
+        Ok(())
+    }
+
+    /// Bind the fixed metadata columns 1..8 of the cdclog INSERT statement.
+    /// Mirrors the first block of `CDCLogSegment.writeCDCLog`.
+    fn bind_metadata(
+        &self,
+        commit_id: i64,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+        op: &str,
+        sql_text: Option<&str>,
+        change_number: i64,
+        arg_cnt: i64,
+    ) -> Result<()> {
+        // SAFETY: bind functions are safe to call with valid stmt; CString lifetimes guarded by holders.
+        let stmt = self.insert_stmt;
+        let api = &self.api;
+
+        let _ = unsafe { (api.reset)(stmt) };
+        let _ = unsafe { (api.clear_bindings)(stmt) };
+
+        unsafe { (api.bind_int64)(stmt, 1, commit_id) };
+        bind_text_or_null(api, stmt, 2, database)?;
+        bind_text_or_null(api, stmt, 3, schema)?;
+        bind_text_or_null(api, stmt, 4, table)?;
+        bind_text_or_null(api, stmt, 5, Some(op))?;
+        bind_text_or_null(api, stmt, 6, sql_text)?;
+        unsafe { (api.bind_int64)(stmt, 7, change_number) };
+        unsafe { (api.bind_int64)(stmt, 8, arg_cnt) };
+
+        Ok(())
+    }
+
+    fn step_insert(&self) -> Result<()> {
+        let stmt = self.insert_stmt;
+        // SAFETY: stmt is owned by writer.
+        let rc = unsafe { (self.api.step)(stmt) };
+        if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+            eprintln!("[cdclog-writer] step_insert rc={rc} ({})", self.cdclog_path.display());
+        }
+        if rc != SQLITE_DONE && rc != SQLITE_OK {
+            return Err(Error::Internal(format!(
+                "cdclog step insert rc={rc}: {}",
+                self.errmsg()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Java parity: write a DDL CDC log record (no values), then its column
+    /// schemas, mirroring `CDCLogger.logDDLRecord` + `writeCDCLog`.
+    fn write_ddl_record(
+        &mut self,
+        commit_id: i64,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+        op: &str,
+        sql_text: Option<&str>,
+        change_number: i64,
+        column_schemas: &[CdcLogSchemaCol<'_>],
+    ) -> Result<()> {
+        self.begin_tran()?;
+        self.bind_metadata(commit_id, database, schema, table, op, sql_text, change_number, 0)?;
+        // All arg slots NULL for DDL.
+        for i in 1..=self.arg_capacity {
+            // SAFETY: bind_null with valid index.
+            let _ = unsafe { (self.api.bind_null)(self.insert_stmt, (Self::METADATA_BIND_COUNT + i) as c_int) };
+        }
+        self.step_insert()?;
+
+        for col in column_schemas {
+            self.write_schema_row(change_number, database, schema, table, col)?;
+        }
+        Ok(())
+    }
+
+    fn write_schema_row(
+        &self,
+        change_number: i64,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+        col: &CdcLogSchemaCol<'_>,
+    ) -> Result<()> {
+        let stmt = self.insert_schema_stmt;
+        let api = &self.api;
+        let _ = unsafe { (api.reset)(stmt) };
+        let _ = unsafe { (api.clear_bindings)(stmt) };
+
+        unsafe { (api.bind_int64)(stmt, 1, change_number) };
+        bind_text_or_null(api, stmt, 2, database)?;
+        bind_text_or_null(api, stmt, 3, schema)?;
+        bind_text_or_null(api, stmt, 4, table)?;
+        unsafe { (api.bind_int64)(stmt, 5, col.column_index) };
+        bind_text_or_null(api, stmt, 6, Some(col.column_name))?;
+        bind_text_or_null(api, stmt, 7, Some(col.column_type))?;
+        unsafe { (api.bind_int)(stmt, 8, if col.not_null { 1 } else { 0 }) };
+        // column_default_value (BLOB) -> NULL.
+        let _ = unsafe { (api.bind_null)(stmt, 9) };
+        unsafe { (api.bind_int64)(stmt, 10, col.primary_key_pos) };
+        unsafe { (api.bind_int)(stmt, 11, if col.auto_increment { 1 } else { 0 }) };
+        bind_text_or_null(api, stmt, 12, col.old_table_name)?;
+        bind_text_or_null(api, stmt, 13, col.old_column_name)?;
+
+        let rc = unsafe { (api.step)(stmt) };
+        if rc != SQLITE_DONE && rc != SQLITE_OK {
+            return Err(Error::Internal(format!(
+                "cdclog step schemas insert rc={rc}: {}",
+                self.errmsg()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Java parity: write a DML CDC log record using raw `sqlite3_value*`
+    /// pointers from the preupdate callback (`bindNativeValue`).
+    ///
+    /// `before_ptrs` and `after_ptrs` are arrays of `sqlite3_value*` valid for
+    /// the duration of the change-callback invocation. The binding order
+    /// matches `CDCLogSegment.writeCDCLog`:
+    ///   INSERT -> after values
+    ///   UPDATE -> before values then after values
+    ///   DELETE -> before values
+    fn write_dml_record(
+        &mut self,
+        commit_id: i64,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+        op: &str,
+        sql_text: Option<&str>,
+        change_number: i64,
+        before_ptrs: &[*const c_void],
+        after_ptrs: &[*const c_void],
+    ) -> Result<()> {
+        let op_upper = op.to_ascii_uppercase();
+        let arg_cnt = match op_upper.as_str() {
+            "INSERT" => after_ptrs.len(),
+            "DELETE" => before_ptrs.len(),
+            "UPDATE" => before_ptrs.len() + after_ptrs.len(),
+            _ => 0,
+        };
+        self.ensure_arg_capacity(arg_cnt)?;
+        self.begin_tran()?;
+        self.bind_metadata(
+            commit_id,
+            database,
+            schema,
+            table,
+            &op_upper,
+            sql_text,
+            change_number,
+            arg_cnt as i64,
+        )?;
+
+        // Bind values via pointer pass-through (Java's bindNativeValue path).
+        let stmt = self.insert_stmt;
+        let api = &self.api;
+        let mut idx: c_int = Self::METADATA_BIND_COUNT as c_int + 1;
+        let bind_ptr = |idx: c_int, v: *const c_void| -> Result<()> {
+            // SAFETY: v is a sqlite3_value* duped by the native preupdate hook
+            // and remains live until the change callback returns; binding it
+            // here is the exact behavior of Java's bindNativeValue.
+            let rc = if v.is_null() {
+                unsafe { (api.bind_null)(stmt, idx) }
+            } else {
+                unsafe { (api.bind_value)(stmt, idx, v) }
+            };
+            if rc != SQLITE_OK {
+                return Err(Error::Internal(format!(
+                    "cdclog bind_value idx={idx} rc={rc}: {}",
+                    {
+                        // SAFETY: errmsg call.
+                        let p = unsafe { (api.errmsg)(self.db) };
+                        if p.is_null() {
+                            String::new()
+                        } else {
+                            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+                        }
+                    }
+                )));
+            }
+            Ok(())
+        };
+
+        match op_upper.as_str() {
+            "INSERT" => {
+                for &p in after_ptrs {
+                    bind_ptr(idx, p)?;
+                    idx += 1;
+                }
+            }
+            "UPDATE" => {
+                for &p in before_ptrs {
+                    bind_ptr(idx, p)?;
+                    idx += 1;
+                }
+                for &p in after_ptrs {
+                    bind_ptr(idx, p)?;
+                    idx += 1;
+                }
+            }
+            "DELETE" => {
+                for &p in before_ptrs {
+                    bind_ptr(idx, p)?;
+                    idx += 1;
+                }
+            }
+            _ => {}
+        }
+
+        // NULL any remaining arg slots so partial rebinds from prior rows do
+        // not leak into this row.
+        while (idx as usize) <= Self::METADATA_BIND_COUNT + self.arg_capacity {
+            let _ = unsafe { (api.bind_null)(stmt, idx) };
+            idx += 1;
+        }
+
+        self.step_insert()
+    }
+
+    fn close(mut self) -> Result<()> {
+        // Best-effort: commit any open txn before tearing down statements.
+        let r = self.commit_tran();
+        if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
+            eprintln!("[cdclog-writer] close commit -> {:?} ({})", r.as_ref().map(|_| "ok").map_err(|e| e.to_string()), self.cdclog_path.display());
+        }
+        let _ = r;
+        if !self.insert_stmt.is_null() {
+            // SAFETY: finalize prepared stmt.
+            let _ = unsafe { (self.api.finalize_stmt)(self.insert_stmt) };
+            self.insert_stmt = std::ptr::null_mut();
+        }
+        if !self.insert_schema_stmt.is_null() {
+            let _ = unsafe { (self.api.finalize_stmt)(self.insert_schema_stmt) };
+            self.insert_schema_stmt = std::ptr::null_mut();
+        }
+        if !self.db.is_null() {
+            // SAFETY: close native db handle.
+            let _ = unsafe { (self.api.close)(self.db) };
+            self.db = std::ptr::null_mut();
+        }
+        let _ = &self.cdclog_path; // path kept for diagnostics.
+        Ok(())
+    }
+}
+
+impl Drop for NativeCdcLogWriter {
+    fn drop(&mut self) {
+        if !self.insert_stmt.is_null() {
+            let _ = unsafe { (self.api.finalize_stmt)(self.insert_stmt) };
+            self.insert_stmt = std::ptr::null_mut();
+        }
+        if !self.insert_schema_stmt.is_null() {
+            let _ = unsafe { (self.api.finalize_stmt)(self.insert_schema_stmt) };
+            self.insert_schema_stmt = std::ptr::null_mut();
+        }
+        if !self.db.is_null() {
+            let _ = unsafe { (self.api.close)(self.db) };
+            self.db = std::ptr::null_mut();
+        }
+    }
+}
+
+fn bind_text_or_null(
+    api: &NativeStmtApi,
+    stmt: *mut c_void,
+    index: c_int,
+    value: Option<&str>,
+) -> Result<()> {
+    match value {
+        Some(s) => {
+            let c = CString::new(s).map_err(|e| Error::Internal(format!("bind_text NUL: {e}")))?;
+            // SAFETY: native bind copies the text (SQLITE_TRANSIENT in native impl).
+            let rc = unsafe { (api.bind_text)(stmt, index, c.as_ptr()) };
+            if rc != SQLITE_OK {
+                return Err(Error::Internal(format!(
+                    "cdclog bind_text idx={index} rc={rc}"
+                )));
+            }
+            Ok(())
+        }
+        None => {
+            let _ = unsafe { (api.bind_null)(stmt, index) };
+            Ok(())
+        }
+    }
+}
+
+/// Java parity: column metadata row written into `cdclog_schemas` for each DDL
+/// record. Mirrors fields used in `CDCLogSegment.writeCDCLog` schema block.
+/// Borrowed view used by `NativeCdcLogWriter`; distinct from the owned
+/// `CdcSchemaColumn` used by the destination apply pipeline.
+struct CdcLogSchemaCol<'a> {
+    column_index: i64,
+    column_name: &'a str,
+    column_type: &'a str,
+    not_null: bool,
+    primary_key_pos: i64,
+    auto_increment: bool,
+    old_table_name: Option<&'a str>,
+    old_column_name: Option<&'a str>,
 }
 
 fn replay_txn_sidecar_path(segment_path: &Path, segment_seq: u64, commit_id: u64) -> PathBuf {
@@ -3910,6 +5572,16 @@ fn mirror_stage_artifact_to_work(layout: &ConsolidatorLayout, stage_path: &Path)
     // authoritative. This handles the pause/resume race where the shipper
     // wins the cleanup before the consolidator drains a paused segment.
     if !stage_path.exists() && work_path.exists() {
+        return Ok(work_path);
+    }
+    // Idempotency: if the work copy already exists and has been marked
+    // APPLIED, do NOT copy from stage. Re-copying would clobber the
+    // APPLIED marker (which lives in the work copy's `metadata` table)
+    // and cause the consolidator to replay the segment. This handles
+    // the multi-notification path: mover notifies once, the shipper's
+    // `on_shipped` callback notifies again after upload, and on restart
+    // `catch_up_stage_dir` notifies any leftover stage files.
+    if work_path.exists() && segment_metadata_status_is_applied(&work_path) {
         return Ok(work_path);
     }
     std::fs::copy(stage_path, &work_path)?;
@@ -4689,7 +6361,7 @@ fn read_cdclog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEntry>)
         };
 
         let has_placeholders = sql.contains('?');
-        let args = if arg_cnt <= 0 || !has_placeholders {
+        let mut args = if arg_cnt <= 0 || !has_placeholders {
             Vec::new()
         } else {
             let mut arg_stmt = seg_conn
@@ -4711,6 +6383,21 @@ fn read_cdclog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEntry>)
                 })
                 .map_err(map_sql_err)?
         };
+
+        // Java parity: cdclog stores UPDATE args as `before…after`; apply expects `after…before`.
+        if op_type
+            .as_deref()
+            .map(|op| op.eq_ignore_ascii_case("UPDATE"))
+            .unwrap_or(false)
+            && !args.is_empty()
+            && args.len() % 2 == 0
+        {
+            let half = args.len() / 2;
+            let mut reordered = Vec::with_capacity(args.len());
+            reordered.extend_from_slice(&args[half..]);
+            reordered.extend_from_slice(&args[..half]);
+            args = reordered;
+        }
 
         entries.push(SegmentEntry {
             change_number,
@@ -5211,15 +6898,17 @@ fn apply_to_duckdb_destination(
     }
 
     dst_conn.execute_batch("COMMIT;").map_err(map_duck_err)?;
+    if layout.metadata_store == MetadataStore::Destination {
+        sync_duckdb_destination_metadata(&dst_conn, layout)?;
+    }
     Ok(progress)
 }
 
 fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &ConsolidatorLayout) -> Result<()> {
-    let dst_index = 1i64;
     ensure_sqlite_metadata_init_status_column(dest_conn)?;
     dest_conn
         .execute(
-            "UPDATE synclite_metadata
+            "UPDATE synclite_checkpoint
              SET initialization_status = 1
              WHERE synclite_device_id = ?1 AND synclite_device_name = ?2",
             params![layout.device_id, layout.device_name],
@@ -5228,8 +6917,8 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
 
     dest_conn
         .execute(
-            "DELETE FROM synclite_table_schema WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3",
-            params![layout.device_id, layout.device_name, dst_index],
+            "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = 'create_sql'",
+            params![layout.device_id, layout.device_name],
         )
         .map_err(map_sql_err)?;
 
@@ -5237,8 +6926,12 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
         .prepare(
             "SELECT name, sql FROM sqlite_master
              WHERE type = 'table'
-               AND name NOT LIKE 'sqlite_%'
-               AND name NOT LIKE 'synclite_%'
+               AND name NOT IN (
+                   'synclite_checkpoint',
+                   'synclite_consolidator_metadata',
+                   'synclite_consolidator_table_metadata',
+                   'sqlite_sequence'
+               )
              ORDER BY name",
         )
         .map_err(map_sql_err)?;
@@ -5248,13 +6941,12 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
         let create_sql: Option<String> = row.get(1).map_err(map_sql_err)?;
         dest_conn
             .execute(
-                "INSERT OR REPLACE INTO synclite_table_schema(
-                     device_uuid, device_name, dst_index, table_name, create_sql
-                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR REPLACE INTO synclite_consolidator_table_metadata(
+                     device_uuid, device_name, database_name, table_name, prop_key, prop_value
+                 ) VALUES(?1, ?2, 'main', ?3, 'create_sql', ?4)",
                 params![
                     layout.device_id,
                     layout.device_name,
-                    dst_index,
                     table_name,
                     create_sql.unwrap_or_default(),
                 ],
@@ -5267,7 +6959,7 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
 
 fn ensure_sqlite_metadata_init_status_column(dest_conn: &Connection) -> Result<()> {
     let mut stmt = dest_conn
-        .prepare("PRAGMA table_info(synclite_metadata)")
+        .prepare("PRAGMA table_info(synclite_checkpoint)")
         .map_err(map_sql_err)?;
     let mut rows = stmt.query([]).map_err(map_sql_err)?;
     let mut has_column = false;
@@ -5280,10 +6972,263 @@ fn ensure_sqlite_metadata_init_status_column(dest_conn: &Connection) -> Result<(
     }
     if !has_column {
         dest_conn
-            .execute_batch("ALTER TABLE synclite_metadata ADD COLUMN initialization_status INTEGER NOT NULL DEFAULT 0")
+            .execute_batch("ALTER TABLE synclite_checkpoint ADD COLUMN initialization_status INTEGER NOT NULL DEFAULT 0")
             .map_err(map_sql_err)?;
     }
     Ok(())
+}
+
+/// DuckDB DESTINATION-mode bookkeeping refresh: marks the device row as
+/// initialized and rebuilds per-table `create_sql` rows under
+/// `synclite_consolidator_table_metadata` from the live destination catalog.
+/// Mirrors `sync_sqlite_destination_metadata`.
+///
+/// DuckDB has no `sqlite_master` analog, so we synthesize a SQLite-flavored
+/// CREATE TABLE per user table from `PRAGMA table_info(...)`. The downstream
+/// consumer (Java `loadSchemasFromDestination`) only replays the CREATE on
+/// an in-memory SQLite and reads back column shape via `PRAGMA table_info`,
+/// so name + type + NOT NULL + PRIMARY KEY are sufficient (matches Java's
+/// `buildCreateSqlFromColumns` shape).
+fn sync_duckdb_destination_metadata(dest_conn: &DuckConnection, layout: &ConsolidatorLayout) -> Result<()> {
+    duck_exec_with_params(
+        dest_conn,
+        "UPDATE synclite_checkpoint
+         SET initialization_status = 1
+         WHERE synclite_device_id = ? AND synclite_device_name = ?",
+        &[
+            DuckValue::Text(layout.device_id.clone()),
+            DuckValue::Text(layout.device_name.clone()),
+        ],
+    )?;
+
+    duck_exec_with_params(
+        dest_conn,
+        "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ? AND device_name = ? AND prop_key = 'create_sql'",
+        &[
+            DuckValue::Text(layout.device_id.clone()),
+            DuckValue::Text(layout.device_name.clone()),
+        ],
+    )?;
+
+    let mut tables: Vec<String> = Vec::new();
+    {
+        let mut stmt = dest_conn
+            .prepare(
+                "SELECT table_name FROM information_schema.tables
+                 WHERE table_type = 'BASE TABLE'
+                   AND table_name NOT IN (
+                       'synclite_checkpoint',
+                       'synclite_consolidator_metadata',
+                       'synclite_consolidator_table_metadata'
+                   )
+                   AND table_schema NOT IN ('information_schema', 'pg_catalog')
+                 ORDER BY table_name",
+            )
+            .map_err(map_duck_err)?;
+        let mut rows = stmt.query([]).map_err(map_duck_err)?;
+        while let Some(row) = rows.next().map_err(map_duck_err)? {
+            let name: String = row.get(0).map_err(map_duck_err)?;
+            tables.push(name);
+        }
+    }
+
+    for tbl in tables {
+        let create_sql = build_create_sql_from_duckdb_columns(dest_conn, &tbl)?;
+        duck_exec_with_params(
+            dest_conn,
+            "INSERT INTO synclite_consolidator_table_metadata(
+                 device_uuid, device_name, database_name, table_name, prop_key, prop_value
+             ) VALUES(?, ?, 'main', ?, 'create_sql', ?)",
+            &[
+                DuckValue::Text(layout.device_id.clone()),
+                DuckValue::Text(layout.device_name.clone()),
+                DuckValue::Text(tbl),
+                DuckValue::Text(create_sql),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn build_create_sql_from_duckdb_columns(conn: &DuckConnection, table: &str) -> Result<String> {
+    let pragma = format!("PRAGMA table_info('{}')", table.replace('\'', "''"));
+    let mut stmt = conn.prepare(&pragma).map_err(map_duck_err)?;
+    let mut rows = stmt.query([]).map_err(map_duck_err)?;
+    let mut cols: Vec<(String, String, bool)> = Vec::new();
+    let mut pks: Vec<(i64, String)> = Vec::new();
+    while let Some(row) = rows.next().map_err(map_duck_err)? {
+        let name: String = row.get(1).map_err(map_duck_err)?;
+        let ty: String = row.get(2).map_err(map_duck_err)?;
+        let notnull: i64 = row.get(3).map_err(map_duck_err)?;
+        let pk: i64 = row.get(5).map_err(map_duck_err)?;
+        cols.push((name.clone(), ty, notnull != 0));
+        if pk > 0 {
+            pks.push((pk, name));
+        }
+    }
+    pks.sort_by_key(|(o, _)| *o);
+
+    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table);
+    let mut first = true;
+    for (name, ty, nn) in &cols {
+        if !first {
+            sql.push_str(", ");
+        }
+        first = false;
+        sql.push_str(name);
+        sql.push(' ');
+        sql.push_str(ty);
+        if *nn {
+            sql.push_str(" NOT NULL");
+        }
+    }
+    if !pks.is_empty() {
+        sql.push_str(", PRIMARY KEY(");
+        let pk_list: Vec<String> = pks.iter().map(|(_, n)| n.clone()).collect();
+        sql.push_str(&pk_list.join(", "));
+        sql.push(')');
+    }
+    sql.push(')');
+    Ok(sql)
+}
+
+/// Postgres DESTINATION-mode bookkeeping refresh. Parallel to
+/// `sync_sqlite_destination_metadata` / `sync_duckdb_destination_metadata`.
+/// Synthesizes a SQLite-parseable CREATE TABLE from `information_schema.columns`
+/// + `pg_index` PK info.
+fn sync_postgres_destination_metadata(client: &mut PgClient, layout: &ConsolidatorLayout) -> Result<()> {
+    let meta = pg_meta_table(layout, "synclite_checkpoint");
+    let ctmeta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
+
+    let upd_sql = format!(
+        "UPDATE {meta}
+         SET initialization_status = 1
+         WHERE synclite_device_id = $1 AND synclite_device_name = $2"
+    );
+    client
+        .execute(upd_sql.as_str(), &[&layout.device_id, &layout.device_name])
+        .map_err(|e| map_pg_err_with_sql(e, &upd_sql))?;
+
+    let del_sql = format!(
+        "DELETE FROM {ctmeta} WHERE device_uuid = $1 AND device_name = $2 AND prop_key = 'create_sql'"
+    );
+    client
+        .execute(del_sql.as_str(), &[&layout.device_id, &layout.device_name])
+        .map_err(|e| map_pg_err_with_sql(e, &del_sql))?;
+
+    // Determine scanning schema: explicit dst_schema when scope is on,
+    // otherwise current_schema().
+    let schema_filter: String = if layout.dst_use_schema_scope_resolution {
+        layout
+            .dst_schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| pg_current_schema(client))
+    } else {
+        pg_current_schema(client)
+    };
+
+    let list_sql = "SELECT table_name FROM information_schema.tables \
+                    WHERE table_schema = $1 \
+                      AND table_type = 'BASE TABLE' \
+                      AND table_name NOT IN ( \
+                          'synclite_checkpoint', \
+                          'synclite_consolidator_metadata', \
+                          'synclite_consolidator_table_metadata' \
+                      ) \
+                    ORDER BY table_name";
+    let rows = client
+        .query(list_sql, &[&schema_filter])
+        .map_err(|e| map_pg_err_with_sql(e, list_sql))?;
+    let tables: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<_, String>(0).ok())
+        .collect();
+
+    let ins_sql = format!(
+        "INSERT INTO {ctmeta}(device_uuid, device_name, database_name, table_name, prop_key, prop_value) \
+         VALUES($1, $2, 'main', $3, 'create_sql', $4)"
+    );
+    for tbl in tables {
+        let create_sql = build_create_sql_from_postgres_columns(client, &schema_filter, &tbl)?;
+        client
+            .execute(
+                ins_sql.as_str(),
+                &[&layout.device_id, &layout.device_name, &tbl, &create_sql],
+            )
+            .map_err(|e| map_pg_err_with_sql(e, &ins_sql))?;
+    }
+    Ok(())
+}
+
+fn pg_current_schema(client: &mut PgClient) -> String {
+    client
+        .query_one("SELECT current_schema()", &[])
+        .ok()
+        .and_then(|r| r.try_get::<_, String>(0).ok())
+        .unwrap_or_else(|| "public".to_string())
+}
+
+fn build_create_sql_from_postgres_columns(
+    client: &mut PgClient,
+    schema: &str,
+    table: &str,
+) -> Result<String> {
+    let col_sql = "SELECT column_name, data_type, is_nullable \
+                   FROM information_schema.columns \
+                   WHERE table_schema = $1 AND table_name = $2 \
+                   ORDER BY ordinal_position";
+    let col_rows = client
+        .query(col_sql, &[&schema, &table])
+        .map_err(|e| map_pg_err_with_sql(e, col_sql))?;
+    let cols: Vec<(String, String, bool)> = col_rows
+        .iter()
+        .filter_map(|r| {
+            let name: String = r.try_get(0).ok()?;
+            let ty: String = r.try_get(1).ok()?;
+            let nullable: String = r.try_get(2).ok()?;
+            Some((name, ty, nullable.eq_ignore_ascii_case("NO")))
+        })
+        .collect();
+
+    let pk_sql = "SELECT a.attname \
+                  FROM pg_index i \
+                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                  JOIN pg_class c ON c.oid = i.indrelid \
+                  JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE i.indisprimary AND c.relname = $1 AND n.nspname = $2 \
+                  ORDER BY array_position(i.indkey, a.attnum)";
+    let pk_rows = client
+        .query(pk_sql, &[&table, &schema])
+        .map_err(|e| map_pg_err_with_sql(e, pk_sql))?;
+    let pks: Vec<String> = pk_rows
+        .iter()
+        .filter_map(|r| r.try_get::<_, String>(0).ok())
+        .collect();
+
+    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table);
+    let mut first = true;
+    for (name, ty, nn) in &cols {
+        if !first {
+            sql.push_str(", ");
+        }
+        first = false;
+        sql.push_str(name);
+        sql.push(' ');
+        sql.push_str(ty);
+        if *nn {
+            sql.push_str(" NOT NULL");
+        }
+    }
+    if !pks.is_empty() {
+        sql.push_str(", PRIMARY KEY(");
+        sql.push_str(&pks.join(", "));
+        sql.push(')');
+    }
+    sql.push(')');
+    Ok(sql)
 }
 
 fn apply_to_postgres_destination(
@@ -5420,6 +7365,9 @@ fn apply_to_postgres_destination(
     }
 
     client.batch_execute("COMMIT").map_err(map_pg_err)?;
+    if layout.metadata_store == MetadataStore::Destination {
+        sync_postgres_destination_metadata(&mut client, layout)?;
+    }
     Ok(progress)
 }
 
@@ -5521,7 +7469,7 @@ fn flush_postgres_batch(
 fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLayout, initial_commit_id: i64) -> Result<()> {
     dest_conn
         .execute_batch(
-            "CREATE TABLE IF NOT EXISTS synclite_metadata(\n\
+            "CREATE TABLE IF NOT EXISTS synclite_checkpoint(\n\
                  synclite_device_id TEXT NOT NULL,\n\
                  synclite_device_name TEXT NOT NULL,\n\
                  synclite_update_timestamp TEXT,\n\
@@ -5532,37 +7480,27 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
                  txn_count LONG NOT NULL,\n\
                  PRIMARY KEY(synclite_device_id, synclite_device_name, commit_id)\n\
              );\n\
-             CREATE TABLE IF NOT EXISTS synclite_table_schema(\n\
-                 device_uuid TEXT NOT NULL,\n\
-                 device_name TEXT NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
-                 table_name TEXT NOT NULL,\n\
-                 create_sql TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, table_name)\n\
-             );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_metadata(\n\
                  device_uuid VARCHAR(64) NOT NULL,\n\
                  device_name VARCHAR(255) NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, prop_key)\n\
+                 PRIMARY KEY(device_uuid, device_name, prop_key)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_table_metadata(\n\
                  device_uuid VARCHAR(64) NOT NULL,\n\
                  device_name VARCHAR(255) NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
                  database_name VARCHAR(255) NOT NULL,\n\
                  table_name VARCHAR(255) NOT NULL,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, database_name, table_name, prop_key)\n\
+                 PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key)\n\
              );",
         )
         .map_err(map_sql_err)?;
     let has_row: i64 = dest_conn
         .query_row(
-            "SELECT COUNT(*) FROM synclite_metadata WHERE synclite_device_id = ?1 AND synclite_device_name = ?2",
+            "SELECT COUNT(*) FROM synclite_checkpoint WHERE synclite_device_id = ?1 AND synclite_device_name = ?2",
             params![layout.device_id, layout.device_name],
             |row| row.get(0),
         )
@@ -5570,12 +7508,37 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
     if has_row == 0 {
         dest_conn
             .execute(
-                "INSERT INTO synclite_metadata(\n\
+                "INSERT INTO synclite_checkpoint(\n\
                      synclite_device_id, synclite_device_name, synclite_update_timestamp,\n\
                      commit_id, cdc_change_number,\n\
                      cdc_log_segment_sequence_number, initialization_status, txn_count\n\
                  ) VALUES(?1, ?2, ?3, ?4, -1, 0, 0, 0)",
                 params![layout.device_id, layout.device_name, current_update_timestamp(), initial_commit_id],
+            )
+            .map_err(map_sql_err)?;
+    }
+    // Seed synclite_metadata_version row if absent (Java parity with
+    // ConsolidatorMetadataManager.seedDstMetadataVersionIfAbsent). Idempotent.
+    let version_present: i64 = dest_conn
+        .query_row(
+            "SELECT COUNT(*) FROM synclite_consolidator_metadata \
+             WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = ?3",
+            params![layout.device_id, layout.device_name, SYNCLITE_METADATA_VERSION_KEY],
+            |row| row.get(0),
+        )
+        .map_err(map_sql_err)?;
+    if version_present == 0 {
+        dest_conn
+            .execute(
+                "INSERT INTO synclite_consolidator_metadata(\
+                     device_uuid, device_name, prop_key, prop_value\
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    layout.device_id,
+                    layout.device_name,
+                    SYNCLITE_METADATA_VERSION_KEY,
+                    SYNCLITE_METADATA_VERSION.to_string(),
+                ],
             )
             .map_err(map_sql_err)?;
     }
@@ -5585,7 +7548,7 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
 fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &ConsolidatorLayout, initial_commit_id: i64) -> Result<()> {
     dest_conn
         .execute_batch(
-            "CREATE TABLE IF NOT EXISTS synclite_metadata(\n\
+            "CREATE TABLE IF NOT EXISTS synclite_checkpoint(\n\
                  synclite_device_id VARCHAR NOT NULL,\n\
                  synclite_device_name VARCHAR NOT NULL,\n\
                  synclite_update_timestamp VARCHAR,\n\
@@ -5596,37 +7559,27 @@ fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &Consolidat
                  txn_count BIGINT NOT NULL,\n\
                  PRIMARY KEY(synclite_device_id, synclite_device_name, commit_id)\n\
              );\n\
-             CREATE TABLE IF NOT EXISTS synclite_table_schema(\n\
-                 device_uuid VARCHAR NOT NULL,\n\
-                 device_name VARCHAR NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
-                 table_name VARCHAR NOT NULL,\n\
-                 create_sql TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, table_name)\n\
-             );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_metadata(\n\
                  device_uuid VARCHAR NOT NULL,\n\
                  device_name VARCHAR NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
                  prop_key VARCHAR NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, prop_key)\n\
+                 PRIMARY KEY(device_uuid, device_name, prop_key)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_table_metadata(\n\
                  device_uuid VARCHAR NOT NULL,\n\
                  device_name VARCHAR NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
                  database_name VARCHAR NOT NULL,\n\
                  table_name VARCHAR NOT NULL,\n\
                  prop_key VARCHAR NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, database_name, table_name, prop_key)\n\
+                 PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key)\n\
              );",
         )
         .map_err(map_duck_err)?;
     let has_row: i64 = dest_conn
         .query_row(
-            "SELECT COUNT(*) FROM synclite_metadata WHERE synclite_device_id = ? AND synclite_device_name = ?",
+            "SELECT COUNT(*) FROM synclite_checkpoint WHERE synclite_device_id = ? AND synclite_device_name = ?",
             duck_params_from_iter([DuckValue::Text(layout.device_id.clone()), DuckValue::Text(layout.device_name.clone())].iter()),
             |row| row.get(0),
         )
@@ -5640,7 +7593,7 @@ fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &Consolidat
         ];
         duck_exec_with_params(
             dest_conn,
-            "INSERT INTO synclite_metadata(\n\
+            "INSERT INTO synclite_checkpoint(\n\
                  synclite_device_id, synclite_device_name, synclite_update_timestamp,\n\
                  commit_id, cdc_change_number,\n\
                  cdc_log_segment_sequence_number, initialization_status, txn_count\n\
@@ -5648,12 +7601,48 @@ fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &Consolidat
             &vals,
         )?;
     }
+    // Seed synclite_metadata_version row if absent (Java parity).
+    let version_present: i64 = {
+        let mut stmt = dest_conn
+            .prepare(
+                "SELECT COUNT(*) FROM synclite_consolidator_metadata \
+                 WHERE device_uuid = ? AND device_name = ? AND prop_key = ?",
+            )
+            .map_err(map_duck_err)?;
+        let mut rows = stmt
+            .query(duck_params_from_iter(
+                [
+                    DuckValue::Text(layout.device_id.clone()),
+                    DuckValue::Text(layout.device_name.clone()),
+                    DuckValue::Text(SYNCLITE_METADATA_VERSION_KEY.to_string()),
+                ]
+                .iter(),
+            ))
+            .map_err(map_duck_err)?;
+        match rows.next().map_err(map_duck_err)? {
+            Some(row) => row.get(0).map_err(map_duck_err)?,
+            None => 0,
+        }
+    };
+    if version_present == 0 {
+        duck_exec_with_params(
+            dest_conn,
+            "INSERT INTO synclite_consolidator_metadata(\
+                 device_uuid, device_name, prop_key, prop_value\
+             ) VALUES(?, ?, ?, ?)",
+            &[
+                DuckValue::Text(layout.device_id.clone()),
+                DuckValue::Text(layout.device_name.clone()),
+                DuckValue::Text(SYNCLITE_METADATA_VERSION_KEY.to_string()),
+                DuckValue::Text(SYNCLITE_METADATA_VERSION.to_string()),
+            ],
+        )?;
+    }
     Ok(())
 }
 
 fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorLayout, initial_commit_id: i64) -> Result<()> {
-    let meta = pg_meta_table(layout, "synclite_metadata");
-    let tschema = pg_meta_table(layout, "synclite_table_schema");
+    let meta = pg_meta_table(layout, "synclite_checkpoint");
     let cmeta = pg_meta_table(layout, "synclite_consolidator_metadata");
     let ctmeta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
     let ddl = format!(
@@ -5668,31 +7657,21 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
                  txn_count BIGINT NOT NULL,\n\
                  PRIMARY KEY(synclite_device_id, synclite_device_name, commit_id)\n\
              );\n\
-             CREATE TABLE IF NOT EXISTS {tschema}(\n\
-                 device_uuid VARCHAR(36) NOT NULL,\n\
-                 device_name VARCHAR(255) NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
-                 table_name VARCHAR(255) NOT NULL,\n\
-                 create_sql TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, table_name)\n\
-             );\n\
              CREATE TABLE IF NOT EXISTS {cmeta}(\n\
                  device_uuid VARCHAR(64) NOT NULL,\n\
                  device_name VARCHAR(255) NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, prop_key)\n\
+                 PRIMARY KEY(device_uuid, device_name, prop_key)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS {ctmeta}(\n\
                  device_uuid VARCHAR(64) NOT NULL,\n\
                  device_name VARCHAR(255) NOT NULL,\n\
-                 dst_index INTEGER NOT NULL,\n\
                  database_name VARCHAR(255) NOT NULL,\n\
                  table_name VARCHAR(255) NOT NULL,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, dst_index, database_name, table_name, prop_key)\n\
+                 PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key)\n\
              );");
     with_device_tracer(|t| tracer_info!(t, "JDBCExecutor", "PG metadata DDL : {}", ddl));
     client.batch_execute(&ddl).map_err(|e| map_pg_err_with_sql(e, &ddl))?;
@@ -5738,6 +7717,35 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
                 &[&layout.device_id, &layout.device_name, &current_update_timestamp(), &initial_commit_id],
             )
             .map_err(|e| map_pg_err_with_sql(e, &insert_sql))?;
+    }
+    // Seed synclite_metadata_version row if absent (Java parity).
+    let version_count_sql = format!(
+        "SELECT COUNT(*) FROM {cmeta} WHERE device_uuid = $1 AND device_name = $2 AND prop_key = $3"
+    );
+    let version_key: String = SYNCLITE_METADATA_VERSION_KEY.to_string();
+    let version_value: String = SYNCLITE_METADATA_VERSION.to_string();
+    let version_count: i64 = client
+        .query_one(
+            version_count_sql.as_str(),
+            &[&layout.device_id, &layout.device_name, &version_key],
+        )
+        .map_err(|e| map_pg_err_with_sql(e, &version_count_sql))?
+        .get(0);
+    if version_count == 0 {
+        let version_insert_sql = format!(
+            "INSERT INTO {cmeta}(device_uuid, device_name, prop_key, prop_value) VALUES($1, $2, $3, $4)"
+        );
+        client
+            .execute(
+                version_insert_sql.as_str(),
+                &[
+                    &layout.device_id,
+                    &layout.device_name,
+                    &version_key,
+                    &version_value,
+                ],
+            )
+            .map_err(|e| map_pg_err_with_sql(e, &version_insert_sql))?;
     }
     Ok(())
 }

@@ -150,6 +150,15 @@ pub trait DbDevice: Send {
     /// to the active segment.
     fn commit(&mut self) -> Result<()>;
 
+    /// Latest commit-id that has been successfully recorded by this device
+    /// (advanced inside `commit()`). Returns 0 if no user commit has
+    /// landed yet. Used by `synclite::await_sync` so it does not have to
+    /// crack open the source DB — important for backends like DuckDB
+    /// where the file is not a SQLite database.
+    fn last_committed_commit_id(&self) -> i64 {
+        0
+    }
+
     /// Flush buffered log records without committing/rolling back fate.
     ///
     /// Transactional backends may use this to durably stage queued records.

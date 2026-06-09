@@ -243,6 +243,20 @@ pub struct ConsolidatorLayout {
     /// upstream logger keeps shipping into the stage subdir while
     /// paused.
     pub pause_sentinel: Option<PathBuf>,
+    /// Per-device stage directory the upstream shipper deposits
+    /// finalized `.sqllog` / `.cdclog` segments into. When set, the
+    /// worker periodically scans this directory and re-notifies any
+    /// segments that were not yet applied — the safety floor for the
+    /// push-style `notify_stage_path` notifications, which can be
+    /// missed on Windows under load (`WatchService` OVERFLOW) or
+    /// from non-SQLite Java shipping paths that don't fire the JNI
+    /// notify hook. `None` disables periodic scanning (caller must
+    /// drive everything via `notify_stage_path`).
+    pub stage_dir: Option<PathBuf>,
+    /// Java parity: `device-polling-interval-ms`. Interval at which
+    /// the worker re-scans `stage_dir` for unapplied segments. Default
+    /// 2000 ms, matching `ConfLoader.devicePollingIntervalMs`.
+    pub device_polling_interval_ms: u64,
 }
 
 /// Run `f` against the destination, retrying up to
@@ -418,6 +432,8 @@ impl ConsolidatorLayout {
             dst_triggers_file: None,
             dst_triggers: HashMap::new(),
             pause_sentinel: None,
+            stage_dir: None,
+            device_polling_interval_ms: 2000,
         }
     }
 
@@ -446,9 +462,11 @@ impl ConsolidatorLayout {
     }
 
     /// Path to the per-device identity metadata file. Mirrors Java's
-    /// `<rootPath>/synclite_device_metadata.db` (see SyncLiteDeviceInfo).
+    /// `<deviceWorkDir>/synclite_device_metadata.db` — this file is per-device
+    /// (one per `synclite-<device>-<uuid>` work subdir), NOT a workDir-root
+    /// global file.
     pub fn device_metadata_path(&self) -> PathBuf {
-        self.device_data_root.join("synclite_device_metadata.db")
+        self.device_work_dir.join("synclite_device_metadata.db")
     }
 
     /// Shared transactional-device backup path. Mirrors Java's
@@ -547,7 +565,7 @@ impl FilterMapperRules {
     /// Format: one `KEY=VALUE` per line. `KEY` is `TABLE` or `TABLE.COLUMN`
     /// (case-insensitive, stored upper-case). Blank lines and `#`-prefixed
     /// comments are skipped. Value `true` means allow, `false` means block,
-    /// anything else is a rename target. After parsing, `synclite_metadata`
+    /// anything else is a rename target. After parsing, `synclite_checkpoint`
     /// is always force-allowed.
     pub fn parse_rules_file(
         path: &Path,
@@ -601,8 +619,8 @@ impl FilterMapperRules {
             }
         }
 
-        // Java parity: synclite_metadata is always force-allowed.
-        table_rules.insert("SYNCLITE_METADATA".to_string(), "true".to_string());
+        // Java parity: synclite_checkpoint is always force-allowed.
+        table_rules.insert("SYNCLITE_CHECKPOINT".to_string(), "true".to_string());
 
         Ok(Self {
             enabled: true,

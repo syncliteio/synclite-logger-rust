@@ -333,11 +333,11 @@ fn req_cstr<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 
 fn parse_device_type(s: &str) -> Result<DeviceType, String> {
     match s.trim().to_ascii_uppercase().as_str() {
-        "SQLITE" => Ok(DeviceType::Sqlite),
-        "SQLITE_STORE" => Ok(DeviceType::SqliteStore),
-        "STREAMING" => Ok(DeviceType::Streaming),
-        "DUCKDB" => Ok(DeviceType::DuckDb),
-        "DUCKDB_STORE" => Ok(DeviceType::DuckDbStore),
+        "SQLITE" => Ok(DeviceType::SQLITE),
+        "SQLITE_STORE" => Ok(DeviceType::SQLITE_STORE),
+        "STREAMING" => Ok(DeviceType::STREAMING),
+        "DUCKDB" => Ok(DeviceType::DUCKDB),
+        "DUCKDB_STORE" => Ok(DeviceType::DUCKDB_STORE),
         other => Err(format!(
             "unknown device_type {other:?}; expected SQLITE | SQLITE_STORE | STREAMING | DUCKDB | DUCKDB_STORE"
         )),

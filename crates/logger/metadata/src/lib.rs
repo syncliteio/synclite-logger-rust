@@ -22,7 +22,15 @@ pub mod keys {
     pub const LOG_SEGMENT_SEQUENCE: &str = "log-segment-sequence";
     /// Last issued data-file sequence number (as a decimal string).
     pub const DATA_FILE_SEQUENCE: &str = "data-file-sequence";
+    /// On-disk metadata schema/semantics version. Bump when the layout
+    /// changes in a non-back-compatible way so a future logger version can
+    /// detect an older store and run a migration routine.
+    pub const SYNCLITE_METADATA_VERSION: &str = "synclite_metadata_version";
 }
+
+/// Current value written under `keys::SYNCLITE_METADATA_VERSION` on first
+/// init. Bump in lockstep with any migration routine.
+pub const SYNCLITE_METADATA_VERSION: i64 = 1;
 
 /// Persistent key/value store backed by a tiny SQLite file.
 pub struct MetadataManager {
@@ -37,6 +45,11 @@ impl MetadataManager {
         let conn = Connection::open(&path).map_err(db_err)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .map_err(db_err)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES(?1, ?2)",
+            params![keys::SYNCLITE_METADATA_VERSION, SYNCLITE_METADATA_VERSION.to_string()],
         )
         .map_err(db_err)?;
         Ok(Self {

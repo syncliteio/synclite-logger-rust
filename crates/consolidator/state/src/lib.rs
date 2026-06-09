@@ -13,10 +13,20 @@ use logger_core::{Error, Result};
 
 const DEFAULT_DST_ALIAS: &str = "DB-1";
 
+/// Key under which the on-disk metadata schema version is stored — both
+/// in the local `metadata` key/value table and in
+/// `synclite_consolidator_metadata` (LOCAL state DB and DESTINATION bookkeeping).
+pub const SYNCLITE_METADATA_VERSION_KEY: &str = "synclite_metadata_version";
+
+/// Current consolidator-side metadata schema/semantics version. Bump in
+/// lockstep with any migration routine so a future consolidator version
+/// can detect an older store and upgrade it on initialization.
+pub const SYNCLITE_METADATA_VERSION: i64 = 1;
+
 pub fn initialize_state_db(path: &Path) -> Result<()> {
     let conn = Connection::open(path).map_err(map_sql_err)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS synclite_metadata(\n\
+        "CREATE TABLE IF NOT EXISTS synclite_checkpoint(\n\
              commit_id LONG NOT NULL PRIMARY KEY,\n\
              cdc_change_number LONG NOT NULL,\n\
              cdc_log_segment_sequence_number LONG NOT NULL,\n\
@@ -49,23 +59,44 @@ pub fn initialize_state_db(path: &Path) -> Result<()> {
          CREATE TABLE IF NOT EXISTS synclite_consolidator_metadata(\n\
              device_uuid VARCHAR(64) NOT NULL,\n\
              device_name VARCHAR(255) NOT NULL,\n\
-             dst_index INTEGER NOT NULL,\n\
              prop_key VARCHAR(255) NOT NULL,\n\
              prop_value TEXT,\n\
-             PRIMARY KEY(device_uuid, device_name, dst_index, prop_key)\n\
+             PRIMARY KEY(device_uuid, device_name, prop_key)\n\
          );\n\
          CREATE TABLE IF NOT EXISTS synclite_consolidator_table_metadata(\n\
              device_uuid VARCHAR(64) NOT NULL,\n\
              device_name VARCHAR(255) NOT NULL,\n\
-             dst_index INTEGER NOT NULL,\n\
              database_name VARCHAR(255) NOT NULL,\n\
              table_name VARCHAR(255) NOT NULL,\n\
              prop_key VARCHAR(255) NOT NULL,\n\
              prop_value TEXT,\n\
-             PRIMARY KEY(device_uuid, device_name, dst_index, database_name, table_name, prop_key)\n\
+             PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key)\n\
          );",
     )
     .map_err(map_sql_err)?;
+
+    // Seed metadata-schema version row if absent. The `metadata` table has
+    // no PRIMARY KEY in this layout (Java parity) so we cannot use
+    // `INSERT OR IGNORE`; do an explicit SELECT-then-INSERT.
+    let has_version: bool = conn
+        .query_row(
+            "SELECT 1 FROM metadata WHERE key = ?1 LIMIT 1",
+            params![SYNCLITE_METADATA_VERSION_KEY],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_sql_err)?
+        .is_some();
+    if !has_version {
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES(?1, ?2)",
+            params![
+                SYNCLITE_METADATA_VERSION_KEY,
+                SYNCLITE_METADATA_VERSION.to_string()
+            ],
+        )
+        .map_err(map_sql_err)?;
+    }
     Ok(())
 }
 
@@ -240,7 +271,7 @@ pub fn initialize_from_backup(
         return Ok(false);
     }
 
-    ensure_synclite_metadata_seeded(state_conn, backup_path)?;
+    ensure_synclite_checkpoint_seeded(state_conn, backup_path)?;
 
     let _ = metadata_path;
 
@@ -269,7 +300,7 @@ pub fn initialize_from_backup(
 pub fn is_initialized(state_conn: &Connection) -> Result<bool> {
     Ok(state_conn
         .query_row(
-            "SELECT commit_id FROM synclite_metadata LIMIT 1",
+            "SELECT commit_id FROM synclite_checkpoint LIMIT 1",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -336,7 +367,7 @@ where
             // irrespective of destination metadata-store mode.
             map_local_checkpoint(state_conn, seq as i64, progress)?;
         } else {
-            update_synclite_metadata_for_segment(state_conn, seq as i64)?;
+            update_synclite_checkpoint_for_segment(state_conn, seq as i64)?;
         }
     }
 
@@ -354,9 +385,9 @@ where
     Ok(())
 }
 
-pub fn ensure_synclite_metadata_seeded(state_conn: &Connection, backup_db_path: &Path) -> Result<()> {
+pub fn ensure_synclite_checkpoint_seeded(state_conn: &Connection, backup_db_path: &Path) -> Result<()> {
     let existing = state_conn.query_row(
-        "SELECT commit_id FROM synclite_metadata LIMIT 1",
+        "SELECT commit_id FROM synclite_checkpoint LIMIT 1",
         [],
         |row| row.get::<_, i64>(0),
     );
@@ -376,7 +407,7 @@ pub fn ensure_synclite_metadata_seeded(state_conn: &Connection, backup_db_path: 
 
     state_conn
         .execute(
-            "INSERT INTO synclite_metadata(\n\
+            "INSERT INTO synclite_checkpoint(\n\
                  commit_id, cdc_change_number,\n\
                  cdc_log_segment_sequence_number, txn_count\n\
              ) VALUES(?1, -1, 0, 0)",
@@ -386,10 +417,10 @@ pub fn ensure_synclite_metadata_seeded(state_conn: &Connection, backup_db_path: 
     Ok(())
 }
 
-pub fn update_synclite_metadata_for_segment(state_conn: &Connection, seq: i64) -> Result<()> {
+pub fn update_synclite_checkpoint_for_segment(state_conn: &Connection, seq: i64) -> Result<()> {
     state_conn
         .execute(
-            "UPDATE synclite_metadata\n\
+            "UPDATE synclite_checkpoint\n\
              SET cdc_log_segment_sequence_number = CASE\n\
                      WHEN cdc_log_segment_sequence_number < ?1 THEN ?1\n\
                      ELSE cdc_log_segment_sequence_number\n\
@@ -402,7 +433,7 @@ pub fn update_synclite_metadata_for_segment(state_conn: &Connection, seq: i64) -
 
 pub fn get_commit_id(state_conn: &Connection) -> Result<i64> {
     let commit_id = state_conn
-        .query_row("SELECT commit_id FROM synclite_metadata LIMIT 1", [], |row| {
+        .query_row("SELECT commit_id FROM synclite_checkpoint LIMIT 1", [], |row| {
             row.get::<_, i64>(0)
         })
         .unwrap_or(0);
@@ -925,7 +956,7 @@ fn duck_exec_with_params(conn: &DuckConnection, sql: &str, vals: &[DuckValue]) -
 
 fn sqlite_has_checkpoint_device_columns(conn: &Connection) -> Result<bool> {
     let mut stmt = conn
-        .prepare("PRAGMA table_info('synclite_metadata')")
+        .prepare("PRAGMA table_info('synclite_checkpoint')")
         .map_err(map_sql_err)?;
     let mut rows = stmt.query([]).map_err(map_sql_err)?;
     let mut has_device_id = false;
@@ -943,7 +974,7 @@ fn sqlite_has_checkpoint_device_columns(conn: &Connection) -> Result<bool> {
 
 fn duckdb_has_checkpoint_device_columns(conn: &DuckConnection) -> Result<bool> {
     let mut stmt = conn
-        .prepare("PRAGMA table_info('synclite_metadata')")
+        .prepare("PRAGMA table_info('synclite_checkpoint')")
         .map_err(map_duck_err)?;
     let mut rows = stmt.query([]).map_err(map_duck_err)?;
     let mut has_device_id = false;
@@ -966,7 +997,7 @@ fn postgres_has_checkpoint_device_columns(client: &mut PgClient, layout: &Consol
                 "SELECT COUNT(DISTINCT column_name)
                  FROM information_schema.columns
                  WHERE table_schema = $1
-                   AND table_name = 'synclite_metadata'
+                   AND table_name = 'synclite_checkpoint'
                    AND column_name IN ('synclite_device_id', 'synclite_device_name')",
                 &[&schema],
             )
@@ -978,7 +1009,7 @@ fn postgres_has_checkpoint_device_columns(client: &mut PgClient, layout: &Consol
                 "SELECT COUNT(DISTINCT column_name)
                  FROM information_schema.columns
                  WHERE table_schema = current_schema()
-                   AND table_name = 'synclite_metadata'
+                   AND table_name = 'synclite_checkpoint'
                    AND column_name IN ('synclite_device_id', 'synclite_device_name')",
                 &[],
             )
@@ -999,12 +1030,12 @@ pub fn map_destination_checkpoint(
             let dst_conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
             if !sqlite_has_checkpoint_device_columns(&dst_conn)? {
                 return Err(Error::Config(
-                    "consolidator: destination synclite_metadata must contain synclite_device_id and synclite_device_name".to_string(),
+                    "consolidator: destination synclite_checkpoint must contain synclite_device_id and synclite_device_name".to_string(),
                 ));
             }
             let updated = dst_conn
                 .execute(
-                    "UPDATE synclite_metadata
+                    "UPDATE synclite_checkpoint
                      SET commit_id = ?1,
                          synclite_update_timestamp = ?2,
                          cdc_change_number = CASE WHEN ?3 >= 0 THEN ?3 ELSE cdc_change_number END,
@@ -1017,7 +1048,7 @@ pub fn map_destination_checkpoint(
                        AND synclite_device_name = ?7
                        AND commit_id = (
                             SELECT MAX(commit_id)
-                            FROM synclite_metadata
+                            FROM synclite_checkpoint
                             WHERE synclite_device_id = ?8 AND synclite_device_name = ?9
                        )",
                     params![
@@ -1036,7 +1067,7 @@ pub fn map_destination_checkpoint(
             if updated == 0 {
                 dst_conn
                     .execute(
-                        "INSERT INTO synclite_metadata(
+                        "INSERT INTO synclite_checkpoint(
                              synclite_device_id, synclite_device_name, synclite_update_timestamp, commit_id,
                              cdc_change_number, cdc_log_segment_sequence_number, txn_count
                          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1057,7 +1088,7 @@ pub fn map_destination_checkpoint(
             let dst_conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
             if !duckdb_has_checkpoint_device_columns(&dst_conn)? {
                 return Err(Error::Config(
-                    "consolidator: destination synclite_metadata must contain synclite_device_id and synclite_device_name".to_string(),
+                    "consolidator: destination synclite_checkpoint must contain synclite_device_id and synclite_device_name".to_string(),
                 ));
             }
             let vals = [
@@ -1074,7 +1105,7 @@ pub fn map_destination_checkpoint(
             ];
             let mut stmt = dst_conn
                 .prepare(
-                    "UPDATE synclite_metadata
+                    "UPDATE synclite_checkpoint
                      SET commit_id = ?,
                          synclite_update_timestamp = ?,
                          cdc_change_number = CASE WHEN ? >= 0 THEN ? ELSE cdc_change_number END,
@@ -1087,7 +1118,7 @@ pub fn map_destination_checkpoint(
                        AND synclite_device_name = ?
                        AND commit_id = (
                             SELECT MAX(commit_id)
-                            FROM synclite_metadata
+                            FROM synclite_checkpoint
                             WHERE synclite_device_id = ? AND synclite_device_name = ?
                        )",
                 )
@@ -1107,7 +1138,7 @@ pub fn map_destination_checkpoint(
                 ];
                 duck_exec_with_params(
                     &dst_conn,
-                    "INSERT INTO synclite_metadata(
+                    "INSERT INTO synclite_checkpoint(
                          synclite_device_id, synclite_device_name, synclite_update_timestamp, commit_id,
                          cdc_change_number, cdc_log_segment_sequence_number, txn_count
                      ) VALUES(?, ?, ?, ?, ?, ?, ?)",
@@ -1120,10 +1151,10 @@ pub fn map_destination_checkpoint(
             let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
             if !postgres_has_checkpoint_device_columns(&mut client, layout)? {
                 return Err(Error::Config(
-                    "consolidator: destination synclite_metadata must contain synclite_device_id and synclite_device_name".to_string(),
+                    "consolidator: destination synclite_checkpoint must contain synclite_device_id and synclite_device_name".to_string(),
                 ));
             }
-            let meta = pg_meta_table(layout, "synclite_metadata");
+            let meta = pg_meta_table(layout, "synclite_checkpoint");
             let update_sql = format!(
                     "UPDATE {meta}
                      SET commit_id = $1,
@@ -1188,7 +1219,7 @@ pub fn map_destination_checkpoint(
 pub fn map_local_checkpoint(state_conn: &Connection, seq: i64, progress: ApplyProgress) -> Result<()> {
     state_conn
         .execute(
-            "UPDATE synclite_metadata\n\
+            "UPDATE synclite_checkpoint\n\
              SET commit_id = ?1,\n\
                  cdc_change_number = CASE WHEN ?2 >= 0 THEN ?2 ELSE cdc_change_number END,\n\
                  cdc_log_segment_sequence_number = CASE\n\
@@ -1220,15 +1251,15 @@ const CREATE_LOCAL_TABLE_METADATA_TBL_SQL: &str =
 
 const CREATE_DST_PROP_TBL_SQL: &str =
     "CREATE TABLE IF NOT EXISTS synclite_consolidator_metadata(\
-     device_uuid VARCHAR(64) NOT NULL, device_name VARCHAR(255) NOT NULL, dst_index INTEGER NOT NULL, \
+     device_uuid VARCHAR(64) NOT NULL, device_name VARCHAR(255) NOT NULL, \
      prop_key VARCHAR(255) NOT NULL, prop_value TEXT, \
-     PRIMARY KEY(device_uuid, device_name, dst_index, prop_key))";
+     PRIMARY KEY(device_uuid, device_name, prop_key))";
 
 const CREATE_DST_TABLE_METADATA_TBL_SQL: &str =
     "CREATE TABLE IF NOT EXISTS synclite_consolidator_table_metadata(\
-     device_uuid VARCHAR(64) NOT NULL, device_name VARCHAR(255) NOT NULL, dst_index INTEGER NOT NULL, \
+     device_uuid VARCHAR(64) NOT NULL, device_name VARCHAR(255) NOT NULL, \
      database_name VARCHAR(255) NOT NULL, table_name VARCHAR(255) NOT NULL, prop_key VARCHAR(255) NOT NULL, prop_value TEXT, \
-     PRIMARY KEY(device_uuid, device_name, dst_index, database_name, table_name, prop_key))";
+     PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key))";
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -1340,14 +1371,13 @@ fn dst_props_sqlite_get(
     conn: &Connection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     key: &str,
 ) -> Result<Option<String>> {
     conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_sql_err)?;
     conn.query_row(
         "SELECT prop_value FROM synclite_consolidator_metadata \
-         WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3 AND prop_key = ?4",
-        params![device_uuid, device_name, dst_index, key],
+         WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = ?3",
+        params![device_uuid, device_name, key],
         |r| r.get::<_, String>(0),
     )
     .optional()
@@ -1358,7 +1388,6 @@ fn dst_props_sqlite_upsert(
     conn: &mut Connection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     kvs: &[(&str, String)],
 ) -> Result<()> {
     conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_sql_err)?;
@@ -1366,14 +1395,14 @@ fn dst_props_sqlite_upsert(
     for (k, v) in kvs {
         tx.execute(
             "DELETE FROM synclite_consolidator_metadata \
-             WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3 AND prop_key = ?4",
-            params![device_uuid, device_name, dst_index, k],
+             WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = ?3",
+            params![device_uuid, device_name, k],
         )
         .map_err(map_sql_err)?;
         tx.execute(
-            "INSERT INTO synclite_consolidator_metadata(device_uuid, device_name, dst_index, prop_key, prop_value) \
-             VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![device_uuid, device_name, dst_index, k, v],
+            "INSERT INTO synclite_consolidator_metadata(device_uuid, device_name, prop_key, prop_value) \
+             VALUES(?1, ?2, ?3, ?4)",
+            params![device_uuid, device_name, k, v],
         )
         .map_err(map_sql_err)?;
     }
@@ -1385,14 +1414,13 @@ fn dst_props_sqlite_delete(
     conn: &Connection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     key: &str,
 ) -> Result<()> {
     conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_sql_err)?;
     conn.execute(
         "DELETE FROM synclite_consolidator_metadata \
-         WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3 AND prop_key = ?4",
-        params![device_uuid, device_name, dst_index, key],
+         WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = ?3",
+        params![device_uuid, device_name, key],
     )
     .map_err(map_sql_err)?;
     Ok(())
@@ -1402,18 +1430,16 @@ fn dst_props_duck_get(
     conn: &DuckConnection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     key: &str,
 ) -> Result<Option<String>> {
     conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_duck_err)?;
     let res: duckdb::Result<String> = conn.query_row(
         "SELECT prop_value FROM synclite_consolidator_metadata \
-         WHERE device_uuid = ? AND device_name = ? AND dst_index = ? AND prop_key = ?",
+         WHERE device_uuid = ? AND device_name = ? AND prop_key = ?",
         duck_params_from_iter(
             [
                 DuckValue::Text(device_uuid.to_string()),
                 DuckValue::Text(device_name.to_string()),
-                DuckValue::Int(dst_index),
                 DuckValue::Text(key.to_string()),
             ]
             .iter(),
@@ -1431,7 +1457,6 @@ fn dst_props_duck_upsert(
     conn: &DuckConnection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     kvs: &[(&str, String)],
 ) -> Result<()> {
     conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_duck_err)?;
@@ -1439,26 +1464,24 @@ fn dst_props_duck_upsert(
         let del_vals = [
             DuckValue::Text(device_uuid.to_string()),
             DuckValue::Text(device_name.to_string()),
-            DuckValue::Int(dst_index),
             DuckValue::Text((*k).to_string()),
         ];
         duck_exec_with_params(
             conn,
             "DELETE FROM synclite_consolidator_metadata \
-             WHERE device_uuid = ? AND device_name = ? AND dst_index = ? AND prop_key = ?",
+             WHERE device_uuid = ? AND device_name = ? AND prop_key = ?",
             &del_vals,
         )?;
         let ins_vals = [
             DuckValue::Text(device_uuid.to_string()),
             DuckValue::Text(device_name.to_string()),
-            DuckValue::Int(dst_index),
             DuckValue::Text((*k).to_string()),
             DuckValue::Text(v.clone()),
         ];
         duck_exec_with_params(
             conn,
-            "INSERT INTO synclite_consolidator_metadata(device_uuid, device_name, dst_index, prop_key, prop_value) \
-             VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO synclite_consolidator_metadata(device_uuid, device_name, prop_key, prop_value) \
+             VALUES(?, ?, ?, ?)",
             &ins_vals,
         )?;
     }
@@ -1469,20 +1492,18 @@ fn dst_props_duck_delete(
     conn: &DuckConnection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     key: &str,
 ) -> Result<()> {
     conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_duck_err)?;
     let vals = [
         DuckValue::Text(device_uuid.to_string()),
         DuckValue::Text(device_name.to_string()),
-        DuckValue::Int(dst_index),
         DuckValue::Text(key.to_string()),
     ];
     duck_exec_with_params(
         conn,
         "DELETE FROM synclite_consolidator_metadata \
-         WHERE device_uuid = ? AND device_name = ? AND dst_index = ? AND prop_key = ?",
+         WHERE device_uuid = ? AND device_name = ? AND prop_key = ?",
         &vals,
     )?;
     Ok(())
@@ -1492,7 +1513,6 @@ fn dst_props_pg_get(
     client: &mut PgClient,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     key: &str,
 ) -> Result<Option<String>> {
     client
@@ -1501,8 +1521,8 @@ fn dst_props_pg_get(
     let rows = client
         .query(
             "SELECT prop_value FROM synclite_consolidator_metadata \
-             WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3 AND prop_key = $4",
-            &[&device_uuid, &device_name, &dst_index, &key],
+             WHERE device_uuid = $1 AND device_name = $2 AND prop_key = $3",
+            &[&device_uuid, &device_name, &key],
         )
         .map_err(map_pg_err)?;
     if let Some(row) = rows.into_iter().next() {
@@ -1517,7 +1537,6 @@ fn dst_props_pg_upsert(
     client: &mut PgClient,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     kvs: &[(&str, String)],
 ) -> Result<()> {
     client
@@ -1527,14 +1546,14 @@ fn dst_props_pg_upsert(
     for (k, v) in kvs {
         tx.execute(
             "DELETE FROM synclite_consolidator_metadata \
-             WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3 AND prop_key = $4",
-            &[&device_uuid, &device_name, &dst_index, k],
+             WHERE device_uuid = $1 AND device_name = $2 AND prop_key = $3",
+            &[&device_uuid, &device_name, k],
         )
         .map_err(map_pg_err)?;
         tx.execute(
-            "INSERT INTO synclite_consolidator_metadata(device_uuid, device_name, dst_index, prop_key, prop_value) \
-             VALUES($1, $2, $3, $4, $5)",
-            &[&device_uuid, &device_name, &dst_index, k, v],
+            "INSERT INTO synclite_consolidator_metadata(device_uuid, device_name, prop_key, prop_value) \
+             VALUES($1, $2, $3, $4)",
+            &[&device_uuid, &device_name, k, v],
         )
         .map_err(map_pg_err)?;
     }
@@ -1546,7 +1565,6 @@ fn dst_props_pg_delete(
     client: &mut PgClient,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     key: &str,
 ) -> Result<()> {
     client
@@ -1555,8 +1573,8 @@ fn dst_props_pg_delete(
     client
         .execute(
             "DELETE FROM synclite_consolidator_metadata \
-             WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3 AND prop_key = $4",
-            &[&device_uuid, &device_name, &dst_index, &key],
+             WHERE device_uuid = $1 AND device_name = $2 AND prop_key = $3",
+            &[&device_uuid, &device_name, &key],
         )
         .map_err(map_pg_err)?;
     Ok(())
@@ -1568,7 +1586,6 @@ fn dst_tblmeta_sqlite_upsert(
     conn: &mut Connection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     db: &str,
     table: &str,
     key: &str,
@@ -1579,15 +1596,15 @@ fn dst_tblmeta_sqlite_upsert(
     let tx = conn.transaction().map_err(map_sql_err)?;
     tx.execute(
         "DELETE FROM synclite_consolidator_table_metadata \
-         WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3 \
-           AND database_name = ?4 AND table_name = ?5 AND prop_key = ?6",
-        params![device_uuid, device_name, dst_index, db, table, key],
+         WHERE device_uuid = ?1 AND device_name = ?2 \
+           AND database_name = ?3 AND table_name = ?4 AND prop_key = ?5",
+        params![device_uuid, device_name, db, table, key],
     )
     .map_err(map_sql_err)?;
     tx.execute(
-        "INSERT INTO synclite_consolidator_table_metadata(device_uuid, device_name, dst_index, database_name, table_name, prop_key, prop_value) \
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![device_uuid, device_name, dst_index, db, table, key, value],
+        "INSERT INTO synclite_consolidator_table_metadata(device_uuid, device_name, database_name, table_name, prop_key, prop_value) \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![device_uuid, device_name, db, table, key, value],
     )
     .map_err(map_sql_err)?;
     tx.commit().map_err(map_sql_err)?;
@@ -1598,7 +1615,6 @@ fn dst_tblmeta_duck_upsert(
     conn: &DuckConnection,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     db: &str,
     table: &str,
     key: &str,
@@ -1609,7 +1625,6 @@ fn dst_tblmeta_duck_upsert(
     let del_vals = [
         DuckValue::Text(device_uuid.to_string()),
         DuckValue::Text(device_name.to_string()),
-        DuckValue::Int(dst_index),
         DuckValue::Text(db.to_string()),
         DuckValue::Text(table.to_string()),
         DuckValue::Text(key.to_string()),
@@ -1617,13 +1632,12 @@ fn dst_tblmeta_duck_upsert(
     duck_exec_with_params(
         conn,
         "DELETE FROM synclite_consolidator_table_metadata \
-         WHERE device_uuid = ? AND device_name = ? AND dst_index = ? AND database_name = ? AND table_name = ? AND prop_key = ?",
+         WHERE device_uuid = ? AND device_name = ? AND database_name = ? AND table_name = ? AND prop_key = ?",
         &del_vals,
     )?;
     let ins_vals = [
         DuckValue::Text(device_uuid.to_string()),
         DuckValue::Text(device_name.to_string()),
-        DuckValue::Int(dst_index),
         DuckValue::Text(db.to_string()),
         DuckValue::Text(table.to_string()),
         DuckValue::Text(key.to_string()),
@@ -1631,8 +1645,8 @@ fn dst_tblmeta_duck_upsert(
     ];
     duck_exec_with_params(
         conn,
-        "INSERT INTO synclite_consolidator_table_metadata(device_uuid, device_name, dst_index, database_name, table_name, prop_key, prop_value) \
-         VALUES(?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO synclite_consolidator_table_metadata(device_uuid, device_name, database_name, table_name, prop_key, prop_value) \
+         VALUES(?, ?, ?, ?, ?, ?)",
         &ins_vals,
     )?;
     Ok(())
@@ -1642,7 +1656,6 @@ fn dst_tblmeta_pg_upsert(
     client: &mut PgClient,
     device_uuid: &str,
     device_name: &str,
-    dst_index: i32,
     db: &str,
     table: &str,
     key: &str,
@@ -1654,14 +1667,14 @@ fn dst_tblmeta_pg_upsert(
     let mut tx = client.transaction().map_err(map_pg_err)?;
     tx.execute(
         "DELETE FROM synclite_consolidator_table_metadata \
-         WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3 AND database_name = $4 AND table_name = $5 AND prop_key = $6",
-        &[&device_uuid, &device_name, &dst_index, &db, &table, &key],
+         WHERE device_uuid = $1 AND device_name = $2 AND database_name = $3 AND table_name = $4 AND prop_key = $5",
+        &[&device_uuid, &device_name, &db, &table, &key],
     )
     .map_err(map_pg_err)?;
     tx.execute(
-        "INSERT INTO synclite_consolidator_table_metadata(device_uuid, device_name, dst_index, database_name, table_name, prop_key, prop_value) \
-         VALUES($1, $2, $3, $4, $5, $6, $7)",
-        &[&device_uuid, &device_name, &dst_index, &db, &table, &key, &value],
+        "INSERT INTO synclite_consolidator_table_metadata(device_uuid, device_name, database_name, table_name, prop_key, prop_value) \
+         VALUES($1, $2, $3, $4, $5, $6)",
+        &[&device_uuid, &device_name, &db, &table, &key, &value],
     )
     .map_err(map_pg_err)?;
     tx.commit().map_err(map_pg_err)?;
@@ -1734,7 +1747,6 @@ pub fn get_consolidator_property(
                     &conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     key,
                 )
             }
@@ -1744,7 +1756,6 @@ pub fn get_consolidator_property(
                     &conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     key,
                 )
             }
@@ -1755,7 +1766,6 @@ pub fn get_consolidator_property(
                     &mut client,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     key,
                 )
             }
@@ -1810,7 +1820,6 @@ pub fn upsert_consolidator_properties(
                     &mut conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     kvs,
                 )
             }
@@ -1821,7 +1830,6 @@ pub fn upsert_consolidator_properties(
                     &conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     kvs,
                 )
             }
@@ -1832,7 +1840,6 @@ pub fn upsert_consolidator_properties(
                     &mut client,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     kvs,
                 )
             }
@@ -1858,7 +1865,6 @@ pub fn delete_consolidator_property(
                     &conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     key,
                 )
             }
@@ -1868,7 +1874,6 @@ pub fn delete_consolidator_property(
                     &conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     key,
                 )
             }
@@ -1879,7 +1884,6 @@ pub fn delete_consolidator_property(
                     &mut client,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     key,
                 )
             }
@@ -1911,7 +1915,6 @@ pub fn upsert_consolidator_table_metadata(
                     &mut conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     db,
                     table,
                     key,
@@ -1925,7 +1928,6 @@ pub fn upsert_consolidator_table_metadata(
                     &conn,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     db,
                     table,
                     key,
@@ -1939,7 +1941,6 @@ pub fn upsert_consolidator_table_metadata(
                     &mut client,
                     &layout.device_id,
                     &layout.device_name,
-                    dst_index,
                     db,
                     table,
                     key,
@@ -1970,12 +1971,11 @@ pub fn get_consolidator_table_metadata(
                     .map_err(map_sql_err)?;
                 conn.query_row(
                     "SELECT prop_value FROM synclite_consolidator_table_metadata \
-                     WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3 \
-                       AND database_name = ?4 AND table_name = ?5 AND prop_key = ?6",
+                     WHERE device_uuid = ?1 AND device_name = ?2 \
+                       AND database_name = ?3 AND table_name = ?4 AND prop_key = ?5",
                     params![
                         &layout.device_id,
                         &layout.device_name,
-                        dst_index,
                         db,
                         table,
                         key
@@ -1990,11 +1990,10 @@ pub fn get_consolidator_table_metadata(
                 conn.execute_batch(CREATE_DST_TABLE_METADATA_TBL_SQL).map_err(map_duck_err)?;
                 let res: duckdb::Result<String> = conn.query_row(
                     "SELECT prop_value FROM synclite_consolidator_table_metadata \
-                     WHERE device_uuid = ? AND device_name = ? AND dst_index = ? AND database_name = ? AND table_name = ? AND prop_key = ?",
+                     WHERE device_uuid = ? AND device_name = ? AND database_name = ? AND table_name = ? AND prop_key = ?",
                     duck_params_from_iter([
                         DuckValue::Text(layout.device_id.clone()),
                         DuckValue::Text(layout.device_name.clone()),
-                        DuckValue::Int(dst_index),
                         DuckValue::Text(db.to_string()),
                         DuckValue::Text(table.to_string()),
                         DuckValue::Text(key.to_string()),
@@ -2016,9 +2015,9 @@ pub fn get_consolidator_table_metadata(
                 let rows = client
                     .query(
                         "SELECT prop_value FROM synclite_consolidator_table_metadata \
-                         WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3 \
-                           AND database_name = $4 AND table_name = $5 AND prop_key = $6",
-                        &[&layout.device_id, &layout.device_name, &dst_index, &db, &table, &key],
+                         WHERE device_uuid = $1 AND device_name = $2 \
+                           AND database_name = $3 AND table_name = $4 AND prop_key = $5",
+                        &[&layout.device_id, &layout.device_name, &db, &table, &key],
                     )
                     .map_err(map_pg_err)?;
                 Ok(rows.into_iter().next().and_then(|r| r.get(0)))
@@ -2072,6 +2071,26 @@ pub fn seed_consolidator_identity(layout: &ConsolidatorLayout, dst_index: i32) -
         ("database_id", "0".to_string()),
     ];
     upsert_consolidator_properties(layout, dst_index, &kvs)
+}
+
+/// Seeds the on-disk metadata schema version under
+/// [`SYNCLITE_METADATA_VERSION_KEY`] into the per-destination consolidator
+/// metadata store, but only if absent. Skipping when present preserves an
+/// older version stamp so future migration routines can detect the gap
+/// (current code version vs. stored version) and run an upgrade.
+pub fn seed_consolidator_metadata_version(
+    layout: &ConsolidatorLayout,
+    dst_index: i32,
+) -> Result<()> {
+    if get_consolidator_property(layout, dst_index, SYNCLITE_METADATA_VERSION_KEY)?.is_some() {
+        return Ok(());
+    }
+    upsert_consolidator_property(
+        layout,
+        dst_index,
+        SYNCLITE_METADATA_VERSION_KEY,
+        &SYNCLITE_METADATA_VERSION.to_string(),
+    )
 }
 
 /// Java parity: `DeviceDstInitializer.markTableInitialized` — after a snapshot
@@ -2175,8 +2194,13 @@ pub fn record_initial_table_schemas(
             .prepare(
                 "SELECT name, sql FROM sqlite_master \
                  WHERE type='table' \
-                   AND name NOT LIKE 'sqlite_%' \
-                   AND name NOT IN ('synclite_txn','synclite_dbreader_checkpoint','synclite_logreader_checkpoint') \
+                   AND name NOT IN ( \
+                       'synclite_txn', \
+                       'synclite_dbreader_checkpoint', \
+                       'synclite_logreader_checkpoint', \
+                       'replay_checkpoint', \
+                       'sqlite_sequence' \
+                   ) \
                  ORDER BY name",
             )
             .map_err(map_sql_err)?;
@@ -2262,8 +2286,13 @@ fn enumerate_user_tables(backup_path: &Path) -> Result<Vec<(String, i64)>> {
         .prepare(
             "SELECT name FROM sqlite_master \
              WHERE type='table' \
-               AND name NOT LIKE 'sqlite_%' \
-               AND name NOT IN ('synclite_txn','synclite_dbreader_checkpoint','synclite_logreader_checkpoint') \
+               AND name NOT IN ( \
+                   'synclite_txn', \
+                   'synclite_dbreader_checkpoint', \
+                   'synclite_logreader_checkpoint', \
+                   'replay_checkpoint', \
+                   'sqlite_sequence' \
+               ) \
              ORDER BY name",
         )
         .map_err(map_sql_err)?;
@@ -2330,11 +2359,11 @@ pub fn get_initialized_tables(
                     let mut stmt = conn
                         .prepare(
                             "SELECT table_name, prop_value FROM synclite_consolidator_table_metadata \
-                             WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3 AND prop_key = 'initial_rows'",
+                             WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = 'initial_rows'",
                         )
                         .map_err(map_sql_err)?;
                     let mut rows = stmt
-                        .query(params![layout.device_id, layout.device_name, dst_index])
+                        .query(params![layout.device_id, layout.device_name])
                         .map_err(map_sql_err)?;
                     while let Some(row) = rows.next().map_err(map_sql_err)? {
                         let t: String = row.get(0).map_err(map_sql_err)?;
@@ -2350,13 +2379,12 @@ pub fn get_initialized_tables(
                     let mut stmt = conn
                         .prepare(
                             "SELECT table_name, prop_value FROM synclite_consolidator_table_metadata \
-                             WHERE device_uuid = ? AND device_name = ? AND dst_index = ? AND prop_key = 'initial_rows'",
+                             WHERE device_uuid = ? AND device_name = ? AND prop_key = 'initial_rows'",
                         )
                         .map_err(map_duck_err)?;
                     let params: Vec<DuckValue> = vec![
                         DuckValue::Text(layout.device_id.clone()),
                         DuckValue::Text(layout.device_name.clone()),
-                        DuckValue::Int(dst_index),
                     ];
                     let mut rows = stmt
                         .query(duck_params_from_iter(params.iter()))
@@ -2378,8 +2406,8 @@ pub fn get_initialized_tables(
                     let rows = client
                         .query(
                             "SELECT table_name, prop_value FROM synclite_consolidator_table_metadata \
-                             WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3 AND prop_key = 'initial_rows'",
-                            &[&layout.device_id, &layout.device_name, &dst_index],
+                             WHERE device_uuid = $1 AND device_name = $2 AND prop_key = 'initial_rows'",
+                            &[&layout.device_id, &layout.device_name],
                         )
                         .map_err(map_pg_err)?;
                     for r in rows {
@@ -2507,8 +2535,9 @@ pub fn reset_local_table_metadata(layout: &ConsolidatorLayout, dst_index: i32) -
 }
 
 /// Java parity: `ConsolidatorMetadataManager.resetSchemas` (DESTINATION branch).
-/// Deletes all `synclite_table_schema` rows for this device+dst.
-pub fn reset_dst_schemas(layout: &ConsolidatorLayout, dst_index: i32) -> Result<()> {
+/// Deletes all per-table schema rows for this device — these now live in
+/// `synclite_consolidator_table_metadata` with `prop_key = 'create_sql'`.
+pub fn reset_dst_schemas(layout: &ConsolidatorLayout, _dst_index: i32) -> Result<()> {
     if layout.metadata_store != MetadataStore::Destination {
         return Ok(());
     }
@@ -2516,8 +2545,8 @@ pub fn reset_dst_schemas(layout: &ConsolidatorLayout, dst_index: i32) -> Result<
         DstType::Sqlite => {
             let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
             conn.execute(
-                "DELETE FROM synclite_table_schema WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3",
-                params![layout.device_id, layout.device_name, dst_index],
+                "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = 'create_sql'",
+                params![layout.device_id, layout.device_name],
             )
             .map_err(map_sql_err)?;
             Ok(())
@@ -2527,10 +2556,9 @@ pub fn reset_dst_schemas(layout: &ConsolidatorLayout, dst_index: i32) -> Result<
             let p: Vec<DuckValue> = vec![
                 DuckValue::Text(layout.device_id.clone()),
                 DuckValue::Text(layout.device_name.clone()),
-                DuckValue::Int(dst_index),
             ];
             conn.execute(
-                "DELETE FROM synclite_table_schema WHERE device_uuid = ? AND device_name = ? AND dst_index = ?",
+                "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ? AND device_name = ? AND prop_key = 'create_sql'",
                 duck_params_from_iter(p.iter()),
             )
             .map_err(map_duck_err)?;
@@ -2541,8 +2569,8 @@ pub fn reset_dst_schemas(layout: &ConsolidatorLayout, dst_index: i32) -> Result<
             let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
             client
                 .execute(
-                    "DELETE FROM synclite_table_schema WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3",
-                    &[&layout.device_id, &layout.device_name, &dst_index],
+                    "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = $1 AND device_name = $2 AND prop_key = 'create_sql'",
+                    &[&layout.device_id, &layout.device_name],
                 )
                 .map_err(map_pg_err)?;
             Ok(())
@@ -2551,7 +2579,7 @@ pub fn reset_dst_schemas(layout: &ConsolidatorLayout, dst_index: i32) -> Result<
 }
 
 /// Java parity: `ConsolidatorMetadataManager.resetTableMetadata` (DESTINATION branch).
-pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, dst_index: i32) -> Result<()> {
+pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, _dst_index: i32) -> Result<()> {
     if layout.metadata_store != MetadataStore::Destination {
         return Ok(());
     }
@@ -2560,8 +2588,8 @@ pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, dst_index: i32) -> 
             let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
             conn.execute_batch(CREATE_DST_TABLE_METADATA_TBL_SQL).map_err(map_sql_err)?;
             conn.execute(
-                "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ?1 AND device_name = ?2 AND dst_index = ?3",
-                params![layout.device_id, layout.device_name, dst_index],
+                "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ?1 AND device_name = ?2",
+                params![layout.device_id, layout.device_name],
             )
             .map_err(map_sql_err)?;
             Ok(())
@@ -2572,10 +2600,9 @@ pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, dst_index: i32) -> 
             let p: Vec<DuckValue> = vec![
                 DuckValue::Text(layout.device_id.clone()),
                 DuckValue::Text(layout.device_name.clone()),
-                DuckValue::Int(dst_index),
             ];
             conn.execute(
-                "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ? AND device_name = ? AND dst_index = ?",
+                "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ? AND device_name = ?",
                 duck_params_from_iter(p.iter()),
             )
             .map_err(map_duck_err)?;
@@ -2587,8 +2614,8 @@ pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, dst_index: i32) -> 
             client.batch_execute(CREATE_DST_TABLE_METADATA_TBL_SQL).map_err(map_pg_err)?;
             client
                 .execute(
-                    "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = $1 AND device_name = $2 AND dst_index = $3",
-                    &[&layout.device_id, &layout.device_name, &dst_index],
+                    "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = $1 AND device_name = $2",
+                    &[&layout.device_id, &layout.device_name],
                 )
                 .map_err(map_pg_err)?;
             Ok(())

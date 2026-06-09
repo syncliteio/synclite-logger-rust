@@ -11,11 +11,11 @@ fn main() -> Result<()> {
     // Explicit initialize variant with device type + config path.
 
     // Destination-aware shape:
-    // synclite::initialize(DeviceType::Sqlite, DEVICE_NAME, DB_PATH, None, synclite::SyncLiteOptions::default())?;
+    // synclite::initialize(DeviceType::SQLITE, DEVICE_NAME, DB_PATH, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
      synclite::initialize(
-         DeviceType::Sqlite,
+         DeviceType::SQLITE,
          DEVICE_NAME,
          DB_PATH,
          Some(synclite::DestinationOptions {
@@ -30,7 +30,7 @@ fn main() -> Result<()> {
 
     // SQLite destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {
@@ -45,7 +45,7 @@ fn main() -> Result<()> {
 
     // DuckDB destination example:
     // synclite::initialize(
-    //     DeviceType::Sqlite,
+    //     DeviceType::SQLITE,
     //     DEVICE_NAME,
     //     DB_PATH,
     //     Some(synclite::DestinationOptions {

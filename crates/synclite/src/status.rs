@@ -280,7 +280,7 @@ pub(crate) fn read_applied_commit_id(layout: &DeviceLayout) -> Option<i64> {
         }
         let Some(conn) = open_ro(&p) else { continue };
         if let Ok(v) = conn.query_row(
-            "SELECT commit_id FROM synclite_metadata LIMIT 1",
+            "SELECT commit_id FROM synclite_checkpoint LIMIT 1",
             [],
             |row| row.get::<_, i64>(0),
         ) {

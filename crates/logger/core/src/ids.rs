@@ -30,34 +30,40 @@ impl fmt::Display for Backend {
 }
 
 /// Java-compatible device type / mode.
+///
+/// Variant identifiers intentionally use Java's `UPPER_SNAKE_CASE` spelling
+/// (see `com.synclite.consolidator.device.DeviceType`) so the Rust and Java
+/// codebases address the same enumerator with the same symbol. The
+/// `non_camel_case_types` lint is suppressed for this reason.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DeviceType {
     /// SQLite transactional SQL device.
-    Sqlite,
+    SQLITE,
     /// SQLite store device.
-    SqliteStore,
+    SQLITE_STORE,
     /// SQLite streaming device.
-    Streaming,
+    STREAMING,
     /// DuckDB transactional SQL device.
-    DuckDb,
+    DUCKDB,
     /// DuckDB store device.
-    DuckDbStore,
+    DUCKDB_STORE,
 }
 
 impl DeviceType {
     /// Backend implied by this device type.
     pub fn backend(self) -> Backend {
         match self {
-            DeviceType::Sqlite | DeviceType::SqliteStore | DeviceType::Streaming => {
+            DeviceType::SQLITE | DeviceType::SQLITE_STORE | DeviceType::STREAMING => {
                 Backend::Sqlite
             }
-            DeviceType::DuckDb | DeviceType::DuckDbStore => Backend::DuckDb,
+            DeviceType::DUCKDB | DeviceType::DUCKDB_STORE => Backend::DuckDb,
         }
     }
 
     /// Whether this device follows transactional SQL-device logging semantics.
     pub fn is_transactional(self) -> bool {
-           matches!(self, DeviceType::Sqlite | DeviceType::DuckDb)
+           matches!(self, DeviceType::SQLITE | DeviceType::DUCKDB)
     }
 
     /// Whether this device participates in in-doubt restart recovery.
@@ -71,24 +77,24 @@ impl DeviceType {
 
     /// Whether the device allows concurrent writers in SyncLite metadata.
     pub fn allows_concurrent_writers(self) -> bool {
-        matches!(self, DeviceType::DuckDb | DeviceType::DuckDbStore | DeviceType::Streaming)
+        matches!(self, DeviceType::DUCKDB | DeviceType::DUCKDB_STORE | DeviceType::STREAMING)
     }
 
     /// Whether this device type is a STORE mode device.
     pub fn is_store(self) -> bool {
-        matches!(self, DeviceType::SqliteStore | DeviceType::DuckDbStore)
+        matches!(self, DeviceType::SQLITE_STORE | DeviceType::DUCKDB_STORE)
     }
 
     /// Whether this device type is the STREAMING mode.
     pub fn is_streaming(self) -> bool {
-        matches!(self, DeviceType::Streaming)
+        matches!(self, DeviceType::STREAMING)
     }
 
     /// Default device type for a backend when no explicit mode is configured.
     pub fn default_for_backend(backend: Backend) -> Self {
         match backend {
-            Backend::Sqlite => DeviceType::Sqlite,
-            Backend::DuckDb => DeviceType::DuckDb,
+            Backend::Sqlite => DeviceType::SQLITE,
+            Backend::DuckDb => DeviceType::DUCKDB,
         }
     }
 }
@@ -96,11 +102,11 @@ impl DeviceType {
 impl fmt::Display for DeviceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DeviceType::Sqlite => f.write_str("SQLITE"),
-            DeviceType::SqliteStore => f.write_str("SQLITE_STORE"),
-            DeviceType::Streaming => f.write_str("STREAMING"),
-            DeviceType::DuckDb => f.write_str("DUCKDB"),
-            DeviceType::DuckDbStore => f.write_str("DUCKDB_STORE"),
+            DeviceType::SQLITE => f.write_str("SQLITE"),
+            DeviceType::SQLITE_STORE => f.write_str("SQLITE_STORE"),
+            DeviceType::STREAMING => f.write_str("STREAMING"),
+            DeviceType::DUCKDB => f.write_str("DUCKDB"),
+            DeviceType::DUCKDB_STORE => f.write_str("DUCKDB_STORE"),
         }
     }
 }
@@ -110,11 +116,11 @@ impl std::str::FromStr for DeviceType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_uppercase().as_str() {
-            "SQLITE" => Ok(DeviceType::Sqlite),
-            "SQLITE_STORE" => Ok(DeviceType::SqliteStore),
-            "STREAMING" => Ok(DeviceType::Streaming),
-            "DUCKDB" => Ok(DeviceType::DuckDb),
-            "DUCKDB_STORE" => Ok(DeviceType::DuckDbStore),
+            "SQLITE" => Ok(DeviceType::SQLITE),
+            "SQLITE_STORE" => Ok(DeviceType::SQLITE_STORE),
+            "STREAMING" => Ok(DeviceType::STREAMING),
+            "DUCKDB" => Ok(DeviceType::DUCKDB),
+            "DUCKDB_STORE" => Ok(DeviceType::DUCKDB_STORE),
             other => Err(format!("unsupported device-type: {other}")),
         }
     }

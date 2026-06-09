@@ -69,7 +69,7 @@ impl DuckDbDeviceConfig {
             on_segment_ready: None,
             log_segment_page_size: DEFAULT_LOG_SEGMENT_PAGE_SIZE,
             log_segment_flush_batch_size: DEFAULT_LOG_SEGMENT_FLUSH_BATCH_SIZE,
-            device_type: DeviceType::DuckDb,
+            device_type: DeviceType::DUCKDB,
             max_inlined_log_args: 16,
             skip_restart_recovery: false,
         }
@@ -100,6 +100,7 @@ pub struct DuckDbDevice {
     current_segment_seq: SegmentSequence,
     next_change_number: u64,
     next_commit_id: u64,
+    last_committed_commit_id: u64,
     next_operation_id: u64,
     txn_runtime: TxnLogRuntime,
     txn_stage: Option<TxnStage>,
@@ -264,6 +265,7 @@ impl DuckDbDevice {
             current_segment_seq: resume.next_seq,
             next_change_number: 0,
             next_commit_id: initial_commit,
+            last_committed_commit_id: 0,
             next_operation_id: 0,
             txn_runtime: TxnLogRuntime::new(),
             txn_stage: None,
@@ -1039,6 +1041,7 @@ impl DbDevice for DuckDbDevice {
             }
         }
         self.flush_user_db_state()?;
+        self.last_committed_commit_id = committed_id;
         self.next_commit_id = next_monotonic_commit_id(self.next_commit_id);
         self.next_operation_id = 0;
         Ok(())

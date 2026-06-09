@@ -183,7 +183,7 @@ fn main() -> Result<()> {
     const DEVICE_NAME: &str = "sampledevice";
 
     synclite::initialize(
-        DeviceType::Sqlite,
+        DeviceType::SQLITE,
         DEVICE_NAME,
         DB_PATH,
         Some(DestinationOptions {
@@ -234,7 +234,7 @@ If you just want local-first behavior without a destination, drop the
 
 ```rust
 synclite::initialize(
-    DeviceType::Sqlite,
+    DeviceType::SQLITE,
     DEVICE_NAME,
     DB_PATH,
     None,
@@ -256,7 +256,7 @@ shipper, alternate stage transport), point SyncLite at a `synclite.conf`:
 
 ```rust
 synclite::initialize(
-    DeviceType::Sqlite,
+    DeviceType::SQLITE,
     DEVICE_NAME,
     DB_PATH,
     None,
@@ -534,7 +534,7 @@ the others.
 | **Rust** | `synclite` ([crates/synclite/](crates/synclite/)) | — | Native API. `rusqlite`- / `duckdb`-style `Connection` + `Statement`. |
 | **Python** | `synclite` (PyO3 wheel built from [crates/logger/bindings-python/](crates/logger/bindings-python/)) | — | `import synclite as sl`. Matches the Rust API 1:1 — `sl.initialize`, `sl.Connection.open`, `sl.await_sync`. Build with `maturin develop` from [python/](python/). |
 | **C / C++** | `synclite-c` cdylib + staticlib ([crates/logger/bindings-c/](crates/logger/bindings-c/)) | [include/synclite.h](include/synclite.h), [include/synclite.hpp](include/synclite.hpp) | C ABI for any FFI-capable language. The C++17 header (`synclite.hpp`) is a header-only RAII wrapper — `synclite::Connection`, `synclite::Statement`, `synclite::Value`. Build with `cargo build -p synclite-c [--release]`. |
-| **Java** | `io.synclite.logger` (JDBC) | — | Lives in the sibling [synclite-logger-java](../synclite-logger-java/) project; uses the same on-disk segment format and ships through the same staging/consolidator pipeline. |
+| **Java** | `io.synclite` (JDBC) | — | Lives in the sibling [synclite-logger-java](../synclite-logger-java/) project; uses the same on-disk segment format and ships through the same staging/consolidator pipeline. |
 | **Any (HTTP)** | [SyncLite DB](../synclite-db/) | — | Language-agnostic HTTP/JSON server fronting the same runtime. |
 
 ## Test

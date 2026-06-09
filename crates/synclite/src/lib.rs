@@ -85,7 +85,10 @@ mod mover;
 #[path = "logger/sql_split.rs"]
 mod sql_split;
 mod consolidator;
-mod cdc_native;
+/// Embedded `synclitecdc` native helper. Public so non-facade entry
+/// points (e.g. the Java JNI binding) can extract it before spawning a
+/// consolidator directly.
+pub mod cdc_native;
 /// Pause / resume sync API. Halts shipping + consolidation while the
 /// in-process logger keeps appending segments locally.
 pub mod pause;
@@ -173,11 +176,28 @@ fn user_home_or_cwd() -> PathBuf {
 }
 
 /// Destination overrides for [`initialize`].
+///
+/// The [`dst_connection_string`] field accepts either JDBC-style URLs
+/// or the native form for every supported backend; both are equivalent:
+///
+/// | Backend | JDBC form                              | Native form                          |
+/// |---------|----------------------------------------|--------------------------------------|
+/// | Sqlite  | `jdbc:sqlite:/path/to/file.db`         | `sqlite:///path/to/file.db`, `file:/path/to/file.db`, or a bare path `/path/to/file.db` |
+/// | DuckDb  | `jdbc:duckdb:/path/to/file.duckdb`     | `duckdb:/path/to/file.duckdb` or a bare path `/path/to/file.duckdb` |
+/// | Postgres| `jdbc:postgresql://user:pw@host:5432/db` | `postgresql://user:pw@host:5432/db` |
+///
+/// Query-string suffixes (e.g. `?journal_mode=WAL`) are accepted for
+/// SQLite/DuckDB and stripped during path extraction.
+///
+/// [`dst_connection_string`]: Self::dst_connection_string
 #[derive(Debug, Clone)]
 pub struct DestinationOptions {
     /// Destination backend/type.
     pub dst_type: DstType,
     /// Destination connection string or local destination path.
+    ///
+    /// JDBC and native forms are accepted interchangeably — see
+    /// [`DestinationOptions`] for the per-backend matrix.
     pub dst_connection_string: String,
     /// Optional destination database / catalog name.
     ///
@@ -272,6 +292,15 @@ pub mod sftp_keys {
 /// [`LogShipper`].
 pub struct Logger {
     device: Box<dyn DbDevice>,
+    /// Canonical db path. Kept so [`Logger::close`] / drop can clean up
+    /// the process-global commit tracker registry.
+    db_path: PathBuf,
+    /// In-memory last-committed-commit-id (advanced on every successful
+    /// `commit()`). Shared with [`LIVE_COMMIT_TRACKERS`] so
+    /// [`await_sync`] can read the source-side commit id without
+    /// reopening the user DB file. Mirrors Java
+    /// `SQLLogger.currentTxnCommitId`.
+    commit_tracker: Arc<std::sync::atomic::AtomicI64>,
     /// Held to keep the worker alive for the logger's lifetime. Dropped
     /// when the logger drops, which drains and stops the worker.
     _shipper: Option<Arc<LogShipper>>,
@@ -305,6 +334,45 @@ pub type SyncLite = Logger;
 
 static INITIALIZED_DEVICES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 const DEFAULT_BATCH_CAPACITY: usize = 4096;
+
+/// Per-device in-memory tracker of the last committed `commit_id`.
+///
+/// Populated by every live [`Logger`] for its db path; consulted by
+/// [`await_sync`] so the source-side commit id never has to be re-read
+/// from disk. This is uniform across SQL transactional / SQL store /
+/// streaming device classes and across SQLite / DuckDB backends — every
+/// `commit()` path bumps the value, and Java callers reach the same
+/// effective behavior through `nativeAwaitAppliedCommit`.
+static LIVE_COMMIT_TRACKERS: OnceLock<Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicI64>>>> =
+    OnceLock::new();
+
+fn live_commit_trackers(
+) -> &'static Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicI64>>> {
+    LIVE_COMMIT_TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_commit_tracker(db_path: &Path) -> Arc<std::sync::atomic::AtomicI64> {
+    let mut guard = live_commit_trackers()
+        .lock()
+        .expect("commit tracker registry mutex poisoned");
+    guard
+        .entry(db_path.to_path_buf())
+        .or_insert_with(|| Arc::new(std::sync::atomic::AtomicI64::new(0)))
+        .clone()
+}
+
+fn unregister_commit_tracker(db_path: &Path) {
+    if let Ok(mut guard) = live_commit_trackers().lock() {
+        guard.remove(db_path);
+    }
+}
+
+fn lookup_commit_tracker(db_path: &Path) -> Option<i64> {
+    let guard = live_commit_trackers().lock().ok()?;
+    guard
+        .get(db_path)
+        .map(|t| t.load(std::sync::atomic::Ordering::Acquire))
+}
 
 /// Prepared-statement style wrapper.
 ///
@@ -418,10 +486,23 @@ pub fn initialize<P: AsRef<Path>>(
     // file is removed.
     pause::maybe_run_trigger(&normalized_db_path, device_name)?;
 
-    // Merge any keys persisted by a prior `synclite::initialize` or
-    // `reinitialize` (notably `dst-idempotent-data-ingestion-1=true`
-    // after a reinit) into cfg.extra; explicit caller-supplied keys win.
+    // Merge keys persisted by a prior `synclite::initialize` into
+    // cfg.extra (e.g. metadata-store / filter-mapper / retry policy);
+    // explicit caller-supplied keys win.
     hydrate_initialize_config_from_metadata(&normalized_db_path, &mut cfg);
+
+    // Consume the one-shot reinit sentinel: if a prior
+    // `reinitialize` (explicit or trigger-file) ran for this device,
+    // it dropped `<device_home>/.reinit` to ask this run — and only
+    // this run — to apply the initial backup with
+    // `dst-object-init-mode-1=OVERWRITE_OBJECT`. In REPLICATION mode
+    // that drops and recreates the destination tables; in
+    // CONSOLIDATION mode it truncates this device's rows on the
+    // shared destination. Either way the post-reinit re-seed lands
+    // cleanly without duplicates. We force the flag in memory and
+    // delete the sentinel; nothing about this is persisted back into
+    // device metadata, so the user's configuration stays pristine.
+    consume_reinit_sentinel(&normalized_db_path, &mut cfg);
 
     // Offline-first: a short connect/round-trip probe of the
     // destination so a bad host / wrong password / missing DB shows
@@ -460,7 +541,7 @@ pub fn initialize<P: AsRef<Path>>(
 ///   * `source` = `MAX(commit_id)` from the device's `synclite_txn`
 ///     table (advanced by every successful user commit).
 ///   * `applied` = `commit_id` recorded in the consolidator's
-///     `synclite_metadata` (advanced after every applied segment),
+///     `synclite_checkpoint` (advanced after every applied segment),
 ///     with `device_status.last_consolidated_commit_id` as fallback.
 /// Returns `Ok` once `applied >= source`.
 ///
@@ -504,11 +585,14 @@ pub fn await_sync<P: AsRef<Path>>(db_path: P, timeout: std::time::Duration) -> R
     let deadline = std::time::Instant::now() + timeout;
 
     loop {
-        // `synclite_txn` is bootstrapped (with seed row (0,0)) during
-        // initialize() for every device backend / type, so this read
-        // is uniform across Sqlite / SqliteStore / DuckDb / DuckDbStore
-        // / Streaming.
-        let source = status::read_source_commit_id(&normalized_db_path).unwrap_or(0);
+        // Prefer the in-memory tracker advanced by Logger::commit. It
+        // works for every backend (SQLite / DuckDB) and every device
+        // class (transactional / store / streaming) because every
+        // commit path updates it. Falls back to reading synclite_txn
+        // from the user DB only when no logger is currently live for
+        // this path (e.g., the caller already closed it).
+        let source = lookup_commit_tracker(&normalized_db_path)
+            .unwrap_or_else(|| status::read_source_commit_id(&normalized_db_path).unwrap_or(0));
         // Edge case: only initialize() has run — no user commits have
         // landed in synclite_txn, so there is nothing for the
         // consolidator to apply.
@@ -523,6 +607,57 @@ pub fn await_sync<P: AsRef<Path>>(db_path: P, timeout: std::time::Duration) -> R
             return Err(Error::Config(format!(
                 "await_sync: timed out after {:?} (source_commit_id={}, applied_commit_id={})",
                 timeout, source, applied
+            )));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Like [`await_sync`] but the caller supplies the `target_commit_id`
+/// to wait for. The Rust runtime does not need to crack open the
+/// source DB — useful when the source backend is a non-SQLite store
+/// (Derby / H2 / HyperSQL) where `synclite_txn` lives inside the
+/// backend's own DB file and is unreachable via rusqlite. The Java
+/// logger reads it from its own in-memory commit-id tracker and
+/// passes the value through the JNI surface.
+pub fn await_applied_commit<P: AsRef<Path>>(
+    db_path: P,
+    target_commit_id: i64,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let normalized_db_path = normalize_db_path(db_path.as_ref())?;
+    let layout = DeviceLayout::new(normalized_db_path.clone());
+
+    if !layout.metadata_path.exists() {
+        return Err(Error::Config(format!(
+            "await_applied_commit: device metadata not found at {}",
+            layout.metadata_path.display()
+        )));
+    }
+
+    let md = Metadata::open_or_create(&layout.metadata_path)?;
+    let sync_configured = md.get_i64("sync_configured")?.unwrap_or(0) != 0;
+    drop(md);
+    if !sync_configured {
+        return Ok(());
+    }
+
+    if target_commit_id <= 0 {
+        return Ok(());
+    }
+
+    let poll = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let applied = status::read_applied_commit_id(&layout).unwrap_or(0);
+        if applied >= target_commit_id {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Config(format!(
+                "await_applied_commit: timed out after {:?} (target_commit_id={}, applied_commit_id={})",
+                timeout, target_commit_id, applied
             )));
         }
         std::thread::sleep(poll);
@@ -1196,6 +1331,8 @@ impl Logger {
 
         Ok(Self {
             device,
+            db_path: db_path.clone(),
+            commit_tracker: register_commit_tracker(&db_path),
             _shipper: shipper,
             _consolidators: consolidators,
             _app_lock: Some(app_lock),
@@ -1276,7 +1413,17 @@ impl Logger {
 
     /// Commit the active logical transaction.
     pub fn commit(&mut self) -> Result<()> {
-        self.device.commit()
+        self.device.commit()?;
+        // Mirror Java SQLLogger.currentTxnCommitId: publish the new
+        // commit-id so await_sync sees it without re-reading
+        // synclite_txn from the user DB. Works uniformly for SQL
+        // transactional / SQL store / streaming device classes.
+        let id = self.device.last_committed_commit_id();
+        if id > 0 {
+            self.commit_tracker
+                .store(id, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Flush buffered log records without deciding transaction fate.
@@ -1300,6 +1447,8 @@ impl Logger {
     pub fn close(self) -> Result<()> {
         let Logger {
             device,
+            db_path,
+            commit_tracker: _,
             _shipper,
             _consolidators,
             _app_lock,
@@ -1313,6 +1462,7 @@ impl Logger {
         drop(_consolidators);
         drop(_app_lock);
         drop(_tracer);
+        unregister_commit_tracker(&db_path);
         Ok(())
     }
 }
@@ -1338,7 +1488,7 @@ fn validate_device_name(device_name: &str) -> Result<()> {
 fn should_enable_event_consolidator(device_type: DeviceType) -> bool {
     device_type.is_store()
         || device_type.is_streaming()
-        || matches!(device_type, DeviceType::Sqlite | DeviceType::DuckDb)
+        || matches!(device_type, DeviceType::SQLITE | DeviceType::DUCKDB)
 }
 
 /// Java parity: the embedded consolidator is activated iff the config
@@ -1606,53 +1756,74 @@ fn parse_cfg_destination_connection_for_index(
     }
 }
 
+/// Extract a SQLite destination path from a connection string.
+///
+/// Accepts (interchangeably):
+///   * `jdbc:sqlite:<path>[?params]` (JDBC form)
+///   * `sqlite://<path>[?params]` (rust-native form)
+///   * `file:<path>[?params]`
+///   * `<path>` (bare filesystem path)
+///
+/// Returns `None` only for an empty input.
 pub(crate) fn parse_sqlite_path_from_connection(conn: Option<&str>) -> Option<PathBuf> {
     let conn = conn?.trim();
+    if conn.is_empty() {
+        return None;
+    }
     let lower = conn.to_ascii_lowercase();
-    if lower.starts_with("jdbc:sqlite:") {
-        let body = &conn["jdbc:sqlite:".len()..];
-        let path_part = body.split('?').next().unwrap_or(body).trim();
-        if !path_part.is_empty() {
-            return Some(PathBuf::from(path_part));
-        }
+    let stripped: Option<&str> = if lower.starts_with("jdbc:sqlite:") {
+        Some(&conn["jdbc:sqlite:".len()..])
+    } else if lower.starts_with("sqlite://") {
+        Some(&conn["sqlite://".len()..])
+    } else if lower.starts_with("file:") {
+        Some(&conn["file:".len()..])
+    } else {
+        None
+    };
+    let body = stripped.unwrap_or(conn);
+    let path_part = body.split('?').next().unwrap_or(body).trim();
+    if path_part.is_empty() {
+        return None;
     }
-    if lower.starts_with("sqlite://") {
-        let body = &conn["sqlite://".len()..];
-        let path_part = body.split('?').next().unwrap_or(body).trim();
-        if !path_part.is_empty() {
-            return Some(PathBuf::from(path_part));
-        }
-    }
-    if lower.starts_with("file:") {
-        let body = &conn["file:".len()..];
-        let path_part = body.split('?').next().unwrap_or(body).trim();
-        if !path_part.is_empty() {
-            return Some(PathBuf::from(path_part));
-        }
-    }
-    None
+    Some(PathBuf::from(path_part))
 }
 
+/// Extract a DuckDB destination path from a connection string.
+///
+/// Accepts (interchangeably):
+///   * `jdbc:duckdb:<path>[?params]` (JDBC form)
+///   * `duckdb:<path>[?params]` (rust-native form)
+///   * `<path>` (bare filesystem path)
+///
+/// Returns `None` only for an empty input.
 pub(crate) fn parse_duckdb_path_from_connection(conn: Option<&str>) -> Option<PathBuf> {
     let conn = conn?.trim();
+    if conn.is_empty() {
+        return None;
+    }
     let lower = conn.to_ascii_lowercase();
-    if lower.starts_with("jdbc:duckdb:") {
-        let body = &conn["jdbc:duckdb:".len()..];
-        let path_part = body.split('?').next().unwrap_or(body).trim();
-        if !path_part.is_empty() {
-            return Some(PathBuf::from(path_part));
-        }
+    let stripped: Option<&str> = if lower.starts_with("jdbc:duckdb:") {
+        Some(&conn["jdbc:duckdb:".len()..])
+    } else if lower.starts_with("duckdb:") {
+        Some(&conn["duckdb:".len()..])
+    } else {
+        None
+    };
+    let body = stripped.unwrap_or(conn);
+    let path_part = body.split('?').next().unwrap_or(body).trim();
+    if path_part.is_empty() {
+        return None;
     }
-    if lower.starts_with("duckdb:") {
-        let body = &conn["duckdb:".len()..];
-        let path_part = body.split('?').next().unwrap_or(body).trim();
-        if !path_part.is_empty() {
-            return Some(PathBuf::from(path_part));
-        }
-    }
-    None
+    Some(PathBuf::from(path_part))
 }
 
+/// Translate a PostgreSQL destination connection string into the form
+/// expected by the rust `postgres` / `tokio-postgres` clients.
+///
+/// Accepts (interchangeably):
+///   * `jdbc:postgresql://...` (JDBC form) — the `jdbc:` prefix is stripped.
+///   * `postgresql://...` or `postgres://...` (rust-native form) — returned as-is.
+///   * libpq key=value strings (e.g. `host=... user=...`) — returned as-is.
 pub(crate) fn translate_postgres_connection_string(conn: &str) -> Option<&str> {
     let trimmed = conn.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -1660,6 +1831,28 @@ pub(crate) fn translate_postgres_connection_string(conn: &str) -> Option<&str> {
         return Some(&trimmed[5..]);
     }
     Some(trimmed)
+}
+
+/// Normalize a destination connection string into the native form expected
+/// by the Rust consolidator's per-engine driver (rusqlite / duckdb /
+/// tokio-postgres). Strips JDBC prefixes and SQLite/DuckDB URL query
+/// strings. Returns the input unchanged when no normalization applies.
+///
+/// Used by callers (e.g. the JNI binding) that build a
+/// `ConsolidatorLayout` directly and bypass the config-loader path that
+/// already normalizes via `parse_cfg_destination_connection_for_index`.
+pub fn normalize_dst_connection_string(dst_type: DstType, raw: &str) -> String {
+    match dst_type {
+        DstType::Sqlite => parse_sqlite_path_from_connection(Some(raw))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw.to_string()),
+        DstType::DuckDb => parse_duckdb_path_from_connection(Some(raw))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw.to_string()),
+        DstType::Postgres => translate_postgres_connection_string(raw)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| raw.to_string()),
+    }
 }
 
 fn apply_destination_initialize_options(
@@ -1818,19 +2011,22 @@ fn persisted_device_name(db_path: &Path) -> Option<String> {
 /// reconstructs an identical destination/consolidator config. Mirrors
 /// `apply_destination_initialize_options` plus any per-destination
 /// suffix variants we need to round-trip.
+///
+/// Notably absent: `dst-idempotent-data-ingestion-1`. That flag is
+/// transient — flipped on for a single post-reinit re-seed via the
+/// `.reinit_idempotent` sentinel file (see [`reinitialize`] module) —
+/// so we deliberately keep it out of user-visible device metadata.
 const PERSISTED_INIT_EXTRA_KEYS: &[&str] = &[
     "dst-type",
     "dst-connection-string",
     "dst-sync-mode",
     "dst-database",
     "dst-schema",
-    // Persisted by `reinitialize` to force idempotent ingestion ON
-    // for the post-reinit re-seed (tolerates already-populated dst).
-    "dst-idempotent-data-ingestion-1",
-    // Persisted so the device-side `reinitialize` can locate the
-    // consolidator metadata DB (LOCAL vs DESTINATION) and apply the
-    // same filter-mapper rules the consolidator used when creating
-    // destination tables — required for accurate dst-name resolution.
+    // Persisted so a later `Connection::open(db_path)` re-spawns the
+    // consolidator with the same metadata store and filter-mapper
+    // rules the original `initialize(..)` used. (Reinit itself no
+    // longer needs the filter-mapper config — it reads pre-mapped
+    // destination names from `synclite_consolidator_table_metadata`.)
     "metadata-store-1",
     "dst-metadata-store-1",
     "dst-enable-filter-mapper-rules-1",
@@ -1952,6 +2148,34 @@ fn hydrate_initialize_config_from_metadata(db_path: &Path, cfg: &mut SyncLiteCon
         if let Ok(Some(value)) = md.get(key) {
             cfg.extra.insert((*key).to_string(), value);
         }
+    }
+}
+
+/// One-shot consumer of the `.reinit` sentinel dropped by
+/// [`reinitialize`]. When present, force
+/// `dst-object-init-mode-1=OVERWRITE_OBJECT` for this single
+/// `initialize(..)` invocation so the post-reinit re-seed wipes
+/// (REPLICATION) or truncates (CONSOLIDATION) this device's
+/// destination footprint before replaying, then delete the sentinel.
+/// We never persist the override back into device metadata — the
+/// user's configuration stays untouched. No-op when the sentinel is
+/// absent.
+fn consume_reinit_sentinel(db_path: &Path, cfg: &mut SyncLiteConfig) {
+    let layout = DeviceLayout::new(db_path.to_path_buf());
+    let sentinel = layout
+        .device_home
+        .join(reinitialize::REINIT_SENTINEL);
+    if !sentinel.exists() {
+        return;
+    }
+    cfg.extra
+        .insert("dst-object-init-mode-1".to_string(), "OVERWRITE_OBJECT".to_string());
+    if let Err(e) = std::fs::remove_file(&sentinel) {
+        tracing::warn!(
+            sentinel = %sentinel.display(),
+            error = %e,
+            "failed to remove reinit sentinel; will be re-applied on next init"
+        );
     }
 }
 
@@ -2237,7 +2461,11 @@ fn build_sftp_archiver_for_suffix(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_device_name, MAX_DEVICE_NAME_LEN};
+    use super::{
+        parse_duckdb_path_from_connection, parse_sqlite_path_from_connection,
+        translate_postgres_connection_string, validate_device_name, MAX_DEVICE_NAME_LEN,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn device_name_validation_accepts_java_compatible_names() {
@@ -2250,6 +2478,63 @@ mod tests {
     fn device_name_validation_rejects_invalid_names() {
         assert!(validate_device_name("bad-name").is_err());
         assert!(validate_device_name(&"a".repeat(MAX_DEVICE_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn sqlite_connection_string_accepts_jdbc_and_native_forms() {
+        let expected = PathBuf::from("/tmp/foo.db");
+        assert_eq!(
+            parse_sqlite_path_from_connection(Some("jdbc:sqlite:/tmp/foo.db")),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_sqlite_path_from_connection(Some("jdbc:sqlite:/tmp/foo.db?journal_mode=WAL")),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_sqlite_path_from_connection(Some("sqlite:///tmp/foo.db")),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_sqlite_path_from_connection(Some("file:/tmp/foo.db")),
+            Some(expected.clone())
+        );
+        // Bare path also works (rust-native form for rusqlite::Connection::open).
+        assert_eq!(
+            parse_sqlite_path_from_connection(Some("/tmp/foo.db")),
+            Some(expected)
+        );
+        assert_eq!(parse_sqlite_path_from_connection(Some("   ")), None);
+        assert_eq!(parse_sqlite_path_from_connection(None), None);
+    }
+
+    #[test]
+    fn duckdb_connection_string_accepts_jdbc_and_native_forms() {
+        let expected = PathBuf::from("/tmp/foo.duckdb");
+        assert_eq!(
+            parse_duckdb_path_from_connection(Some("jdbc:duckdb:/tmp/foo.duckdb")),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_duckdb_path_from_connection(Some("duckdb:/tmp/foo.duckdb")),
+            Some(expected.clone())
+        );
+        // Bare path also works (rust-native form for duckdb::Connection::open).
+        assert_eq!(
+            parse_duckdb_path_from_connection(Some("/tmp/foo.duckdb")),
+            Some(expected)
+        );
+        assert_eq!(parse_duckdb_path_from_connection(Some("   ")), None);
+    }
+
+    #[test]
+    fn postgres_connection_string_accepts_jdbc_and_native_forms() {
+        let native = "postgresql://u:p@h:5432/db";
+        let jdbc = "jdbc:postgresql://u:p@h:5432/db";
+        let kv = "host=h user=u password=p dbname=db";
+        assert_eq!(translate_postgres_connection_string(jdbc), Some(native));
+        assert_eq!(translate_postgres_connection_string(native), Some(native));
+        assert_eq!(translate_postgres_connection_string(kv), Some(kv));
     }
 }
 

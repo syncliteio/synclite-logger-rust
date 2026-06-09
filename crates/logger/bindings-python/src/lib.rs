@@ -159,7 +159,7 @@ impl PyConnection {
     }
 
     /// Initialize + open in one call using path-derived defaults
-    /// (`DeviceType::Sqlite`, device name derived from filename).
+    /// (`DeviceType::SQLITE`, device name derived from filename).
     #[staticmethod]
     fn initialize(db_path: &str) -> PyResult<Self> {
         let c = sl_sqlite::Connection::initialize(db_path).map_err(map_err)?;
@@ -561,11 +561,11 @@ impl PyDuckStatement {
 
 fn parse_device_type(s: &str) -> PyResult<DeviceType> {
     match s.trim().to_ascii_uppercase().as_str() {
-        "SQLITE" => Ok(DeviceType::Sqlite),
-        "SQLITE_STORE" => Ok(DeviceType::SqliteStore),
-        "STREAMING" => Ok(DeviceType::Streaming),
-        "DUCKDB" => Ok(DeviceType::DuckDb),
-        "DUCKDB_STORE" => Ok(DeviceType::DuckDbStore),
+        "SQLITE" => Ok(DeviceType::SQLITE),
+        "SQLITE_STORE" => Ok(DeviceType::SQLITE_STORE),
+        "STREAMING" => Ok(DeviceType::STREAMING),
+        "DUCKDB" => Ok(DeviceType::DUCKDB),
+        "DUCKDB_STORE" => Ok(DeviceType::DUCKDB_STORE),
         other => Err(PyValueError::new_err(format!(
             "unknown device_type {other:?}; expected one of \
              SQLITE, SQLITE_STORE, STREAMING, DUCKDB, DUCKDB_STORE"

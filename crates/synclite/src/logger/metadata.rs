@@ -14,11 +14,20 @@
 //! - `backup_taken` — `1` once the data backup has been written locally.
 //! - `backup_shipped` — `1` once the backup + metadata copy reach the
 //!   stage subdir.
+//! - `synclite_metadata_version` — see [`SYNCLITE_METADATA_VERSION`].
 
 use std::path::Path;
 
 use rusqlite::{params, Connection};
 use logger_core::{Error, Result};
+
+/// Key under which the on-disk metadata schema version is stored.
+pub const SYNCLITE_METADATA_VERSION_KEY: &str = "synclite_metadata_version";
+
+/// Current on-disk metadata schema/semantics version. Bump in lockstep with
+/// any migration routine so a future logger version can detect an older
+/// store and upgrade it.
+pub const SYNCLITE_METADATA_VERSION: i64 = 1;
 
 /// Wrapper around a `metadata` SQLite file.
 pub struct Metadata {
@@ -35,6 +44,11 @@ impl Metadata {
         let conn = Connection::open(path).map_err(map_err)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .map_err(map_err)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES(?1, ?2)",
+            params![SYNCLITE_METADATA_VERSION_KEY, SYNCLITE_METADATA_VERSION.to_string()],
         )
         .map_err(map_err)?;
         Ok(Self { conn })
