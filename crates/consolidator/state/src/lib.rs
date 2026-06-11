@@ -1694,13 +1694,10 @@ pub fn open_device_metadata(layout: &ConsolidatorLayout) -> Result<Connection> {
 /// call repeatedly: each call upserts and never deletes other keys.
 pub fn seed_device_metadata(layout: &ConsolidatorLayout) -> Result<()> {
     let mut conn = open_device_metadata(layout)?;
-    let allow_concurrent_writers = "0";
     let kvs: Vec<(&str, String)> = vec![
         ("database_name", layout.database_name.clone()),
         ("device_name", layout.device_name.clone()),
         ("device_type", layout.device_type.clone()),
-        ("database_id", "0".to_string()),
-        ("allow_concurrent_writers", allow_concurrent_writers.to_string()),
     ];
     local_upsert_many(&mut conn, &kvs)?;
     // Only set status if not already present (preserve handover state from Java).

@@ -8,7 +8,6 @@
 //!
 //! - `uuid` — UUIDv4 string, generated on first open.
 //! - `device_type` — `SQLITE` or `DUCKDB`.
-//! - `database_id` — informational; defaults to `0`.
 //! - `database_name` — basename of the device DB file.
 //! - `log_segment_sequence_number` — last seq used (`-1` when none).
 //! - `backup_taken` — `1` once the data backup has been written locally.
