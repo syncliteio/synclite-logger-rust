@@ -121,8 +121,6 @@ struct Snapshot {
     device_name: String,
     device_type: String,
     database_name: String,
-    database_id: i64,
-    allow_concurrent_writers: i64,
     dst_type: Option<String>,
     dst_conn_str: Option<String>,
     dst_database: Option<String>,
@@ -166,8 +164,6 @@ impl Snapshot {
             database_name: md
                 .get("database_name")?
                 .unwrap_or_else(|| layout.db_file_name.clone()),
-            database_id: md.get_i64("database_id")?.unwrap_or(0),
-            allow_concurrent_writers: md.get_i64("allow_concurrent_writers")?.unwrap_or(0),
             dst_type: md.get("dst-type")?.map(|s| s.trim().to_ascii_uppercase()),
             dst_conn_str: md.get("dst-connection-string")?,
             dst_database: md.get("dst-database")?,
@@ -186,8 +182,6 @@ impl Snapshot {
             md.put("device_type", &self.device_type)?;
         }
         md.put("database_name", &self.database_name)?;
-        md.put_i64("database_id", self.database_id)?;
-        md.put_i64("allow_concurrent_writers", self.allow_concurrent_writers)?;
         if let Some(v) = &self.dst_type {
             md.put("dst-type", v)?;
         }

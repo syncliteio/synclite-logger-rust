@@ -756,15 +756,6 @@ impl Logger {
         if md.get("device_type")?.is_none() {
             md.put("device_type", &device_type.to_string())?;
         }
-        if md.get("allow_concurrent_writers")?.is_none() {
-            md.put_i64(
-                "allow_concurrent_writers",
-                i64::from(device_type.allows_concurrent_writers()),
-            )?;
-        }
-        if md.get("database_id")?.is_none() {
-            md.put_i64("database_id", 0)?;
-        }
         if md.get("database_name")?.is_none() {
             md.put("database_name", &layout.db_file_name)?;
         }

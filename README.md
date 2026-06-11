@@ -107,66 +107,212 @@ alongside data, so the destination schema evolves automatically as the
 source schema changes. They all feed the same downstream destinations and
 honor all three mappers (filter / value / data-type).
 
+> **Which device should I pick?** Store devices (`*_STORE`) and the
+> `STREAMING` device emit pre-formed row events that the consolidator
+> applies directly to the destination — there is no SQL-log parsing or
+> CDC-deduction step on the apply path, so they deliver the highest
+> end-to-end consolidation throughput. Reach for a SQL device (`SQLITE`,
+> `DUCKDB`) when your app actually needs raw SQL, JOINs, multi-statement
+> transactions in one connection, or ad-hoc DDL beyond the schema-evolution
+> the Store API handles for you. For a brand-new app, `SQLITE_STORE` is
+> usually the fastest *and* simplest starting point.
+
 ## Supported Destinations
 
 - **SQLite** — file or in-memory.
 - **DuckDB** — file or in-memory.
 - **PostgreSQL** — via `dst-connection-string-N`.
 
-## Install
+## Prerequisites
 
-Add to `Cargo.toml`:
+> **Architecture support.** SyncLite is **64-bit only** — `x86_64` and `aarch64` on Windows / Linux / macOS. 32-bit is not supported because the embedded DuckDB engine requires a 64-bit host. SQLite-only deployments are still 64-bit since the `synclite` umbrella crate enables both backends; carving out a 32-bit SQLite-only build is not on the roadmap.
+
+| Tool | Version | When you need it |
+|---|---|---|
+| **Rust toolchain** (`rustc`, `cargo`) | `stable` (pinned via [`rust-toolchain.toml`](rust-toolchain.toml); workspace declares `rust-version = "1.86"`) | Always. `rustup` will auto-install the pinned toolchain on first build. |
+| **C/C++ toolchain** | Platform default (64-bit) | Always — transitive crates (`rusqlite`, `duckdb`) ship native code. Windows: "Build Tools for Visual Studio" (MSVC, x64). Linux: `build-essential` (gcc + make). macOS: Xcode Command Line Tools. |
+| **CMake** | 3.16+ | Required by the `duckdb` crate native build. Pre-installed on most CI images; otherwise install via your package manager. |
+| **Python 3.8+** + [`maturin`](https://www.maturin.rs/) | latest | Only for the [PyO3 wheel](python/) (`pip install maturin && maturin develop`). |
+| [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) + [Zig](https://ziglang.org/download/) | latest stable | Only for the multi-arch Linux cross-compile (see [Cross-compile for Linux](#cross-compile-for-linux-multi-arch-cdylibs) below). Not needed for a single-host build. |
+| **macOS host** | any supported | Only if you need `.dylib` artifacts — Apple SDK isn't redistributable so macOS cdylibs must be built on a macOS box. |
+
+One-shot bootstrap on a fresh box:
+
+```bash
+# 1. Rust toolchain (rustup auto-picks the channel from rust-toolchain.toml)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 2. (Optional) cross-compile prereqs for the Linux multi-arch payload (64-bit only)
+cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+# zig must be on PATH — download from https://ziglang.org/download/
+
+# 3. (Optional) accelerators — see Build accelerators below
+cargo install sccache
+```
+
+## Build
+
+All commands run from the repo root (`synclite-logger-rust/`) unless noted.
+
+### Build everything (one command)
+
+Build every crate (umbrella + JNI + C ABI), in release mode, for the host plus both Linux glibc targets — no examples, no test binaries:
+
+```bash
+cargo build --workspace --release \
+  && cargo zigbuild --workspace --release --target x86_64-unknown-linux-gnu \
+  && cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu
+```
+
+This produces, under `target/`:
+
+| Path | What it is |
+|---|---|
+| `target/release/synclite_jni.{dll,so,dylib}` | Host-arch JNI cdylib for the Java logger. |
+| `target/release/synclite_c.{dll,so,dylib}` + `.{lib,a}` | Host-arch C ABI cdylib + staticlib for C/C++/Go/Python. |
+| `target/release/libsynclite.rlib` (and component `.rlib`s) | Rust artifacts for in-tree consumers. |
+| `target/x86_64-unknown-linux-gnu/release/libsynclite_jni.so`, `libsynclite_c.so` | Linux x86_64 cdylibs (cross-compiled). |
+| `target/aarch64-unknown-linux-gnu/release/libsynclite_jni.so`, `libsynclite_c.so` | Linux aarch64 cdylibs (cross-compiled). |
+
+The macOS `.dylib` is only produced when you run the same command on a macOS host — the Apple SDK is not redistributable, so it cannot be cross-compiled from Windows/Linux.
+
+If you don't have `cargo-zigbuild` + Zig set up, drop the two `cargo zigbuild` lines — the first `cargo build --workspace --release` is enough on its own and produces a complete host-arch build.
+
+### Use as a dependency
+
+In another Cargo project, add the crate by **path** (local checkout):
 
 ```toml
 [dependencies]
 synclite = { path = "path/to/synclite-logger-rust/crates/synclite" }
 ```
 
-Or build from the workspace root:
+…or directly from **GitHub** (no local clone required):
 
-```powershell
+```toml
+[dependencies]
+# Track the main branch
+synclite = { git = "https://github.com/syncliteio/SyncLite.git", branch = "main" }
+
+# Pin to a release tag (recommended for reproducible builds)
+synclite = { git = "https://github.com/syncliteio/SyncLite.git", tag = "v1.0.0" }
+
+# Pin to an exact commit
+synclite = { git = "https://github.com/syncliteio/SyncLite.git", rev = "abc1234" }
+```
+
+The `synclite` crate lives in a sub-directory of the platform repo, so Cargo needs no extra hint — it discovers the crate via the workspace metadata in [`Cargo.toml`](Cargo.toml). For private forks, swap in your fork URL; if the fork uses an SSH remote, use `git = "ssh://git@github.com/<org>/<repo>.git"`.
+
+> Cargo caches git deps under `~/.cargo/git/`. Run `cargo update -p synclite` to pull a new commit when tracking a branch.
+
+### Standalone debug build
+
+```bash
 cargo build --workspace
 ```
 
-### Platform packaging (multi-arch cdylibs)
+Outputs go to `target/debug/`. Fast to iterate on, larger binaries, no LTO.
 
-Building the umbrella SyncLite platform from the repo root with Maven
-produces a complete, multi-arch native bundle under
-`target/synclite-platform-<rev>/lib/native/`:
-
-```
-libsynclite_<rev>.dll                  # Windows host build
-libsynclite_<rev>.lib                  # Windows import library
-libsynclite_<rev>_linux_x86_64.so      # cross-compiled with cargo-zigbuild
-libsynclite_<rev>_linux_aarch64.so     # cross-compiled with cargo-zigbuild
-libsynclite_<rev>.dylib                # only when built on a macOS host
-```
-
-The Linux cdylibs are cross-compiled on every host by default (no
-profile flag needed) using [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
-so a single `mvn -Drevision=<rev> package` ships a Windows + Linux
-x86_64 + Linux aarch64 payload from one machine.
-
-Required build-host prerequisites (in addition to Rust + Cargo):
-
-- `cargo-zigbuild` Cargo subcommand
-- [Zig](https://ziglang.org/download/) compiler on `PATH`
-- Rust std libs for the Linux targets
-
-One-time host setup:
+### Standalone release build
 
 ```bash
-cargo install cargo-zigbuild
-rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-# zig must be on PATH — download from https://ziglang.org/download/
+cargo build --workspace --release
 ```
 
-> If `mvn package` fails with `error: no such command: zigbuild`, you are
-> missing `cargo-zigbuild` — run `cargo install cargo-zigbuild` and retry.
+Outputs go to `target/release/`. The workspace [`profile.release`](Cargo.toml) enables `lto = "thin"`, `codegen-units = 1`, and symbol stripping — use this for benchmarking, distribution, and the artifacts consumed by the Java/Python/C++ bindings.
 
-macOS `.dylib` still requires running the build on a macOS host — the
-Apple SDK is not redistributable. Run the same Maven build on macOS to
-produce `libsynclite_<rev>.dylib`.
+### Build a single crate
+
+```bash
+# Just the public umbrella crate (no examples, no bindings)
+cargo build -p synclite --release
+
+# JNI bindings (consumed by the Java logger)
+cargo build -p synclite-bindings-java --release
+
+# C ABI cdylib + staticlib (consumed by C/C++/Go/Python)
+cargo build -p synclite-c --release
+```
+
+### Cross-compile for Linux (multi-arch cdylibs)
+
+For a multi-arch payload that runs on Windows + Linux x86_64 + Linux aarch64 from a single Windows or Linux build host, use [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) + [Zig](https://ziglang.org/download/) (see Prerequisites):
+
+```bash
+cargo zigbuild -p synclite-c --release --target x86_64-unknown-linux-gnu
+cargo zigbuild -p synclite-c --release --target aarch64-unknown-linux-gnu
+# repeat with -p synclite-bindings-java for the JNI cdylib
+```
+
+Outputs land under `target/<triple>/release/` — e.g. `target/x86_64-unknown-linux-gnu/release/libsynclite_c.so`.
+
+On a host without `cargo-zigbuild` + `zig`, simply omit the `--target <linux-triple>` lines — the host-arch build (`cargo build --workspace --release`) still produces a complete, working artifact for the build host. There's no separate "skip cross-compile" flag at the Cargo layer; not passing `--target` is the skip.
+
+> If `cargo zigbuild` fails with `error: no such command: zigbuild`, you are missing `cargo-zigbuild` — run `cargo install cargo-zigbuild` and retry.
+
+macOS `.dylib` requires running the build on a macOS host — the Apple SDK is not redistributable. Run the same `cargo build --workspace --release` on macOS to produce `libsynclite_jni.dylib` and `libsynclite_c.dylib`.
+
+### Useful build flags
+
+| Flag | Effect |
+|---|---|
+| `--release` | Apply the workspace release profile (LTO, codegen-units=1, stripped). |
+| `--workspace` | Build every member crate; required for full integration testing. |
+| `-p <crate>` | Build only the named crate (and its deps). Big speed-up when iterating. |
+| `--target <triple>` | Cross-compile for another target. Pair with `cargo-zigbuild` for Linux glibc targets. |
+| `--jobs N` / `-j N` | Cap concurrent rustc/codegen jobs. Useful on memory-constrained CI. |
+| `--locked` | Refuse to update `Cargo.lock`. Use in CI for reproducible builds. |
+| `--offline` | Disable network. Combine with a pre-populated `~/.cargo` cache. |
+| `--features=<...>` / `--no-default-features` | Toggle optional features on member crates. |
+
+Environment toggles that change *what* gets built:
+
+| Variable | Effect |
+|---|---|
+| `CARGO_PROFILE_RELEASE_LTO=off` | Skip LTO for a faster release build (drop the wall-clock at the cost of a slightly larger / slower binary). |
+| `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` | Trade some optimization for parallelism on release builds. |
+| `CARGO_INCREMENTAL=1` | Force incremental compilation even in release (off by default for release). |
+| `RUSTFLAGS="-C target-cpu=native"` | Tune the binary for the build host — not portable; do not use for distribution artifacts. |
+
+### Build accelerators
+
+None of these are required — they only speed up local iteration and CI.
+
+- **[`sccache`](https://github.com/mozilla/sccache)** — caches compiler output across builds and (optionally) across machines.
+
+  ```bash
+  cargo install sccache
+  $env:RUSTC_WRAPPER = "sccache"          # PowerShell
+  export RUSTC_WRAPPER=sccache            # bash / zsh
+  ```
+
+  Confirm it's wired in with `sccache --show-stats`.
+
+- **`mold` linker (Linux)** — ~10× faster link step than the default `ld` for incremental rebuilds. Install `mold` from your package manager, then in `~/.cargo/config.toml`:
+
+  ```toml
+  [target.x86_64-unknown-linux-gnu]
+  linker = "clang"
+  rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+  ```
+
+- **`lld` linker (Windows / Linux)** — shipped with LLVM; same setup pattern as mold.
+
+- **[`cargo-nextest`](https://nexte.st/)** — parallel test runner, 1.5–3× faster than `cargo test`:
+
+  ```bash
+  cargo install cargo-nextest
+  cargo nextest run -p synclite
+  ```
+
+- **Shared `target/` across workspaces** — point `CARGO_TARGET_DIR` at a single directory to share compiled deps across multiple checkouts.
+
+- **Incremental builds** — already on by default for debug. For release, set `CARGO_INCREMENTAL=1` if you rebuild often.
+
+- **Pre-warmed registry cache** — in containerised builds, mount `~/.cargo/registry` and `~/.cargo/git` as a cache layer; or use [`cargo-chef`](https://github.com/LukeMathWalker/cargo-chef) for Docker layer caching.
+
+- **Parallelism cap** — the workspace release profile uses `codegen-units = 1` for best runtime perf. For dev/CI where you only need a working binary, override with `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to use all cores.
 
 ## Quick Start — Local SQLite Replicated To PostgreSQL
 
@@ -598,7 +744,7 @@ On hosts without an embedded prebuilt (e.g., macOS today),
 the loader falls back to its standard search path: `SYNCLITE_CDC_LIB_DIR`,
 the workspace `native/` directory, then the system loader path.
 
-## Workspace Layout
+## Crate Identity
 
 - Repository / workspace: `synclite-logger-rust`
 - Published package: `synclite`

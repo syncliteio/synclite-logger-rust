@@ -75,11 +75,6 @@ impl DeviceType {
         true
     }
 
-    /// Whether the device allows concurrent writers in SyncLite metadata.
-    pub fn allows_concurrent_writers(self) -> bool {
-        matches!(self, DeviceType::DUCKDB | DeviceType::DUCKDB_STORE | DeviceType::STREAMING)
-    }
-
     /// Whether this device type is a STORE mode device.
     pub fn is_store(self) -> bool {
         matches!(self, DeviceType::SQLITE_STORE | DeviceType::DUCKDB_STORE)
