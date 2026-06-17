@@ -52,6 +52,9 @@ const EMBEDDED: Option<(&str, &[u8])> = None;
 
 static EXTRACTED_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Extract the embedded `synclitecdc` helper for supported hosts and return
+/// the directory that was written. If `SYNCLITE_CDC_LIB_DIR` is already set,
+/// this leaves the caller override in place and returns `None`.
 pub fn ensure_extracted() -> Option<PathBuf> {
     EXTRACTED_DIR
         .get_or_init(|| {
