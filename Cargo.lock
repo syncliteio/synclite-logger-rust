@@ -983,6 +983,7 @@ dependencies = [
  "logger-core",
  "postgres",
  "rusqlite",
+ "tracing",
 ]
 
 [[package]]

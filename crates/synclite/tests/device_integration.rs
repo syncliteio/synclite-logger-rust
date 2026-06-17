@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use logger_core::record::ArgValue;
 use logger_core::DeviceType;
 use logger_db_traits::Row;
-use synclite::{duckdb as sl_duckdb, rusqlite as sl_rusqlite, Logger};
+use synclite::{duckdb as sl_duckdb, rusqlite as sl_rusqlite};
 
 // --------------------------------------------------------------------------
 // Test scaffolding
@@ -62,31 +62,6 @@ fn inferred_device_type(device_name: &str, engine: &str) -> &'static str {
         ("duckdb", false) => "DUCKDB",
         _ => panic!("unsupported engine: {engine}"),
     }
-}
-
-fn slugify_kebab(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut prev_dash = false;
-    for ch in input.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() {
-            ch.to_ascii_lowercase()
-        } else {
-            '-'
-        };
-        if mapped == '-' {
-            if prev_dash {
-                continue;
-            }
-            prev_dash = true;
-        } else {
-            prev_dash = false;
-        }
-        out.push(mapped);
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() { "na".to_string() } else { out }
 }
 
 fn slugify_alnum(input: &str) -> String {
@@ -1180,6 +1155,14 @@ fn sqlite_execute_unlogged_runs_ddl_and_dml_without_commandlog_entries() {
 /// Exact mapping: Java `SQLiteTransactionalTest.testBasicTableOperations`.
 #[test]
 fn sqlite_transactional_test_basic_table_operations() {
+    let ws = Workspace::new(
+        "SQLiteTransactionalTest",
+        "sqlitetransactional-rust",
+        "sqlite",
+        false,
+    );
+    let table = test_table_name(&ws);
+    reset_destination_table_if_exists(&table);
     sqlite_basic_table_operations_core(
         "sqlitetransactional-rust",
         "SQLiteTransactionalTest",
@@ -1327,8 +1310,9 @@ fn sqlite_transactional_prepared_batch_logs_sql_once_and_cleans_on_rollback() {
         "sqlite",
         false,
     );
-    let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
+    reset_destination_table_if_exists(&table);
+    let mut logger = open_logger(&ws);
 
     logger
         .execute(
@@ -1947,6 +1931,8 @@ fn sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite() {
     }
     let store_table = test_table_name(&store_ws);
     let sql_table = test_table_name(&sql_ws);
+    reset_destination_table_if_exists(&store_table);
+    reset_destination_table_if_exists(&sql_table);
 
     // Store-device path writes directly from .sqllog.
     {

@@ -35,6 +35,15 @@ thread_local! {
     /// traces without threading the tracer through every signature.
     static DEVICE_TRACER: std::cell::RefCell<Option<Arc<Tracer>>> =
         std::cell::RefCell::new(None);
+
+    // Java parity (`DeviceSyncProcessor.inMemoryReplicaConn`): one long-lived
+    // in-memory SQLite schema replica per consolidator worker thread (i.e.
+    // per device-dst pair). Seeded lazily on first use, then mutated in place
+    // as DDL ops flow through `derive_commandlog_ddl_columns`. Reused across
+    // every segment apply for the lifetime of the worker thread so we never
+    // pay the seed cost more than once.
+    static SCHEMA_REPLICA: std::cell::RefCell<Option<Connection>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn with_device_tracer<F: FnOnce(&Arc<Tracer>)>(f: F) {
@@ -43,6 +52,37 @@ fn with_device_tracer<F: FnOnce(&Arc<Tracer>)>(f: F) {
             f(t);
         }
     });
+}
+
+/// Take-or-init the thread-local schema replica. On drop the connection is
+/// returned to the thread-local so subsequent segment applies reuse it.
+struct SchemaReplicaGuard {
+    conn: Option<Connection>,
+}
+
+impl SchemaReplicaGuard {
+    fn as_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().expect("schema replica guard taken")
+    }
+}
+
+impl Drop for SchemaReplicaGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            SCHEMA_REPLICA.with(|cell| {
+                *cell.borrow_mut() = Some(conn);
+            });
+        }
+    }
+}
+
+fn acquire_schema_replica(layout: &ConsolidatorLayout) -> Result<SchemaReplicaGuard> {
+    let existing = SCHEMA_REPLICA.with(|cell| cell.borrow_mut().take());
+    let conn = match existing {
+        Some(c) => c,
+        None => seed_commandlog_schema_replica(layout)?,
+    };
+    Ok(SchemaReplicaGuard { conn: Some(conn) })
 }
 
 // Java parity: `com.synclite.consolidator.processor.DeviceLogCleaner`
@@ -229,14 +269,13 @@ fn current_update_timestamp() -> String {
 
 fn format_timestamp_utc(epoch_ms: i64) -> String {
     let secs = epoch_ms.div_euclid(1000);
-    let millis = epoch_ms.rem_euclid(1000) as u32;
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400) as u32;
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
     let second = secs_of_day % 60;
     let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}")
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
 }
 
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
@@ -1820,6 +1859,9 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
     // synclite_device_metadata.db and reads consolidator init state from
     // the per-destination consolidator metadata store. This makes Java<->Rust
     // handover seamless for a given device.
+    if let Err(e) = consolidator_state::bootstrap_destination_metadata(&layout, layout.dst_index) {
+        tracing::warn!(error = %e, "failed to bootstrap destination metadata tables");
+    }
     if let Err(e) = consolidator_state::seed_device_metadata(&layout) {
         tracing::warn!(error = %e, "failed to seed synclite_device_metadata.db");
     }
@@ -2563,6 +2605,7 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
         &replica_path,
         work_command_log_path,
         seg_seq as i64,
+        layout,
         &cdc_log_path,
     )?;
 
@@ -2664,10 +2707,17 @@ fn replay_segment_with_native_cdc(
     replica_path: &Path,
     segment_path: &Path,
     command_log_segment_seq: i64,
+    layout: &ConsolidatorLayout,
     cdc_log_path: &Path,
 ) -> Result<ReplayOutput> {
     let seg_conn = Connection::open(segment_path).map_err(map_sql_err)?;
-    let (_first_commit, mut entries) = read_segment_entries(&seg_conn)?;
+    // Java parity (`DeviceSyncProcessor.inMemoryReplicaConn`): acquire the
+    // worker-owned schema replica. Held for the duration of this replay so
+    // the outer segment read + every REPLAY_TXN sidecar share state, and
+    // returned to the thread-local on drop for the next segment to reuse.
+    let mut guard = acquire_schema_replica(layout)?;
+    let schema_replica = guard.as_mut();
+    let (_first_commit, mut entries) = read_segment_entries_with_replica(&seg_conn, schema_replica)?;
 
     if let Some(resume) = read_replica_resume_checkpoint(replica_path)? {
         with_device_tracer(|t| {
@@ -2714,7 +2764,7 @@ fn replay_segment_with_native_cdc(
     let raw_entries_len = entries.len();
     entries = retain_committed_entries(entries);
     let committed_len = entries.len();
-    entries = expand_replay_txn_entries(entries, segment_path, command_log_segment_seq)?;
+    entries = expand_replay_txn_entries(entries, segment_path, command_log_segment_seq, schema_replica)?;
     let expanded_len = entries.len();
     let debug_callback = env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1");
     if debug_callback {
@@ -2752,6 +2802,7 @@ fn replay_segment_with_native_cdc(
                         &entries,
                         command_log_segment_seq,
                         segment_path,
+                        layout,
                         Some(&writer_mutex),
                     );
                     // Always finalize the writer regardless of replay outcome.
@@ -2789,6 +2840,7 @@ fn replay_segment_with_native_cdc(
                         &entries,
                         command_log_segment_seq,
                         segment_path,
+                        layout,
                         None,
                     )?;
                     Ok(ReplayOutput {
@@ -2820,7 +2872,14 @@ fn expand_replay_txn_entries(
     entries: Vec<SegmentEntry>,
     segment_path: &Path,
     segment_seq: i64,
+    schema_replica: &mut Connection,
 ) -> Result<Vec<SegmentEntry>> {
+    // Java parity (DeviceSyncProcessor.inMemoryReplicaConn): one schema
+    // replica is shared across the entire segment apply (outer segment +
+    // every sidecar). Each sidecar may contain ALTER TABLE / ADD COLUMN
+    // that depends on a CREATE TABLE emitted by an earlier sidecar or by
+    // the outer segment; using a fresh replica per sidecar would trip
+    // PRAGMA table_info on a missing table.
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         if entry.sql.trim_start().eq_ignore_ascii_case("REPLAY_TXN") {
@@ -2832,7 +2891,18 @@ fn expand_replay_txn_entries(
                 )));
             }
             let conn = Connection::open(&sidecar).map_err(map_sql_err)?;
-            let (_, side_entries) = read_segment_entries(&conn)?;
+            let (_, side_entries) = read_commandlog_entries_with_replica(&conn, schema_replica)?;
+            // Java parity (CommandLogSegment.java L84-86, L168-169): sidecar
+            // entries carry their own intra-sidecar change_number/commit_id
+            // (starting at 0) but logically belong to the outer REPLAY_TXN
+            // transaction. Re-stamp each entry with the outer marker's
+            // commit_id and change_number so downstream filters
+            // (retain_committed_entries) and per-entry checkpoint progress
+            // see them as part of the wrapping outer commit, not as
+            // orphan commit_id=0 rows that get dropped or never advance
+            // the destination checkpoint.
+            let outer_commit = entry.commit_id;
+            let outer_change = entry.change_number;
             for side in side_entries {
                 let sql_norm = side.sql.trim_start().to_ascii_uppercase();
                 if sql_norm.starts_with("BEGIN")
@@ -2843,7 +2913,11 @@ fn expand_replay_txn_entries(
                 {
                     continue;
                 }
-                out.push(side);
+                out.push(SegmentEntry {
+                    commit_id: outer_commit,
+                    change_number: outer_change,
+                    ..side
+                });
             }
             continue;
         }
@@ -4329,6 +4403,7 @@ impl NativeCdc {
         entries: &[SegmentEntry],
         command_log_segment_seq: i64,
         segment_path: &Path,
+        layout: &ConsolidatorLayout,
         writer: Option<&Mutex<NativeCdcLogWriter>>,
     ) -> Result<Vec<CdcEvent>> {
         let replica_c = CString::new(replica_path.to_string_lossy().to_string())
@@ -4428,7 +4503,14 @@ impl NativeCdc {
             )));
         }
 
-        let replay_result = self.replay_entries(db, entries, ctx_ptr, command_log_segment_seq, segment_path);
+        let replay_result = self.replay_entries(
+            db,
+            entries,
+            ctx_ptr,
+            command_log_segment_seq,
+            segment_path,
+            layout,
+        );
 
         // SAFETY: clear callback before dropping ctx.
         let clear_rc = unsafe { (self.clear_change_callback)(db) };
@@ -4490,6 +4572,7 @@ impl NativeCdc {
         ctx_ptr: *mut ReplayContext,
         command_log_segment_seq: i64,
         segment_path: &Path,
+        layout: &ConsolidatorLayout,
     ) -> Result<()> {
         let mut in_txn = false;
 
@@ -4569,7 +4652,14 @@ impl NativeCdc {
                     self.exec_sql(db, "BEGIN TRANSACTION")?;
                     in_txn = true;
                 }
-                self.replay_staged_txn_sidecar(db, segment_path, command_log_segment_seq, entry.commit_id)?;
+                self.replay_staged_txn_sidecar(
+                    db,
+                    segment_path,
+                    command_log_segment_seq,
+                    entry.commit_id,
+                    layout,
+                    ctx_ptr,
+                )?;
                 continue;
             }
 
@@ -4819,6 +4909,8 @@ impl NativeCdc {
         segment_path: &Path,
         command_log_segment_seq: i64,
         commit_id: i64,
+        layout: &ConsolidatorLayout,
+        ctx_ptr: *mut ReplayContext,
     ) -> Result<()> {
         let sidecar = replay_txn_sidecar_path(segment_path, command_log_segment_seq as u64, commit_id as u64);
         if !sidecar.exists() {
@@ -4829,9 +4921,9 @@ impl NativeCdc {
         }
 
         let conn = Connection::open(&sidecar).map_err(map_sql_err)?;
-        let (_, entries) = read_segment_entries(&conn)?;
-        for entry in entries {
-            let sql_norm = entry.sql.trim_start().to_ascii_uppercase();
+        let (_, entries) = read_segment_entries(&conn, layout)?;
+        for sidecar_entry in entries {
+            let sql_norm = sidecar_entry.sql.trim_start().to_ascii_uppercase();
             if sql_norm.starts_with("BEGIN")
                 || sql_norm.starts_with("COMMIT")
                 || sql_norm.starts_with("ROLLBACK")
@@ -4840,6 +4932,47 @@ impl NativeCdc {
             {
                 continue;
             }
+
+            // Java parity: sidecar entries carry their own intra-sidecar
+            // change_number/commit_id (starting at 0), but logically they
+            // are part of the outer REPLAY_TXN transaction. Re-stamp each
+            // entry with the outer commit_id so that cdclog rows and the
+            // commit_hook DML callback see the same commit as the wrapping
+            // BEGIN/COMMIT triple in the main sqllog. Without this, DDL
+            // would be persisted under commit_id=0 and the downstream
+            // device-sync-processor would never advance past it.
+            let entry = SegmentEntry {
+                commit_id,
+                ..sidecar_entry
+            };
+
+            // SAFETY: ctx_ptr remains valid through replay lifecycle.
+            if let Ok(mut cur_commit) = unsafe { &*ctx_ptr }.current_commit.lock() {
+                *cur_commit = commit_id;
+            }
+            if let Ok(mut cur_change) = unsafe { &*ctx_ptr }.current_change.lock() {
+                *cur_change = entry.change_number;
+            }
+
+            // Java parity: sidecar DDL must update the writer cdclog and the
+            // in-memory schema map exactly like the main replay loop does,
+            // otherwise DML rows that follow in this txn have no schema and
+            // the destination table never materializes.
+            let op_type = map_cdclog_op_type(&entry.sql);
+            let table_name = extract_table_name_for_operation(&entry.sql);
+            // SAFETY: ctx_ptr valid for replay duration.
+            let ctx_ref = unsafe { &*ctx_ptr };
+            if !ctx_ref.writer_ptr.is_null()
+                && !matches!(
+                    op_type,
+                    "INSERT" | "UPDATE" | "DELETE"
+                        | "BEGINTRAN" | "COMMITTRAN" | "ROLLBACKTRAN" | "CHECKPOINTTRAN"
+                        | "NOOP"
+                )
+            {
+                self.emit_ddl_via_writer(ctx_ref, op_type, table_name.as_deref(), &entry)?;
+            }
+
             let rendered = render_sql_with_args(&entry.sql, &entry.args);
             self.exec_sql(db, &rendered)?;
         }
@@ -5976,9 +6109,9 @@ struct CdcSchemaColumn {
     old_column_name: Option<String>,
 }
 
-fn read_segment_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEntry>)> {
+fn read_segment_entries(seg_conn: &Connection, layout: &ConsolidatorLayout) -> Result<(i64, Vec<SegmentEntry>)> {
     if has_table(seg_conn, "commandlog")? {
-        return read_commandlog_entries(seg_conn);
+        return read_commandlog_entries(seg_conn, layout);
     }
     if has_table(seg_conn, "cdclog")? {
         return read_cdclog_entries(seg_conn);
@@ -5988,33 +6121,64 @@ fn read_segment_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEntry>
     ))
 }
 
+fn read_segment_entries_with_replica(
+    seg_conn: &Connection,
+    schema_replica: &mut Connection,
+) -> Result<(i64, Vec<SegmentEntry>)> {
+    if has_table(seg_conn, "commandlog")? {
+        return read_commandlog_entries_with_replica(seg_conn, schema_replica);
+    }
+    if has_table(seg_conn, "cdclog")? {
+        return read_cdclog_entries(seg_conn);
+    }
+    Err(Error::Config(
+        "consolidator: segment has neither commandlog nor cdclog table".to_string(),
+    ))
+}
+
+fn apply_resume_filter(
+    entries: &mut Vec<SegmentEntry>,
+    segment_path: &Path,
+    layout: &ConsolidatorLayout,
+) -> Result<()> {
+    if layout.metadata_store != MetadataStore::Destination {
+        return Ok(());
+    }
+    let Some(segment_seq) = parse_segment_seq(segment_path).map(|v| v as i64) else {
+        return Ok(());
+    };
+    let Some(resume) = read_destination_resume_checkpoint(layout)? else {
+        return Ok(());
+    };
+    if resume.cdc_log_segment_sequence_number != segment_seq {
+        return Ok(());
+    }
+    if resume.cdc_change_number < 0 {
+        return Ok(());
+    }
+    let resume_change = resume.cdc_change_number;
+    entries.retain(|entry| entry.change_number > resume_change);
+    Ok(())
+}
+
+fn read_segment_entries_with_resume_and_replica(
+    seg_conn: &Connection,
+    segment_path: &Path,
+    layout: &ConsolidatorLayout,
+    schema_replica: &mut Connection,
+) -> Result<(i64, Vec<SegmentEntry>)> {
+    let (first_commit_id, mut entries) = read_segment_entries_with_replica(seg_conn, schema_replica)?;
+    apply_resume_filter(&mut entries, segment_path, layout)?;
+    Ok((first_commit_id, entries))
+}
+
 fn read_segment_entries_with_resume(
     seg_conn: &Connection,
     segment_path: &Path,
     layout: &ConsolidatorLayout,
 ) -> Result<(i64, Vec<SegmentEntry>)> {
-    let (first_commit_id, mut entries) = read_segment_entries(seg_conn)?;
-    if layout.metadata_store != MetadataStore::Destination {
-        return Ok((first_commit_id, entries));
-    }
-
-    let Some(segment_seq) = parse_segment_seq(segment_path).map(|v| v as i64) else {
-        return Ok((first_commit_id, entries));
-    };
-    let Some(resume) = read_destination_resume_checkpoint(layout)? else {
-        return Ok((first_commit_id, entries));
-    };
-    let resume_seq = resume.cdc_log_segment_sequence_number;
-    let resume_change = resume.cdc_change_number;
-
-    if resume_seq != segment_seq {
-        return Ok((first_commit_id, entries));
-    }
-    if resume_change < 0 {
-        return Ok((first_commit_id, entries));
-    }
-
-    entries.retain(|entry| entry.change_number > resume_change);
+    let (first_commit_id, mut entries) = read_segment_entries(seg_conn, layout)?;
+    apply_resume_filter(&mut entries, segment_path, layout)?;
     Ok((first_commit_id, entries))
 }
 
@@ -6030,7 +6194,15 @@ fn has_table(conn: &Connection, table_name: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-fn read_commandlog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEntry>)> {
+fn read_commandlog_entries(seg_conn: &Connection, layout: &ConsolidatorLayout) -> Result<(i64, Vec<SegmentEntry>)> {
+    let mut schema_replica = seed_commandlog_schema_replica(layout)?;
+    read_commandlog_entries_with_replica(seg_conn, &mut schema_replica)
+}
+
+fn read_commandlog_entries_with_replica(
+    seg_conn: &Connection,
+    schema_replica: &mut Connection,
+) -> Result<(i64, Vec<SegmentEntry>)> {
     let first_commit_id = seg_conn
         .query_row("SELECT MIN(commit_id) FROM commandlog", [], |row| {
             row.get::<_, Option<i64>>(0)
@@ -6084,15 +6256,9 @@ fn read_commandlog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEnt
                 .map_err(map_sql_err)?
         };
 
-        // Java parity: DeviceEventStreamer keeps an in-memory replica of
-        // the source schema so it can extract per-column metadata for
-        // store-device records (commandlog only carries raw SQL + args,
-        // not table/op/column metadata). For Rust we mirror the
-        // observable outcome by parsing the SQL directly: classify the
-        // op_type, extract the table name, and for CREATE TABLE / ADD
-        // COLUMN extract the column list. This is exactly the metadata
-        // the FilterMapper / ValueMapper / DataTypeMapper pipelines need
-        // to behave the same as for SQL devices (cdclog path).
+        // Java parity: DeviceEventStreamer keeps an in-memory schema replica.
+        // Seed from persisted metadata, apply DDL into the replica, then
+        // query PRAGMA table_info for column metadata.
         let op_type_str = map_cdclog_op_type(&sql);
         let op_type = if op_type_str == "NOOP" {
             None
@@ -6100,13 +6266,12 @@ fn read_commandlog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEnt
             Some(op_type_str.to_string())
         };
         let table_name = extract_table_name_for_operation(&sql);
-        let ddl_columns = match op_type_str {
-            "CREATETABLE" => parse_create_table_schema_columns(&sql).unwrap_or_default(),
-            "ADDCOLUMN" => parse_add_column_column(&sql)
-                .map(|c| vec![c])
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+        let ddl_columns = derive_commandlog_ddl_columns(
+            schema_replica,
+            op_type_str,
+            table_name.as_deref(),
+            &sql,
+        )?;
 
         entries.push(SegmentEntry {
             change_number,
@@ -6121,6 +6286,207 @@ fn read_commandlog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEnt
     }
 
     Ok((first_commit_id, entries))
+}
+
+fn seed_commandlog_schema_replica(layout: &ConsolidatorLayout) -> Result<Connection> {
+    let replica = Connection::open_in_memory().map_err(map_sql_err)?;
+    let create_sql_rows = load_seed_create_sql_rows(layout)?;
+    for (_table, create_sql) in create_sql_rows {
+        if create_sql.trim().is_empty() {
+            continue;
+        }
+        if let Err(e) = replica.execute_batch(&create_sql) {
+            let msg = e.to_string().to_ascii_lowercase();
+            if !msg.contains("already exists") && !msg.contains("more than one primary key") {
+                return Err(map_sql_err(e));
+            }
+        }
+    }
+    Ok(replica)
+}
+
+fn load_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<Vec<(String, String)>> {
+    if layout.metadata_store == MetadataStore::Local {
+        return load_local_seed_create_sql_rows(layout);
+    }
+    load_destination_seed_create_sql_rows(layout)
+}
+
+fn load_local_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<Vec<(String, String)>> {
+    let path = layout.consolidator_metadata_path(layout.dst_index);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open(&path).map_err(map_sql_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT table_name, value FROM table_metadata \
+             WHERE key = 'create_sql' \
+             ORDER BY database_name, table_name",
+        )
+        .map_err(map_sql_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            let table: String = r.get(0)?;
+            let sql: Option<String> = r.get(1)?;
+            Ok((table, sql.unwrap_or_default()))
+        })
+        .map_err(map_sql_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_sql_err)?;
+    Ok(rows)
+}
+
+fn load_destination_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<Vec<(String, String)>> {
+    let query = "SELECT table_name, prop_value FROM synclite_consolidator_table_metadata \
+        WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 AND prop_key = 'create_sql' \
+        ORDER BY table_name";
+    match layout.dst_type {
+        DstType::Sqlite => {
+            let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+            let mut stmt = conn.prepare(query).map_err(map_sql_err)?;
+            let rows = stmt
+                .query_map(params![layout.device_id, layout.device_name], |r| {
+                    let table: String = r.get(0)?;
+                    let sql: Option<String> = r.get(1)?;
+                    Ok((table, sql.unwrap_or_default()))
+                })
+                .map_err(map_sql_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(map_sql_err)?;
+            Ok(rows)
+        }
+        DstType::DuckDb => {
+            let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
+            let mut stmt = conn.prepare(query).map_err(map_duck_err)?;
+            let mut rows = stmt
+                .query(duck_params_from_iter([
+                    DuckValue::Text(layout.device_id.clone()),
+                    DuckValue::Text(layout.device_name.clone()),
+                ].iter()))
+                .map_err(map_duck_err)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(map_duck_err)? {
+                let table: String = row.get(0).map_err(map_duck_err)?;
+                let sql: Option<String> = row.get(1).map_err(map_duck_err)?;
+                out.push((table, sql.unwrap_or_default()));
+            }
+            Ok(out)
+        }
+        DstType::Postgres => {
+            let mut client = PgClient::connect(&layout.dst_connection_string, NoTls).map_err(map_pg_err)?;
+            let meta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
+            let sql = format!(
+                "SELECT table_name, prop_value FROM {meta} \
+                 WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = 'create_sql' \
+                 ORDER BY table_name"
+            );
+            let rows = client
+                .query(&sql, &[&layout.device_id, &layout.device_name])
+                .map_err(map_pg_err)?;
+            Ok(rows
+                .into_iter()
+                .map(|r| {
+                    let table: String = r.get(0);
+                    let sql: Option<String> = r.get(1);
+                    (table, sql.unwrap_or_default())
+                })
+                .collect())
+        }
+    }
+}
+
+fn derive_commandlog_ddl_columns(
+    replica: &mut Connection,
+    op_type: &str,
+    table_name: Option<&str>,
+    sql: &str,
+) -> Result<Vec<CdcSchemaColumn>> {
+    let ddl_ops = matches!(
+        op_type,
+        "CREATETABLE" | "ADDCOLUMN" | "ALTERCOLUMN" | "DROPCOLUMN" | "RENAMECOLUMN" | "RENAMETABLE" | "DROPTABLE"
+    );
+    if !ddl_ops {
+        return Ok(Vec::new());
+    }
+
+    // Java parity (`DeviceEventStreamer.executeDDLOnReplica`): the replica
+    // is long-lived per device-dst, so re-applying the same segment (retry
+    // path or restart catch-up) will replay DDL that is already present.
+    // Tolerate the idempotency error classes Java tolerates instead of
+    // failing the segment.
+    if let Err(e) = replica.execute_batch(sql) {
+        let msg = e.to_string().to_ascii_lowercase();
+        let idempotent = msg.contains("already exists")
+            || msg.contains("duplicate column name")
+            || msg.contains("no such column")
+            || msg.contains("no such table");
+        if !idempotent {
+            return Err(map_sql_err(e));
+        }
+    }
+
+    let effective_table = if op_type == "RENAMETABLE" {
+        parse_alter_rename_table_name(sql)
+            .or_else(|| table_name.map(|t| t.to_string()))
+    } else {
+        table_name.map(|t| t.to_string())
+    };
+
+    let Some(tbl) = effective_table else {
+        return Ok(Vec::new());
+    };
+
+    if op_type == "DROPTABLE" {
+        return Ok(Vec::new());
+    }
+
+    let cols = fetch_schema_columns_from_replica(replica, &tbl)?;
+    if op_type == "ADDCOLUMN" {
+        if let Some(parsed) = parse_add_column_column(sql) {
+            let name = parsed.column_name.to_ascii_lowercase();
+            if let Some(found) = cols.iter().find(|c| c.column_name.eq_ignore_ascii_case(&name)).cloned() {
+                return Ok(vec![found]);
+            }
+        }
+    }
+    Ok(cols)
+}
+
+fn fetch_schema_columns_from_replica(replica: &Connection, table_name: &str) -> Result<Vec<CdcSchemaColumn>> {
+    let sqlite_table = table_name
+        .trim()
+        .trim_matches('"')
+        .split('.')
+        .last()
+        .unwrap_or(table_name)
+        .trim_matches('"')
+        .to_string();
+    if sqlite_table.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pragma = format!("PRAGMA table_info({})", quote_ident_raw(&sqlite_table));
+    let mut stmt = replica.prepare(&pragma).map_err(map_sql_err)?;
+    let mut rows = stmt.query([]).map_err(map_sql_err)?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sql_err)? {
+        let cid: i64 = row.get(0).map_err(map_sql_err)?;
+        let name: String = row.get(1).map_err(map_sql_err)?;
+        let ty: Option<String> = row.get(2).map_err(map_sql_err)?;
+        let pk: i64 = row.get(5).map_err(map_sql_err)?;
+        out.push(CdcSchemaColumn {
+            column_index: cid,
+            column_name: name,
+            column_type: ty,
+            column_primary_key: pk,
+            old_table_name: None,
+            old_column_name: None,
+        });
+    }
+    Ok(out)
 }
 
 /// Java parity: parse a `CREATE TABLE [IF NOT EXISTS] <name> (<col-defs>)`
@@ -6521,7 +6887,15 @@ fn apply_staged_segment_with_retry(layout: &ConsolidatorLayout, segment_path: &P
 
 fn apply_staged_segment_once(layout: &ConsolidatorLayout, segment_path: &Path) -> Result<ApplyProgress> {
     let seg_conn = Connection::open(segment_path).map_err(map_sql_err)?;
-    let (first_commit_id, entries) = read_segment_entries_with_resume(&seg_conn, segment_path, layout)?;
+    // Java parity (`DeviceSyncProcessor.inMemoryReplicaConn`): the schema
+    // replica is owned by the worker thread for the lifetime of the
+    // consolidator (one worker == one device-dst). Acquire it for the
+    // duration of this segment apply, then return it on drop so the next
+    // segment reuses the accumulated CREATE TABLE / ALTER TABLE state.
+    let mut guard = acquire_schema_replica(layout)?;
+    let schema_replica = guard.as_mut();
+    let (first_commit_id, entries) =
+        read_segment_entries_with_resume_and_replica(&seg_conn, segment_path, layout, schema_replica)?;
     // DuckDB-family devices stage per-transaction records into a
     // `.sqllog.{commit}.txn` sidecar; the main segment only carries
     // BEGIN/COMMIT/REPLAY_TXN markers. The SQL-device path expands these
@@ -6529,7 +6903,7 @@ fn apply_staged_segment_once(layout: &ConsolidatorLayout, segment_path: &Path) -
     // store/streaming apply path reaches us directly — expand here so the
     // user's CREATE TABLE / INSERT / UPDATE rows actually get applied.
     let entries = if let Some(seq) = parse_segment_seq(segment_path) {
-        expand_replay_txn_entries(entries, segment_path, seq as i64)?
+        expand_replay_txn_entries(entries, segment_path, seq as i64, schema_replica)?
     } else {
         entries
     };
@@ -6706,6 +7080,8 @@ fn apply_to_sqlite_destination(
     dst_conn.execute_batch("COMMIT;").map_err(map_sql_err)?;
     if layout.metadata_store == MetadataStore::Destination {
         sync_sqlite_destination_metadata(&dst_conn, layout)?;
+    } else {
+        sync_sqlite_local_metadata_create_sql(&dst_conn, layout)?;
     }
     Ok(progress)
 }
@@ -6900,6 +7276,8 @@ fn apply_to_duckdb_destination(
     dst_conn.execute_batch("COMMIT;").map_err(map_duck_err)?;
     if layout.metadata_store == MetadataStore::Destination {
         sync_duckdb_destination_metadata(&dst_conn, layout)?;
+    } else {
+        sync_duckdb_local_metadata_create_sql(&dst_conn, layout)?;
     }
     Ok(progress)
 }
@@ -6917,7 +7295,7 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
 
     dest_conn
         .execute(
-            "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = 'create_sql'",
+            "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 AND prop_key = 'create_sql'",
             params![layout.device_id, layout.device_name],
         )
         .map_err(map_sql_err)?;
@@ -6942,11 +7320,12 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
         dest_conn
             .execute(
                 "INSERT OR REPLACE INTO synclite_consolidator_table_metadata(
-                     device_uuid, device_name, database_name, table_name, prop_key, prop_value
-                 ) VALUES(?1, ?2, 'main', ?3, 'create_sql', ?4)",
+                     synclite_device_id, synclite_device_name, synclite_update_timestamp, database_name, table_name, prop_key, prop_value
+                 ) VALUES(?1, ?2, ?3, 'main', ?4, 'create_sql', ?5)",
                 params![
                     layout.device_id,
                     layout.device_name,
+                    current_update_timestamp(),
                     table_name,
                     create_sql.unwrap_or_default(),
                 ],
@@ -6954,6 +7333,46 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
             .map_err(map_sql_err)?;
     }
 
+    Ok(())
+}
+
+fn sync_sqlite_local_metadata_create_sql(dest_conn: &Connection, layout: &ConsolidatorLayout) -> Result<()> {
+    let meta_path = layout.consolidator_metadata_path(layout.dst_index);
+    let meta_conn = Connection::open(&meta_path).map_err(map_sql_err)?;
+    meta_conn
+        .execute(
+            "DELETE FROM table_metadata WHERE database_name = ?1 AND key = 'create_sql'",
+            params![layout.database_name],
+        )
+        .map_err(map_sql_err)?;
+
+    let mut stmt = dest_conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master
+             WHERE type = 'table'
+               AND name NOT IN (
+                   'synclite_checkpoint',
+                   'synclite_consolidator_metadata',
+                   'synclite_consolidator_table_metadata',
+                   'sqlite_sequence'
+               )
+             ORDER BY name",
+        )
+        .map_err(map_sql_err)?;
+    let mut rows = stmt.query([]).map_err(map_sql_err)?;
+    while let Some(row) = rows.next().map_err(map_sql_err)? {
+        let table_name: String = row.get(0).map_err(map_sql_err)?;
+        let create_sql: Option<String> = row.get(1).map_err(map_sql_err)?;
+        consolidator_state::upsert_consolidator_table_metadata(
+            layout,
+            layout.dst_index,
+            &layout.database_name,
+            "",
+            &table_name,
+            "create_sql",
+            &create_sql.unwrap_or_default(),
+        )?;
+    }
     Ok(())
 }
 
@@ -7003,7 +7422,7 @@ fn sync_duckdb_destination_metadata(dest_conn: &DuckConnection, layout: &Consoli
 
     duck_exec_with_params(
         dest_conn,
-        "DELETE FROM synclite_consolidator_table_metadata WHERE device_uuid = ? AND device_name = ? AND prop_key = 'create_sql'",
+        "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = ? AND synclite_device_name = ? AND prop_key = 'create_sql'",
         &[
             DuckValue::Text(layout.device_id.clone()),
             DuckValue::Text(layout.device_name.clone()),
@@ -7034,17 +7453,66 @@ fn sync_duckdb_destination_metadata(dest_conn: &DuckConnection, layout: &Consoli
 
     for tbl in tables {
         let create_sql = build_create_sql_from_duckdb_columns(dest_conn, &tbl)?;
+        let ts = current_update_timestamp();
         duck_exec_with_params(
             dest_conn,
             "INSERT INTO synclite_consolidator_table_metadata(
-                 device_uuid, device_name, database_name, table_name, prop_key, prop_value
-             ) VALUES(?, ?, 'main', ?, 'create_sql', ?)",
+                 synclite_device_id, synclite_device_name, synclite_update_timestamp, database_name, table_name, prop_key, prop_value
+             ) VALUES(?, ?, ?, 'main', ?, 'create_sql', ?)",
             &[
                 DuckValue::Text(layout.device_id.clone()),
                 DuckValue::Text(layout.device_name.clone()),
+                DuckValue::Text(ts),
                 DuckValue::Text(tbl),
                 DuckValue::Text(create_sql),
             ],
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_duckdb_local_metadata_create_sql(dest_conn: &DuckConnection, layout: &ConsolidatorLayout) -> Result<()> {
+    let meta_path = layout.consolidator_metadata_path(layout.dst_index);
+    let meta_conn = Connection::open(&meta_path).map_err(map_sql_err)?;
+    meta_conn
+        .execute(
+            "DELETE FROM table_metadata WHERE database_name = ?1 AND key = 'create_sql'",
+            params![layout.database_name],
+        )
+        .map_err(map_sql_err)?;
+
+    let mut tables: Vec<String> = Vec::new();
+    {
+        let mut stmt = dest_conn
+            .prepare(
+                "SELECT table_name FROM information_schema.tables
+                 WHERE table_type = 'BASE TABLE'
+                   AND table_name NOT IN (
+                       'synclite_checkpoint',
+                       'synclite_consolidator_metadata',
+                       'synclite_consolidator_table_metadata'
+                   )
+                   AND table_schema NOT IN ('information_schema', 'pg_catalog')
+                 ORDER BY table_name",
+            )
+            .map_err(map_duck_err)?;
+        let mut rows = stmt.query([]).map_err(map_duck_err)?;
+        while let Some(row) = rows.next().map_err(map_duck_err)? {
+            let name: String = row.get(0).map_err(map_duck_err)?;
+            tables.push(name);
+        }
+    }
+
+    for tbl in tables {
+        let create_sql = build_create_sql_from_duckdb_columns(dest_conn, &tbl)?;
+        consolidator_state::upsert_consolidator_table_metadata(
+            layout,
+            layout.dst_index,
+            &layout.database_name,
+            "",
+            &tbl,
+            "create_sql",
+            &create_sql,
         )?;
     }
     Ok(())
@@ -7110,7 +7578,7 @@ fn sync_postgres_destination_metadata(client: &mut PgClient, layout: &Consolidat
         .map_err(|e| map_pg_err_with_sql(e, &upd_sql))?;
 
     let del_sql = format!(
-        "DELETE FROM {ctmeta} WHERE device_uuid = $1 AND device_name = $2 AND prop_key = 'create_sql'"
+        "DELETE FROM {ctmeta} WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = 'create_sql'"
     );
     client
         .execute(del_sql.as_str(), &[&layout.device_id, &layout.device_name])
@@ -7148,17 +7616,72 @@ fn sync_postgres_destination_metadata(client: &mut PgClient, layout: &Consolidat
         .collect();
 
     let ins_sql = format!(
-        "INSERT INTO {ctmeta}(device_uuid, device_name, database_name, table_name, prop_key, prop_value) \
-         VALUES($1, $2, 'main', $3, 'create_sql', $4)"
+        "INSERT INTO {ctmeta}(synclite_device_id, synclite_device_name, synclite_update_timestamp, database_name, table_name, prop_key, prop_value) \
+         VALUES($1, $2, $3, 'main', $4, 'create_sql', $5)"
     );
     for tbl in tables {
         let create_sql = build_create_sql_from_postgres_columns(client, &schema_filter, &tbl)?;
+        let ts = current_update_timestamp();
         client
             .execute(
                 ins_sql.as_str(),
-                &[&layout.device_id, &layout.device_name, &tbl, &create_sql],
+                &[&layout.device_id, &layout.device_name, &ts, &tbl, &create_sql],
             )
             .map_err(|e| map_pg_err_with_sql(e, &ins_sql))?;
+    }
+    Ok(())
+}
+
+fn sync_postgres_local_metadata_create_sql(client: &mut PgClient, layout: &ConsolidatorLayout) -> Result<()> {
+    let meta_path = layout.consolidator_metadata_path(layout.dst_index);
+    let meta_conn = Connection::open(&meta_path).map_err(map_sql_err)?;
+    meta_conn
+        .execute(
+            "DELETE FROM table_metadata WHERE database_name = ?1 AND key = 'create_sql'",
+            params![layout.database_name],
+        )
+        .map_err(map_sql_err)?;
+
+    let schema_filter: String = if layout.dst_use_schema_scope_resolution {
+        layout
+            .dst_schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| pg_current_schema(client))
+    } else {
+        pg_current_schema(client)
+    };
+
+    let list_sql = "SELECT table_name FROM information_schema.tables \
+                    WHERE table_schema = $1 \
+                      AND table_type = 'BASE TABLE' \
+                      AND table_name NOT IN ( \
+                          'synclite_checkpoint', \
+                          'synclite_consolidator_metadata', \
+                          'synclite_consolidator_table_metadata' \
+                      ) \
+                    ORDER BY table_name";
+    let rows = client
+        .query(list_sql, &[&schema_filter])
+        .map_err(|e| map_pg_err_with_sql(e, list_sql))?;
+    let tables: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<_, String>(0).ok())
+        .collect();
+
+    for tbl in tables {
+        let create_sql = build_create_sql_from_postgres_columns(client, &schema_filter, &tbl)?;
+        consolidator_state::upsert_consolidator_table_metadata(
+            layout,
+            layout.dst_index,
+            &layout.database_name,
+            "",
+            &tbl,
+            "create_sql",
+            &create_sql,
+        )?;
     }
     Ok(())
 }
@@ -7367,6 +7890,8 @@ fn apply_to_postgres_destination(
     client.batch_execute("COMMIT").map_err(map_pg_err)?;
     if layout.metadata_store == MetadataStore::Destination {
         sync_postgres_destination_metadata(&mut client, layout)?;
+    } else {
+        sync_postgres_local_metadata_create_sql(&mut client, layout)?;
     }
     Ok(progress)
 }
@@ -7481,20 +8006,22 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
                  PRIMARY KEY(synclite_device_id, synclite_device_name, commit_id)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_metadata(\n\
-                 device_uuid VARCHAR(64) NOT NULL,\n\
-                 device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_device_id VARCHAR(64) NOT NULL,\n\
+                 synclite_device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_update_timestamp TEXT,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, prop_key)\n\
+                 PRIMARY KEY(synclite_device_id, synclite_device_name, prop_key)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_table_metadata(\n\
-                 device_uuid VARCHAR(64) NOT NULL,\n\
-                 device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_device_id VARCHAR(64) NOT NULL,\n\
+                 synclite_device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_update_timestamp TEXT,\n\
                  database_name VARCHAR(255) NOT NULL,\n\
                  table_name VARCHAR(255) NOT NULL,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key)\n\
+                 PRIMARY KEY(synclite_device_id, synclite_device_name, database_name, table_name, prop_key)\n\
              );",
         )
         .map_err(map_sql_err)?;
@@ -7522,7 +8049,7 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
     let version_present: i64 = dest_conn
         .query_row(
             "SELECT COUNT(*) FROM synclite_consolidator_metadata \
-             WHERE device_uuid = ?1 AND device_name = ?2 AND prop_key = ?3",
+             WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 AND prop_key = ?3",
             params![layout.device_id, layout.device_name, SYNCLITE_METADATA_VERSION_KEY],
             |row| row.get(0),
         )
@@ -7531,11 +8058,12 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
         dest_conn
             .execute(
                 "INSERT INTO synclite_consolidator_metadata(\
-                     device_uuid, device_name, prop_key, prop_value\
-                 ) VALUES(?1, ?2, ?3, ?4)",
+                     synclite_device_id, synclite_device_name, synclite_update_timestamp, prop_key, prop_value\
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
                 params![
                     layout.device_id,
                     layout.device_name,
+                    current_update_timestamp(),
                     SYNCLITE_METADATA_VERSION_KEY,
                     SYNCLITE_METADATA_VERSION.to_string(),
                 ],
@@ -7560,20 +8088,22 @@ fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &Consolidat
                  PRIMARY KEY(synclite_device_id, synclite_device_name, commit_id)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_metadata(\n\
-                 device_uuid VARCHAR NOT NULL,\n\
-                 device_name VARCHAR NOT NULL,\n\
+                 synclite_device_id VARCHAR NOT NULL,\n\
+                 synclite_device_name VARCHAR NOT NULL,\n\
+                 synclite_update_timestamp TEXT,\n\
                  prop_key VARCHAR NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, prop_key)\n\
+                 PRIMARY KEY(synclite_device_id, synclite_device_name, prop_key)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS synclite_consolidator_table_metadata(\n\
-                 device_uuid VARCHAR NOT NULL,\n\
-                 device_name VARCHAR NOT NULL,\n\
+                 synclite_device_id VARCHAR NOT NULL,\n\
+                 synclite_device_name VARCHAR NOT NULL,\n\
+                 synclite_update_timestamp TEXT,\n\
                  database_name VARCHAR NOT NULL,\n\
                  table_name VARCHAR NOT NULL,\n\
                  prop_key VARCHAR NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key)\n\
+                 PRIMARY KEY(synclite_device_id, synclite_device_name, database_name, table_name, prop_key)\n\
              );",
         )
         .map_err(map_duck_err)?;
@@ -7606,7 +8136,7 @@ fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &Consolidat
         let mut stmt = dest_conn
             .prepare(
                 "SELECT COUNT(*) FROM synclite_consolidator_metadata \
-                 WHERE device_uuid = ? AND device_name = ? AND prop_key = ?",
+                 WHERE synclite_device_id = ? AND synclite_device_name = ? AND prop_key = ?",
             )
             .map_err(map_duck_err)?;
         let mut rows = stmt
@@ -7628,11 +8158,12 @@ fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &Consolidat
         duck_exec_with_params(
             dest_conn,
             "INSERT INTO synclite_consolidator_metadata(\
-                 device_uuid, device_name, prop_key, prop_value\
-             ) VALUES(?, ?, ?, ?)",
+                 synclite_device_id, synclite_device_name, synclite_update_timestamp, prop_key, prop_value\
+             ) VALUES(?, ?, ?, ?, ?)",
             &[
                 DuckValue::Text(layout.device_id.clone()),
                 DuckValue::Text(layout.device_name.clone()),
+                DuckValue::Text(current_update_timestamp()),
                 DuckValue::Text(SYNCLITE_METADATA_VERSION_KEY.to_string()),
                 DuckValue::Text(SYNCLITE_METADATA_VERSION.to_string()),
             ],
@@ -7658,20 +8189,22 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
                  PRIMARY KEY(synclite_device_id, synclite_device_name, commit_id)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS {cmeta}(\n\
-                 device_uuid VARCHAR(64) NOT NULL,\n\
-                 device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_device_id VARCHAR(64) NOT NULL,\n\
+                 synclite_device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_update_timestamp TEXT,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, prop_key)\n\
+                 PRIMARY KEY(synclite_device_id, synclite_device_name, prop_key)\n\
              );\n\
              CREATE TABLE IF NOT EXISTS {ctmeta}(\n\
-                 device_uuid VARCHAR(64) NOT NULL,\n\
-                 device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_device_id VARCHAR(64) NOT NULL,\n\
+                 synclite_device_name VARCHAR(255) NOT NULL,\n\
+                 synclite_update_timestamp TEXT,\n\
                  database_name VARCHAR(255) NOT NULL,\n\
                  table_name VARCHAR(255) NOT NULL,\n\
                  prop_key VARCHAR(255) NOT NULL,\n\
                  prop_value TEXT,\n\
-                 PRIMARY KEY(device_uuid, device_name, database_name, table_name, prop_key)\n\
+                 PRIMARY KEY(synclite_device_id, synclite_device_name, database_name, table_name, prop_key)\n\
              );");
     with_device_tracer(|t| tracer_info!(t, "JDBCExecutor", "PG metadata DDL : {}", ddl));
     client.batch_execute(&ddl).map_err(|e| map_pg_err_with_sql(e, &ddl))?;
@@ -7720,7 +8253,7 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
     }
     // Seed synclite_metadata_version row if absent (Java parity).
     let version_count_sql = format!(
-        "SELECT COUNT(*) FROM {cmeta} WHERE device_uuid = $1 AND device_name = $2 AND prop_key = $3"
+        "SELECT COUNT(*) FROM {cmeta} WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = $3"
     );
     let version_key: String = SYNCLITE_METADATA_VERSION_KEY.to_string();
     let version_value: String = SYNCLITE_METADATA_VERSION.to_string();
@@ -7733,7 +8266,7 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
         .get(0);
     if version_count == 0 {
         let version_insert_sql = format!(
-            "INSERT INTO {cmeta}(device_uuid, device_name, prop_key, prop_value) VALUES($1, $2, $3, $4)"
+            "INSERT INTO {cmeta}(synclite_device_id, synclite_device_name, synclite_update_timestamp, prop_key, prop_value) VALUES($1, $2, $3, $4, $5)"
         );
         client
             .execute(
@@ -7741,6 +8274,7 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
                 &[
                     &layout.device_id,
                     &layout.device_name,
+                    &current_update_timestamp(),
                     &version_key,
                     &version_value,
                 ],
@@ -7806,6 +8340,30 @@ fn is_duckdb_unparsable_err(e: &Error) -> bool {
 /// must execute as a pair. Each element shares the same args slice with
 /// pre-computed slice ranges — for safety we materialize new `Vec<SqlValue>`
 /// per statement.
+fn warn_missing_pk_once(
+    dst_type: DstType,
+    method: DstIdempotentDataIngestionMethod,
+    table: &str,
+) {
+    static MISSING_PK_WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let key = format!("{:?}::{}", dst_type, table.to_ascii_lowercase());
+    let mut guard = match MISSING_PK_WARNED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.insert(key) {
+        tracing::warn!(
+            ?dst_type,
+            ?method,
+            table = %table,
+            "dst-idempotent-data-ingestion is enabled but destination table has no primary key; \
+             falling back to plain INSERT. Re-ingesting the same source rows will produce duplicates. \
+             Declare a primary key on the source table to enable the configured idempotent method."
+        );
+    }
+}
+
 fn rewrite_insert_idempotent(
     layout: &ConsolidatorLayout,
     dst_type: DstType,
@@ -7815,11 +8373,21 @@ fn rewrite_insert_idempotent(
     pks: &[String],
 ) -> Vec<(String, Vec<SqlValue>)> {
     let fallback = || vec![(sql.to_string(), args.to_vec())];
+    let parsed = parse_insert_sql(sql);
     if pks.is_empty() {
-        tracing::debug!(?dst_type, ?method, "idempotent ingest skipped: destination table has no primary key");
+        // Java parity (`TableMapper.warnMissingPrimaryKeyOnce`): when the
+        // user enabled `dst-idempotent-data-ingestion` but the destination
+        // table has no primary key, plain INSERT will silently duplicate
+        // rows on replay. Emit a one-shot WARN per (dst_type, table) so
+        // operators notice without spamming every record.
+        let table_for_warn = parsed
+            .as_ref()
+            .map(|(t, _)| t.as_str())
+            .unwrap_or("<unknown>");
+        warn_missing_pk_once(dst_type, method, table_for_warn);
         return fallback();
     }
-    let Some((table, cols)) = parse_insert_sql(sql) else {
+    let Some((table, cols)) = parsed else {
         tracing::debug!(?dst_type, ?method, sql = %sql, "idempotent ingest skipped: INSERT lacks explicit column list");
         return fallback();
     };

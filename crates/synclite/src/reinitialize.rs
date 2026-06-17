@@ -315,7 +315,7 @@ fn delete_by_device_sqlite(
     if !table_exists_sqlite(conn, table) {
         return Ok(());
     }
-    let sql = format!("DELETE FROM {table} WHERE device_uuid=?1 AND device_name=?2");
+    let sql = format!("DELETE FROM {table} WHERE synclite_device_id=?1 AND synclite_device_name=?2");
     conn.execute(&sql, [&snap.uuid, &snap.device_name])
         .map_err(|e| Error::Config(format!("reinitialize: delete from {table}: {e}")))?;
     Ok(())
@@ -397,7 +397,7 @@ fn delete_by_device_duck(
     if !table_exists_duck(conn, table) {
         return Ok(());
     }
-    let sql = format!("DELETE FROM {table} WHERE device_uuid=? AND device_name=?");
+    let sql = format!("DELETE FROM {table} WHERE synclite_device_id=? AND synclite_device_name=?");
     conn.execute(&sql, [&snap.uuid, &snap.device_name])
         .map_err(|e| Error::Config(format!("reinitialize: delete from {table}: {e}")))?;
     Ok(())
@@ -489,7 +489,7 @@ fn pg_delete_by_device(
         return Ok(());
     }
     let sql = format!(
-        "DELETE FROM {}.{} WHERE device_uuid=$1 AND device_name=$2",
+        "DELETE FROM {}.{} WHERE synclite_device_id=$1 AND synclite_device_name=$2",
         quote_pg_ident(schema),
         quote_pg_ident(table)
     );
