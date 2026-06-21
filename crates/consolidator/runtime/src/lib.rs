@@ -5,6 +5,7 @@
 //! so multiple devices can run concurrently without a shared job workDir.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::env;
@@ -52,6 +53,17 @@ fn with_device_tracer<F: FnOnce(&Arc<Tracer>)>(f: F) {
             f(t);
         }
     });
+}
+
+/// Java parity (`JDBCExecutor.prepareXxxStatement` / `executeUnbatchedSql`):
+/// at DEBUG trace level, log every distinct SQL statement issued against
+/// the destination. Matches the Java `tracer.debug(... + " SQL : " + sql)`
+/// format using the same `"SqlExecutor"` tag the replica path uses.
+/// Caller is responsible for invoking this once per unique SQL template
+/// (typically gated by the per-batch mapped_cache) so big batches don't
+/// generate one line per row.
+fn trace_dst_sql(sql: &str) {
+    with_device_tracer(|t| tracer_debug!(t, "SqlExecutor", "SQL : {}", sql));
 }
 
 /// Take-or-init the thread-local schema replica. On drop the connection is
@@ -2954,6 +2966,25 @@ fn retain_committed_entries(entries: Vec<SegmentEntry>) -> Vec<SegmentEntry> {
         .collect()
 }
 
+/// Highest commit_id in `entries` that has a matching COMMIT marker.
+///
+/// Used to advance the destination's `synclite_checkpoint.commit_id` for
+/// empty transactions (BEGIN/COMMIT with no data ops): the apply loop only
+/// bumps `progress.applied_commit` from mapped DML rows, so a segment that
+/// contains nothing but an empty committed txn would otherwise leave the
+/// checkpoint at the prior commit_id forever. Callers should max this with
+/// the in-loop `progress.applied_commit` before pushing the checkpoint, so
+/// awaitSync (which reads source-truth from `synclite_txn`) doesn't hang
+/// waiting for a commit_id the consolidator silently dropped.
+fn max_committed_commit_id(entries: &[SegmentEntry]) -> Option<i64> {
+    let fates = txn_fates_by_commit_id(entries);
+    entries
+        .iter()
+        .filter(|entry| matches!(fates.get(&entry.commit_id).copied(), Some(TxnFate::Commit)))
+        .map(|entry| entry.commit_id)
+        .max()
+}
+
 fn read_replica_resume_checkpoint(replica_path: &Path) -> Result<Option<ReplicaResumeCheckpoint>> {
     if !replica_path.exists() {
         return Ok(None);
@@ -4982,8 +5013,10 @@ impl NativeCdc {
 
     fn exec_sql(&self, db: *mut c_void, sql: &str) -> Result<()> {
         // Java parity (JDBCExecutor.exec): `tracer.debug("SQL : " + sql)` for
-        // every statement executed against the replica.
-        with_device_tracer(|t| tracer_debug!(t, "JDBCExecutor", "SQL : {}", sql));
+        // every statement executed against the replica. Rust tag is
+        // "SqlExecutor" since the Rust path uses the `postgres`/`rusqlite`
+        // crates rather than JDBC.
+        with_device_tracer(|t| tracer_debug!(t, "SqlExecutor", "SQL : {}", sql));
         let c_sql = CString::new(sql).map_err(|e| Error::Internal(format!("sql contains NUL: {e}")))?;
         // SAFETY: db handle and SQL pointer are valid for call duration.
         let rc = unsafe { (self.exec)(db, c_sql.as_ptr()) };
@@ -5801,30 +5834,39 @@ fn cleanup_processed_sqllog(
         return Ok(());
     }
 
-    // Java parity: DeviceLogCleaner deletes work artifacts (cdclog + cmdlog
-    // + work-side sidecars) up to `appliedLogSegmentSeqNum - 1` for THIS
-    // destination. Stage (upload) artifacts are deleted up to
-    // `min(last_consolidated_cdc_log_segment_seq_num)` across ALL configured
-    // destinations (Device.getLastConsolidatedLogSegmentSequenceNumber) so
-    // that a slower destination can still resume from stage.
-    let work_target_seq = (applied_seq as i64) - 1;
-    cleanup_work_artifacts_up_to(layout, state_conn, stage_path, work_path, work_target_seq)?;
-
-    if layout.cleanup_stage_files {
-        let stage_target_seq = compute_stage_cleanup_target(layout)?;
-        if stage_target_seq >= 0 {
-            cleanup_stage_artifacts_up_to(layout, state_conn, stage_path, stage_target_seq)?;
-        }
+    // Java parity: `DeviceLogCleaner.markAppliedAndCleanUp` is invoked per
+    // *device* (not per destination) from `SyncDriver`, and it computes its
+    // target from `Device.getLastConsolidatedLogSegmentSequenceNumber()` —
+    // the MIN of `last_consolidated_cdc_log_segment_seq_num` across every
+    // configured destination. Both workDir (cdclog + cmdlog + sidecars)
+    // AND stageDir use the same MIN watermark so a slower destination can
+    // still re-read the work copy without re-mirroring from stage.
+    // We gate workDir cleanup the same way: per-dst `applied_seq - 1` is
+    // wrong when multiple destinations share the same device, because the
+    // fast destination would delete work files the slow one still needs.
+    let min_target_seq = compute_min_applied_target(layout)?;
+    if min_target_seq >= 0 {
+        cleanup_work_artifacts_up_to(layout, state_conn, stage_path, work_path, min_target_seq)?;
     }
+
+    if layout.cleanup_stage_files && min_target_seq >= 0 {
+        cleanup_stage_artifacts_up_to(layout, state_conn, stage_path, min_target_seq)?;
+    }
+    // `applied_seq` is intentionally not consulted for the target — it is
+    // already implicitly bounded by the per-dst checkpoint feeding into
+    // `compute_min_applied_target`.
+    let _ = applied_seq;
     Ok(())
 }
 
 /// Java parity: `Device.getLastConsolidatedLogSegmentSequenceNumber` — the
 /// MIN of `last_consolidated_cdc_log_segment_seq_num` across every
-/// configured destination. Returns `min - 1` (the highest seq safe to delete
-/// from the shared stage), or -1 when no destination has applied anything
-/// yet.
-fn compute_stage_cleanup_target(layout: &ConsolidatorLayout) -> Result<i64> {
+/// configured destination. Returns `min - 1` (the highest seq safe to
+/// delete from both workDir and stageDir), or -1 when no destination has
+/// applied anything yet. Used as the cleanup target for both workDir
+/// (cdclog + cmdlog + sidecars) and stageDir, mirroring the per-device
+/// scope of `DeviceLogCleaner` on the Java side.
+fn compute_min_applied_target(layout: &ConsolidatorLayout) -> Result<i64> {
     let mut min_seq: i64 = i64::MAX;
     for dst in &layout.all_dst_indexes {
         let v = consolidator_state::get_consolidator_property_long(
@@ -6842,6 +6884,24 @@ fn apply_staged_segment_with_retry(layout: &ConsolidatorLayout, segment_path: &P
             }
             Err(e) => {
                 let retry = should_retry_apply_error(layout.dst_type, &e) && attempt < max_attempts;
+                if retry {
+                    // Java parity (DeviceConsolidator / DeviceEventStreamer):
+                    // `device.tracer.info("Retry attempt : N : Retrying transaction
+                    // after an exception from dst : <err>")` on every retriable
+                    // failure. Numbering matches Java: the NEXT attempt is
+                    // (attempt + 1), and Java reports `i + 2` because `i` is
+                    // zero-based loop counter for the *just-failed* attempt
+                    // and the message refers to the upcoming one.
+                    with_device_tracer(|t| {
+                        tracer_info!(
+                            t,
+                            "DeviceConsolidator",
+                            "Retry attempt : {} : Retrying transaction after an exception from dst : {}",
+                            attempt + 1,
+                            e
+                        )
+                    });
+                }
                 last_err = Some(e);
                 if retry {
                     thread::sleep(Duration::from_millis(layout.dst_oper_retry_interval_ms));
@@ -6852,11 +6912,18 @@ fn apply_staged_segment_with_retry(layout: &ConsolidatorLayout, segment_path: &P
         }
     }
     let err = last_err.unwrap_or_else(|| Error::Config("consolidator: unknown apply error".to_string()));
-    if layout.dst_skip_failed_log_files {
-        // Java parity: `dst-skip-failed-log-files=true` keeps the
-        // consolidator advancing past a poison segment by logging the
-        // failure and returning an empty progress so callers checkpoint
-        // and clean up the file as if it succeeded.
+    // `dst-skip-failed-log-files=true` is for poison-pill segments
+    // (genuinely non-retriable errors: syntax, missing table/column,
+    // unresolvable constraint, etc.) where advancing past the segment
+    // is the right call. It must NOT mask a fundamental destination
+    // outage — if the last error is in the retriable class
+    // (connection / timeout / busy / deadlock / transient) and we
+    // still exhausted attempts, the destination is unreachable; every
+    // subsequent segment will fail the same way, so silently skipping
+    // them would cause data loss. Halt instead; the next worker cycle
+    // retries the same segment when connectivity returns.
+    let exhausted_retriable = should_retry_apply_error(layout.dst_type, &err);
+    if layout.dst_skip_failed_log_files && !exhausted_retriable {
         tracing::error!(
             segment = %segment_path.display(),
             dst_index = layout.dst_index,
@@ -6880,6 +6947,22 @@ fn apply_staged_segment_with_retry(layout: &ConsolidatorLayout, segment_path: &P
             applied_change: -1,
             applied_commit: -1,
             applied_txn_cnt: 0,
+        });
+    }
+    if layout.dst_skip_failed_log_files && exhausted_retriable {
+        with_device_tracer(|t| {
+            tracer_error!(
+                t,
+                "DeviceConsolidator",
+                "NOT skipping cdc log segment : {} on dst : {} \
+                 despite dst_skip_failed_log_files=true: error appears to be \
+                 a transient / destination-connectivity issue (\"{}\"). Skipping \
+                 would silently advance past every subsequent segment and lose data. \
+                 The same segment will be retried on the next consolidator cycle.",
+                segment_path.display(),
+                layout.dst_index,
+                err
+            )
         });
     }
     Err(err)
@@ -6911,6 +6994,22 @@ fn apply_staged_segment_once(layout: &ConsolidatorLayout, segment_path: &Path) -
         DstType::Sqlite => apply_to_sqlite_destination(layout, first_commit_id, &entries)?,
         DstType::DuckDb => apply_to_duckdb_destination(layout, first_commit_id, &entries)?,
         DstType::Postgres => apply_to_postgres_destination(layout, first_commit_id, &entries)?,
+    };
+
+    // Empty committed transactions (BEGIN+COMMIT with no DML rows) never
+    // bump `progress.applied_commit` inside the apply loop because every
+    // entry is filtered out by map_operation_using_mapper. Without this,
+    // the destination's `synclite_checkpoint.commit_id` stalls behind
+    // `synclite_txn.commit_id` and awaitSync hangs. Advance to the highest
+    // commit_id with a COMMIT marker so the checkpoint reflects every
+    // successfully replayed txn -- empty or not.
+    let progress = if let Some(max_commit) = max_committed_commit_id(&entries) {
+        ApplyProgress {
+            applied_commit: progress.applied_commit.max(max_commit),
+            ..progress
+        }
+    } else {
+        progress
     };
 
     if let Some(seq) = parse_segment_seq(segment_path) {
@@ -6978,10 +7077,20 @@ fn apply_to_sqlite_destination(
             batch_count = 0;
         }
 
-        let cached = mapped_cache.entry(key).or_insert_with(|| CachedMappedOperation {
-            sql: mapped.sql.clone(),
-            reusable_args: Vec::with_capacity(mapped.args.len().max(8)),
-        });
+        let cached = match mapped_cache.entry(key) {
+            HashMapEntry::Occupied(o) => o.into_mut(),
+            HashMapEntry::Vacant(v) => {
+                // Java parity (JDBCExecutor.prepareXxxStatement DEBUG line):
+                // log the SQL template the first time it appears in this
+                // batch. Skipping on cache hits keeps the log volume
+                // proportional to distinct statements, not row count.
+                trace_dst_sql(&mapped.sql);
+                v.insert(CachedMappedOperation {
+                    sql: mapped.sql.clone(),
+                    reusable_args: Vec::with_capacity(mapped.args.len().max(8)),
+                })
+            }
+        };
         cached.reusable_args.clear();
         cached.reusable_args.extend_from_slice(&mapped.args);
 
@@ -7124,6 +7233,7 @@ fn apply_to_duckdb_destination(
         "applying batch to DuckDB destination"
     );
     let dst_conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
+    ensure_duckdb_dst_schema(&dst_conn, layout)?;
     if layout.metadata_store == MetadataStore::Destination {
         ensure_duckdb_metadata_seeded(&dst_conn, layout, first_commit_id)?;
     }
@@ -7160,10 +7270,16 @@ fn apply_to_duckdb_destination(
             batch_count = 0;
         }
 
-        let cached = mapped_cache.entry(key).or_insert_with(|| CachedMappedOperation {
-            sql: mapped.sql.clone(),
-            reusable_args: Vec::with_capacity(mapped.args.len().max(8)),
-        });
+        let cached = match mapped_cache.entry(key) {
+            HashMapEntry::Occupied(o) => o.into_mut(),
+            HashMapEntry::Vacant(v) => {
+                trace_dst_sql(&mapped.sql);
+                v.insert(CachedMappedOperation {
+                    sql: mapped.sql.clone(),
+                    reusable_args: Vec::with_capacity(mapped.args.len().max(8)),
+                })
+            }
+        };
         cached.reusable_args.clear();
         cached.reusable_args.extend_from_slice(&mapped.args);
 
@@ -7769,6 +7885,7 @@ fn apply_to_postgres_destination(
     );
     let conn_str = build_postgres_connection_string(layout);
     let mut client = PgClient::connect(&conn_str, NoTls).map_err(map_pg_err)?;
+    ensure_pg_dst_schema(&mut client, layout)?;
     if layout.metadata_store == MetadataStore::Destination {
         ensure_postgres_metadata_seeded(&mut client, layout, first_commit_id)?;
     }
@@ -7808,10 +7925,16 @@ fn apply_to_postgres_destination(
             batch_count = 0;
         }
 
-        let cached = mapped_cache.entry(key).or_insert_with(|| CachedMappedOperation {
-            sql: mapped.sql.clone(),
-            reusable_args: Vec::with_capacity(mapped.args.len().max(8)),
-        });
+        let cached = match mapped_cache.entry(key) {
+            HashMapEntry::Occupied(o) => o.into_mut(),
+            HashMapEntry::Vacant(v) => {
+                trace_dst_sql(&mapped.sql);
+                v.insert(CachedMappedOperation {
+                    sql: mapped.sql.clone(),
+                    reusable_args: Vec::with_capacity(mapped.args.len().max(8)),
+                })
+            }
+        };
         cached.reusable_args.clear();
         cached.reusable_args.extend_from_slice(&mapped.args);
 
@@ -7939,7 +8062,7 @@ fn flush_postgres_batch(
 
     for (sql, is_insert, change_number) in pending_sql.iter() {
         with_device_tracer(|t| {
-            tracer_info!(t, "JDBCExecutor", "PG DML : {}", sql)
+            tracer_info!(t, "SqlExecutor", "PG DML : {}", sql)
         });
         client
             .batch_execute("SAVEPOINT synclite_flush_stmt_sp")
@@ -8172,6 +8295,49 @@ fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &Consolidat
     Ok(())
 }
 
+/// Java parity: ensure the user-configured destination schema exists by
+/// issuing `CREATE SCHEMA IF NOT EXISTS`. Mirrors Java's
+/// `DSTInitializer.initialize` (consolidation mode) and
+/// `DeviceDstInitializer.initializeSchema` (replication mode), which both
+/// run `CREATE SCHEMA IF NOT EXISTS <schema>` before any user table is
+/// created. No-op when `dst_schema` is unset/blank.
+///
+/// Note: Java does NOT auto-create the destination database for JDBC
+/// targets (`JDBCExecutor.canCreateDatabase()` returns false); the user
+/// must pre-create the database. Rust matches that behavior — only the
+/// schema is auto-created.
+fn ensure_pg_dst_schema(client: &mut PgClient, layout: &ConsolidatorLayout) -> Result<()> {
+    let Some(schema) = layout
+        .dst_schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(schema));
+    with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "Ensuring dst schema : {}", sql));
+    client
+        .batch_execute(&sql)
+        .map_err(|e| map_pg_err_with_sql(e, &sql))
+}
+
+/// DuckDB analogue of [`ensure_pg_dst_schema`]. DuckDB supports
+/// `CREATE SCHEMA IF NOT EXISTS`; no-op when `dst_schema` is unset/blank.
+fn ensure_duckdb_dst_schema(conn: &DuckConnection, layout: &ConsolidatorLayout) -> Result<()> {
+    let Some(schema) = layout
+        .dst_schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(schema));
+    with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "Ensuring dst schema : {}", sql));
+    conn.execute_batch(&sql).map_err(map_duck_err)
+}
+
 fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorLayout, initial_commit_id: i64) -> Result<()> {
     let meta = pg_meta_table(layout, "synclite_checkpoint");
     let cmeta = pg_meta_table(layout, "synclite_consolidator_metadata");
@@ -8206,7 +8372,7 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
                  prop_value TEXT,\n\
                  PRIMARY KEY(synclite_device_id, synclite_device_name, database_name, table_name, prop_key)\n\
              );");
-    with_device_tracer(|t| tracer_info!(t, "JDBCExecutor", "PG metadata DDL : {}", ddl));
+    with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG metadata DDL : {}", ddl));
     client.batch_execute(&ddl).map_err(|e| map_pg_err_with_sql(e, &ddl))?;
     // Idempotent column-type promotion: earlier builds may have created
     // these bookkeeping tables with int4 columns. Rust binds i64 (Java
@@ -8218,16 +8384,16 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
          ALTER TABLE {meta} ALTER COLUMN cdc_log_segment_sequence_number TYPE BIGINT USING cdc_log_segment_sequence_number::bigint;\n\
          ALTER TABLE {meta} ALTER COLUMN txn_count TYPE BIGINT USING txn_count::bigint;"
     );
-    with_device_tracer(|t| tracer_info!(t, "JDBCExecutor", "PG metadata promote : {}", promote_sql));
+    with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG metadata promote : {}", promote_sql));
     if let Err(e) = client.batch_execute(&promote_sql) {
         with_device_tracer(|t| tracer_info!(
             t,
-            "JDBCExecutor",
+            "SqlExecutor",
             "PG metadata column promote failed (continuing): {}",
             e
         ));
     } else {
-        with_device_tracer(|t| tracer_info!(t, "JDBCExecutor", "PG metadata promote OK on {}", meta));
+        with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG metadata promote OK on {}", meta));
     }
     let count_sql = format!(
         "SELECT COUNT(*) FROM {meta} WHERE synclite_device_id = $1 AND synclite_device_name = $2"
@@ -8754,7 +8920,7 @@ fn apply_ddl_batch_postgres(client: &mut PgClient, sql: &str) -> Result<()> {
     // we run, so wrap each DDL in a SAVEPOINT and roll back to it on a
     // benign error to keep the outer txn live.
     for stmt in split_ddl_statements(sql) {
-        with_device_tracer(|t| tracer_info!(t, "JDBCExecutor", "PG DDL : {}", stmt));
+        with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG DDL : {}", stmt));
         client.batch_execute("SAVEPOINT synclite_ddl_sp").map_err(map_pg_err)?;
         match client.batch_execute(stmt) {
             Ok(()) => {
@@ -8779,7 +8945,7 @@ fn apply_ddl_batch_postgres(client: &mut PgClient, sql: &str) -> Result<()> {
                     with_device_tracer(|t| {
                         tracer_info!(
                             t,
-                            "JDBCExecutor",
+                            "SqlExecutor",
                             "PG DDL benign-skip: {} :: {}",
                             stmt,
                             msg
@@ -8792,7 +8958,7 @@ fn apply_ddl_batch_postgres(client: &mut PgClient, sql: &str) -> Result<()> {
                 with_device_tracer(|t| {
                     tracer_error!(
                         t,
-                        "JDBCExecutor",
+                        "SqlExecutor",
                         "PG DDL failed: {} :: {}",
                         stmt,
                         msg

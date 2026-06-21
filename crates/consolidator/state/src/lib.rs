@@ -168,6 +168,14 @@ fn pg_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
     name.to_string()
 }
 
+/// Postgres-only: double-quote an identifier, escaping any embedded `"`.
+/// Used when we need to emit a bare quoted identifier (e.g. for
+/// `CREATE SCHEMA IF NOT EXISTS <ident>`).
+fn pg_quote_ident(name: &str) -> String {
+    let escaped = name.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
 /// Returns the PG schema to use when filtering `information_schema` queries,
 /// matching the same logic used to qualify metadata tables.
 fn pg_meta_schema(layout: &ConsolidatorLayout) -> Option<String> {
@@ -319,6 +327,19 @@ pub fn bootstrap_destination_metadata(layout: &ConsolidatorLayout, dst_index: i3
         }
         DstType::Postgres => {
             let mut client = PgClient::connect(&layout.dst_connection_string, NoTls).map_err(map_pg_err)?;
+            // The consolidator metadata tables (and later, the user
+            // tables) live in dst_schema when one is configured. Pre-
+            // ensure it now so the very first CREATE TABLE below doesn't
+            // fail with `3F000 schema does not exist`. Mirrors the
+            // ensure_pg_dst_schema call in apply_to_postgres_destination,
+            // which would otherwise only run after bootstrap.
+            if let Some(schema) = pg_meta_schema(layout) {
+                let create_schema_sql =
+                    format!("CREATE SCHEMA IF NOT EXISTS {}", pg_quote_ident(&schema));
+                client
+                    .batch_execute(create_schema_sql.as_str())
+                    .map_err(|e| map_pg_err_with_sql(e, &create_schema_sql))?;
+            }
             let create_prop_sql = pg_create_dst_prop_table_sql(layout);
             client
                 .batch_execute(create_prop_sql.as_str())
