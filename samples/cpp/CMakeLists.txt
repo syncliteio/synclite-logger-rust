@@ -55,6 +55,31 @@ endif()
 message(STATUS "synclite include dir: ${SYNCLITE_INCLUDE_DIR}")
 message(STATUS "synclite library    : ${SYNCLITE_LIB}")
 
+# synclite_c.dll is built in download-lib mode, so on Windows it carries a
+# load-time import of duckdb.dll. Every sample that loads synclite_c.dll
+# (not just the duckdb / duckdb_store ones) therefore needs duckdb.dll
+# resolvable at run time. Locate it so we can stage it next to each .exe,
+# mirroring the synclite_c.dll copy below. A bundled/static synclite_c
+# build won't have a separate duckdb.dll — in that case we just warn and
+# move on rather than failing the configure step.
+if(WIN32)
+    find_file(SYNCLITE_DUCKDB_DLL
+        NAMES duckdb.dll
+        HINTS "${SYNCLITE_LIB_DIR}"
+              "${SYNCLITE_LIB_DIR}/deps"
+        NO_DEFAULT_PATH)
+    if(SYNCLITE_DUCKDB_DLL)
+        message(STATUS "duckdb runtime dll  : ${SYNCLITE_DUCKDB_DLL}")
+    else()
+        message(WARNING
+            "duckdb.dll not found near ${SYNCLITE_LIB_DIR}.\n"
+            "synclite_c.dll links duckdb dynamically, so the samples may "
+            "fail to start with a missing-DLL error. Copy duckdb.dll next "
+            "to the built .exe manually, or build synclite-c with a bundled "
+            "(static) duckdb to remove the runtime dependency.")
+    endif()
+endif()
+
 function(add_synclite_sample name)
     add_executable(${name} ${name}.cpp)
     target_include_directories(${name} PRIVATE "${SYNCLITE_INCLUDE_DIR}")
@@ -65,6 +90,13 @@ function(add_synclite_sample name)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${SYNCLITE_LIB_DIR}/synclite_c.dll"
                     "$<TARGET_FILE_DIR:${name}>/synclite_c.dll")
+        # Stage duckdb.dll alongside it when present (download-lib builds).
+        if(SYNCLITE_DUCKDB_DLL)
+            add_custom_command(TARGET ${name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${SYNCLITE_DUCKDB_DLL}"
+                        "$<TARGET_FILE_DIR:${name}>/duckdb.dll")
+        endif()
     endif()
 endfunction()
 
