@@ -3712,6 +3712,7 @@ fn parse_alter_rename_table_name(sql: &str) -> Option<String> {
         .trim_matches('[')
         .trim_matches(']')
         .trim_end_matches(';');
+    let new_tbl = new_tbl.split('.').last().unwrap_or(new_tbl).trim_matches('"').trim_matches('`').trim_matches('[').trim_matches(']');
     if new_tbl.is_empty() {
         None
     } else {
@@ -9103,6 +9104,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_alter_rename_table_name_strips_schema_qualification() {
+        let sql = "ALTER TABLE newdb.newschema.t1 RENAME TO newdb.newschema.t2;";
+        assert_eq!(parse_alter_rename_table_name(sql), Some("t2".to_string()));
+    }
+
+    #[test]
     fn cleanup_keeps_last_applied_and_tracks_last_cleaned_segment() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -9305,6 +9312,3 @@ mod tests {
         assert_eq!(fates.get(&3), Some(&TxnFate::Unknown));
     }
 }
-
-
-
