@@ -118,6 +118,34 @@ the in-process consolidator that drains into PostgreSQL. From there the
 app uses a normal rusqlite-style `Connection` — there are no network calls
 in the hot write path; sync happens asynchronously in the background.
 
+## Device families
+
+Every sample picks one of three **device families**. The connection and
+SQL surface is identical across all three — the only code-level difference
+is the `DeviceType` you pass to `synclite::initialize`:
+
+- **SQL device** (`SQLITE`, `DUCKDB`) — a full, SQLite-syntax-compliant
+  embedded SQL database. Run arbitrary `CREATE` / `ALTER` / `SELECT` /
+  `INSERT` / `UPDATE` / `DELETE`. Reach for it when your app needs real
+  SQL, JOINs, multi-statement transactions, or ad-hoc DDL.
+  See [synclite_rusqlite.rs](synclite_rusqlite.rs) /
+  [synclite_duckdb.rs](synclite_duckdb.rs).
+- **Store device** (`SQLITE_STORE`, `DUCKDB_STORE`) — the same SQL-shaped
+  API, tuned for bulk write-through. The runtime emits pre-formed row
+  events that the Consolidator applies directly to the destination — no
+  SQL-log parsing or CDC-deduction on the apply path — so it delivers the
+  highest end-to-end consolidation throughput. It's usually the fastest
+  *and* simplest starting point for a new app.
+  See [synclite_rusqlite_store.rs](synclite_rusqlite_store.rs) /
+  [synclite_duckdb_store.rs](synclite_duckdb_store.rs).
+- **Streaming device** (`STREAMING`) — append-only ingestion for
+  high-throughput event capture. Accepts `INSERT` + DDL and rejects
+  `UPDATE` / `DELETE` by design.
+  See [synclite_streaming.rs](synclite_streaming.rs).
+
+All three produce the same change log and flow through the same shipper +
+consolidator, so you can mix device families inside one application.
+
 ## Sibling samples
 
 Every sample below uses the same canonical shape as the marquee sample
