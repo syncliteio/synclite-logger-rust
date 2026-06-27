@@ -18,6 +18,23 @@ diff them side-by-side and confirm the API is identical across languages:
 - `synclite_duckdb` — DuckDB device, basic CRUD.
 - `synclite_duckdb_store` — DuckDB Store device.
 
+These fall into three **device families** — the connection + SQL surface is
+identical across all three, only the `DeviceType` passed to `initialize`
+changes:
+
+- **SQL device** (`SQLITE`, `DUCKDB`) — a full, SQLite-syntax-compliant
+  embedded SQL database for arbitrary `CREATE` / `ALTER` / `SELECT` /
+  `INSERT` / `UPDATE` / `DELETE`. Use it when you need real SQL, JOINs,
+  multi-statement transactions, or ad-hoc DDL.
+- **Store device** (`SQLITE_STORE`, `DUCKDB_STORE`) — the same SQL-shaped
+  API tuned for bulk write-through; the runtime emits pre-formed row events
+  that the Consolidator applies directly to the destination, giving the
+  highest end-to-end consolidation throughput and the simplest starting
+  point for a new app.
+- **Streaming device** (`STREAMING`) — append-only ingestion for
+  high-throughput event capture; accepts `INSERT` + DDL and rejects
+  `UPDATE` / `DELETE` by design.
+
 The Rust folder also has the marquee **SQLite → PostgreSQL** demo
 (`synclite_rusqlite_postgres`) plus device-artifact / reinitialize samples.
 
