@@ -25,6 +25,31 @@ synclite-logger-rust/
   crates/logger/bindings-c/   # crate producing the cdylib
 ```
 
+## Device families
+
+Every sample picks one of three **device families**. The connection and
+SQL surface is identical across all three — the only code-level difference
+is the `DeviceType` you pass to `synclite::initialize`:
+
+- **SQL device** (`SQLITE`, `DUCKDB`) — a full, SQLite-syntax-compliant
+  embedded SQL database. Run arbitrary `CREATE` / `ALTER` / `SELECT` /
+  `INSERT` / `UPDATE` / `DELETE`. Reach for it when your app needs real
+  SQL, JOINs, multi-statement transactions, or ad-hoc DDL.
+  See `synclite_rusqlite.cpp` / `synclite_duckdb.cpp`.
+- **Store device** (`SQLITE_STORE`, `DUCKDB_STORE`) — the same SQL-shaped
+  API, tuned for bulk write-through. The runtime emits pre-formed row
+  events that the Consolidator applies directly to the destination — no
+  SQL-log parsing or CDC-deduction on the apply path — so it delivers the
+  highest end-to-end consolidation throughput. It's usually the fastest
+  *and* simplest starting point for a new app.
+  See `synclite_rusqlite_store.cpp` / `synclite_duckdb_store.cpp`.
+- **Streaming device** (`STREAMING`) — append-only ingestion for
+  high-throughput event capture. Accepts `INSERT` + DDL and rejects
+  `UPDATE` / `DELETE` by design. See `synclite_streaming.cpp`.
+
+All three produce the same change log and flow through the same shipper +
+consolidator, so you can mix device families inside one application.
+
 ## Two ways to consume the SyncLite runtime
 
 You need two things at link/run time:
