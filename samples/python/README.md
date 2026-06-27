@@ -56,6 +56,29 @@ python synclite_rusqlite.py
 | `synclite_duckdb.py`              | `synclite_duckdb.rs`         | `DUCKDB`        |
 | `synclite_duckdb_store.py`        | `synclite_duckdb_store.rs`   | `DUCKDB_STORE`  |
 
+## Device families
+
+Every sample picks one of three **device families**. The connection and
+SQL surface is identical across all three — the only code-level difference
+is the `device_type` string you pass to `sl.initialize(...)`:
+
+- **SQL device** (`"SQLITE"`, `"DUCKDB"`) — a full, SQLite-syntax-compliant
+  embedded SQL database. Run arbitrary `CREATE` / `ALTER` / `SELECT` /
+  `INSERT` / `UPDATE` / `DELETE`. Reach for it when your app needs real
+  SQL, JOINs, multi-statement transactions, or ad-hoc DDL.
+- **Store device** (`"SQLITE_STORE"`, `"DUCKDB_STORE"`) — the same
+  SQL-shaped API, tuned for bulk write-through. The runtime emits
+  pre-formed row events that the Consolidator applies directly to the
+  destination — no SQL-log parsing or CDC-deduction on the apply path — so
+  it delivers the highest end-to-end consolidation throughput. It's
+  usually the fastest *and* simplest starting point for a new app.
+- **Streaming device** (`"STREAMING"`) — append-only ingestion for
+  high-throughput event capture. Accepts `INSERT` + DDL and rejects
+  `UPDATE` / `DELETE` by design.
+
+All three produce the same change log and flow through the same shipper +
+consolidator, so you can mix device families inside one application.
+
 ## API shape
 
 ```python
