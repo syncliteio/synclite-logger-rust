@@ -1,0 +1,4 @@
+[env]
+# Keep DuckDB's prebuilt library download enabled for the sample when Cargo is
+# launched from this folder rather than from the repository root.
+DUCKDB_DOWNLOAD_LIB = "true"
