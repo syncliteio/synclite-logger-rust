@@ -753,8 +753,25 @@ impl Logger {
                 name
             }
         };
-        if md.get("device_type")?.is_none() {
-            md.put("device_type", &device_type.to_string())?;
+        match md.get("device_type")? {
+            Some(persisted) => {
+                let requested = device_type.to_string();
+                if requested != persisted {
+                    return Err(Error::Config(format!(
+                        "device-type mismatch for db_path={}: requested='{}', persisted='{}'. \
+                         A SyncLite device is identified by its db path; reopen with device-type='{}' \
+                         or move/remove the existing device home at '{}' to mint a new device.",
+                        db_path.display(),
+                        requested,
+                        persisted,
+                        persisted,
+                        layout.device_home.display()
+                    )));
+                }
+            }
+            None => {
+                md.put("device_type", &device_type.to_string())?;
+            }
         }
         if md.get("database_name")?.is_none() {
             md.put("database_name", &layout.db_file_name)?;
