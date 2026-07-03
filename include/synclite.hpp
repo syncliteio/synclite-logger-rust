@@ -47,6 +47,8 @@ public:
 
 namespace detail {
 
+class ParamBuf;
+
 [[noreturn]] inline void throw_last(const char* fallback) {
     const char* msg = ::synclite_last_error();
     throw Error(msg ? msg : fallback);
