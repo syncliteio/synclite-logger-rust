@@ -3639,6 +3639,21 @@ fn parse_create_table_columns(sql: &str) -> Vec<(String, String, i64)> {
     cols
 }
 
+fn normalize_identifier_name(raw: &str) -> String {
+    raw.trim()
+        .split('.')
+        .map(|part| {
+            part.trim()
+                .trim_matches('"')
+                .trim_matches('`')
+                .trim_matches('[')
+                .trim_matches(']')
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn parse_alter_add_column_name(sql: &str) -> Option<String> {
     let upper = sql.to_ascii_uppercase();
     let idx = upper.find(" ADD COLUMN ")?;
@@ -3677,21 +3692,8 @@ fn parse_alter_rename_column_names(sql: &str) -> Option<(String, String)> {
     let rest = &sql[idx + " RENAME COLUMN ".len()..];
     let upper_rest = rest.to_ascii_uppercase();
     let to_idx = upper_rest.find(" TO ")?;
-    let old_col = rest[..to_idx]
-        .trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_string();
-    let new_col = rest[to_idx + " TO ".len()..]
-        .trim()
-        .trim_end_matches(';')
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_string();
+    let old_col = normalize_identifier_name(&rest[..to_idx]);
+    let new_col = normalize_identifier_name(&rest[to_idx + " TO ".len()..].trim_end_matches(';'));
     if old_col.is_empty() || new_col.is_empty() {
         None
     } else {
@@ -3703,16 +3705,8 @@ fn parse_alter_rename_table_name(sql: &str) -> Option<String> {
     let upper = sql.to_ascii_uppercase();
     let idx = upper.find(" RENAME TO ")?;
     let rest = sql[idx + " RENAME TO ".len()..].trim();
-    let new_tbl = rest
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .trim_end_matches(';');
-    let new_tbl = new_tbl.split('.').last().unwrap_or(new_tbl).trim_matches('"').trim_matches('`').trim_matches('[').trim_matches(']');
+    let new_tbl = normalize_identifier_name(&rest.split_whitespace().next().unwrap_or("").trim_end_matches(';'));
+    let new_tbl = new_tbl.split('.').last().unwrap_or(&new_tbl);
     if new_tbl.is_empty() {
         None
     } else {
@@ -9101,6 +9095,15 @@ mod tests {
     fn retry_classifier_does_not_retry_syntax_errors() {
         let err = Error::Config("consolidator: sqlite syntax error near SELECT".to_string());
         assert!(!should_retry_apply_error(DstType::Sqlite, &err));
+    }
+
+    #[test]
+    fn parse_alter_rename_column_names_normalizes_quoted_qualified_identifiers() {
+        let sql = r#"ALTER TABLE "main"."t1" RENAME COLUMN "schema"."old_col" TO "new_col";"#;
+        assert_eq!(
+            parse_alter_rename_column_names(sql),
+            Some(("schema.old_col".to_string(), "new_col".to_string()))
+        );
     }
 
     #[test]

@@ -54,9 +54,11 @@ prometheus = { version = "0.13", default-features = false }
 # Metadata DB (Cargo-managed bundled SQLite; much lighter than DuckDB source builds)
 rusqlite = { version = "0.39", features = ["bundled"] }
 
-# DuckDB (linked/prebuilt only; no bundled native source builds)
+# DuckDB is built into the Rust library so SyncLite can start without a
+# separate duckdb.dll sidecar. This keeps SQLite and non-DuckDB flows
+# independent of the optional DuckDB runtime.
 # Pin exact duckdb-rs release that maps to DuckDB 1.5.2 (Java uses 1.5.2.0).
-duckdb = { version = "=1.10502.0" }
+duckdb = { version = "=1.10502.0", default-features = false, features = ["bundled"] }
 postgres = "0.19"
 
 # Logging / tracing

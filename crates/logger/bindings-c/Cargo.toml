@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [lib]
-name = "synclite_c"
+name = "libsynclite_1_0_0"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
@@ -17,6 +17,3 @@ logger-runtime.workspace = true
 logger-db-traits.workspace = true
 logger-core.workspace = true
 synclite.workspace = true
-
-
-
