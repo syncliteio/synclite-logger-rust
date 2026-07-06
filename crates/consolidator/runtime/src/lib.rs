@@ -14,6 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -1659,6 +1660,11 @@ enum Msg {
 pub struct Consolidator {
     tx: Sender<Msg>,
     join: Mutex<Option<JoinHandle<()>>>,
+    // Set on shutdown so the worker abandons any in-progress /
+    // subsequent destination I/O and exits promptly. Offline-first:
+    // callers (initialize / Connection::close) must never block on an
+    // unreachable destination.
+    stopping: Arc<AtomicBool>,
 }
 
 impl Consolidator {
@@ -1673,15 +1679,18 @@ impl Consolidator {
         initialize_device_stats_db(&layout)?;
         initialize_consolidator_stats_db(&layout)?;
 
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("synclite-consolidator".into())
-            .spawn(move || worker_loop(rx, layout))
+            .spawn(move || worker_loop(rx, layout, worker_stopping))
             .map_err(|e| Error::Internal(format!("spawn consolidator thread: {e}")))?;
 
         Ok(Arc::new(Self {
             tx,
             join: Mutex::new(Some(join)),
+            stopping,
         }))
     }
 
@@ -1729,10 +1738,45 @@ impl Consolidator {
     }
 
     fn shutdown(&self) {
+        // Signal the worker to abandon any pending destination I/O and
+        // exit. Offline-first: shutdown (hence initialize / close) must
+        // never block on an unreachable destination, so we only wait a
+        // short grace for a clean stop and then detach the worker. The
+        // detached worker exits on its own once its current blocking
+        // operation returns and observes the stop flag.
+        self.stopping.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Msg::Shutdown);
-        if let Ok(mut join) = self.join.lock() {
-            if let Some(handle) = join.take() {
+        let handle = match self.join.lock() {
+            Ok(mut join) => join.take(),
+            Err(_) => None,
+        };
+        let Some(handle) = handle else {
+            return;
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let joiner = thread::Builder::new()
+            .name("synclite-consolidator-join".into())
+            .spawn(move || {
                 let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+        match joiner {
+            Ok(joiner) => {
+                // Give the worker a brief window to stop cleanly (e.g.
+                // finish applying an in-flight segment to a reachable
+                // destination). If it can't (destination down / blocked
+                // in a connect), detach so the caller is never stalled.
+                if done_rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+                    let _ = joiner.join();
+                }
+                // On timeout: intentionally drop `joiner` (and thus the
+                // worker handle it owns) without joining — both threads
+                // are now detached and will terminate on their own.
+            }
+            Err(_) => {
+                // Could not spawn the joiner; fall back to a direct join
+                // is undesirable (would block), so we simply return and
+                // let the worker wind down after observing the stop flag.
             }
         }
     }
@@ -1813,7 +1857,7 @@ fn migrate_legacy_state_db(layout: &ConsolidatorLayout) -> Result<()> {
     Ok(())
 }
 
-fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
+fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Arc<AtomicBool>) {
     // Java parity: open per-device trace file under the consolidator's per-device
     // work directory (`<workDir>/synclite-<device>-<id>/synclite_device.trace`).
     // Default level is INFO matching Java `ConfLoader.getTraceLevel`. Tracing
@@ -1871,24 +1915,46 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
     // synclite_device_metadata.db and reads consolidator init state from
     // the per-destination consolidator metadata store. This makes Java<->Rust
     // handover seamless for a given device.
-    if let Err(e) = consolidator_state::bootstrap_destination_metadata(&layout, layout.dst_index) {
-        tracing::warn!(error = %e, "failed to bootstrap destination metadata tables");
-    }
-    if let Err(e) = consolidator_state::seed_device_metadata(&layout) {
-        tracing::warn!(error = %e, "failed to seed synclite_device_metadata.db");
-    }
-    if let Err(e) = consolidator_state::seed_consolidator_identity(&layout, layout.dst_index) {
-        tracing::warn!(error = %e, "failed to seed consolidator identity metadata");
-    }
-    if let Err(e) = consolidator_state::seed_consolidator_metadata_version(&layout, layout.dst_index) {
-        tracing::warn!(error = %e, "failed to seed consolidator metadata-schema version");
-    }
-    match consolidator_state::get_consolidator_property_long(&layout, layout.dst_index, "initialization_status") {
-        Ok(Some(1)) => {
-            bootstrap_initialized = true;
+    //
+    // These steps connect to the (possibly unreachable) destination. They
+    // are best-effort and must not stall an offline-first startup: if a
+    // shutdown was already requested (e.g. `initialize` opened and is
+    // immediately closing this logger), skip them and let the worker exit.
+    // Any that fail here are retried lazily by the apply path once the
+    // destination becomes reachable.
+    if !stopping.load(Ordering::SeqCst) {
+        if let Err(e) = consolidator_state::bootstrap_destination_metadata(&layout, layout.dst_index) {
+            tracing::warn!(error = %e, "failed to bootstrap destination metadata tables");
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "failed to read consolidator initialization_status"),
+    }
+    if !stopping.load(Ordering::SeqCst) {
+        if let Err(e) = consolidator_state::seed_device_metadata(&layout) {
+            tracing::warn!(error = %e, "failed to seed synclite_device_metadata.db");
+        }
+    }
+    if !stopping.load(Ordering::SeqCst) {
+        if let Err(e) = consolidator_state::seed_consolidator_identity(&layout, layout.dst_index) {
+            tracing::warn!(error = %e, "failed to seed consolidator identity metadata");
+        }
+    }
+    if !stopping.load(Ordering::SeqCst) {
+        if let Err(e) = consolidator_state::seed_consolidator_metadata_version(&layout, layout.dst_index) {
+            tracing::warn!(error = %e, "failed to seed consolidator metadata-schema version");
+        }
+    }
+    if !stopping.load(Ordering::SeqCst) {
+        match consolidator_state::get_consolidator_property_long(&layout, layout.dst_index, "initialization_status") {
+            Ok(Some(1)) => {
+                bootstrap_initialized = true;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to read consolidator initialization_status"),
+        }
+    }
+    // Fast-exit if shutdown was requested while we were bringing up the
+    // destination metadata above.
+    if stopping.load(Ordering::SeqCst) {
+        return;
     }
     let mut pending_stage_paths: Vec<PathBuf> = Vec::new();
     // Pause-buffer: while the pause sentinel exists we queue staged
@@ -1903,6 +1969,13 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout) {
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+
+        // Offline-first shutdown: if a stop was requested (possibly while
+        // we were blocked applying to / connecting to the destination),
+        // exit now instead of starting another apply cycle.
+        if stopping.load(Ordering::SeqCst) || matches!(msg, Some(Msg::Shutdown)) {
+            break;
+        }
 
         let paused = is_paused(&layout);
         if !paused && !paused_stage_paths.is_empty() && bootstrap_initialized {
