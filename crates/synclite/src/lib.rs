@@ -504,13 +504,12 @@ pub fn initialize<P: AsRef<Path>>(
     // device metadata, so the user's configuration stays pristine.
     consume_reinit_sentinel(&normalized_db_path, &mut cfg);
 
-    // Offline-first: a short connect/round-trip probe of the
-    // destination so a bad host / wrong password / missing DB shows
-    // up immediately in logs instead of only as a downstream
-    // `await_sync` timeout. We never block initialize on the result —
-    // the background consolidator will keep retrying when the
-    // destination comes back.
-    probe_destination_best_effort(&cfg);
+    // Offline-first: `initialize` never touches the destination. The
+    // background consolidator owns all destination connectivity — it
+    // connects, logs any failures, and keeps retrying when the
+    // destination comes back. A synchronous (or even background)
+    // connect probe here adds nothing but a duplicate connection
+    // attempt, so we deliberately don't do one.
 
     // Persist destination + device config keys into the per-device
     // metadata file BEFORE we ever bring up a Logger. This way any
@@ -2046,77 +2045,6 @@ const PERSISTED_INIT_EXTRA_KEYS: &[&str] = &[
     "dst-oper-retry-count-1",
     "dst-oper-retry-interval-ms-1",
 ];
-
-/// Best-effort probe of the configured destination. Offline-first:
-/// any failure is logged via `tracing::warn!` and swallowed so the
-/// application can keep accepting local writes; the background
-/// consolidator will continue to retry on its own schedule. No-op
-/// when no destination is configured (pure local logging mode).
-fn probe_destination_best_effort(cfg: &SyncLiteConfig) {
-    let Some(dst_type_raw) = cfg.extra.get("dst-type") else {
-        return;
-    };
-    let Some(conn_str) = cfg.extra.get("dst-connection-string") else {
-        return;
-    };
-    let dst_type = dst_type_raw.trim().to_ascii_uppercase();
-    let result = match dst_type.as_str() {
-        "POSTGRES" | "POSTGRESQL" => probe_postgres(conn_str),
-        "SQLITE" => probe_sqlite(conn_str),
-        "DUCKDB" => probe_duckdb(conn_str),
-        // Unknown destination kinds: nothing to probe here.
-        _ => return,
-    };
-    match result {
-        Ok(()) => {
-            tracing::info!(dst_type = %dst_type, "destination connectivity probe ok");
-        }
-        Err(e) => {
-            tracing::warn!(
-                dst_type = %dst_type,
-                error = %e,
-                "destination connectivity probe failed; continuing in offline-first mode, consolidator will retry"
-            );
-        }
-    }
-}
-
-fn probe_postgres(conn_str: &str) -> Result<()> {
-    use ::postgres::{Client, NoTls};
-    // A short-lived connect + trivial round-trip is enough to surface
-    // bad host / auth / database name.
-    let mut client = Client::connect(conn_str.trim(), NoTls).map_err(|e| {
-        crate::Error::Config(format!("cannot connect to Postgres destination: {e}"))
-    })?;
-    client.simple_query("SELECT 1").map_err(|e| {
-        crate::Error::Config(format!("Postgres destination handshake failed: {e}"))
-    })?;
-    Ok(())
-}
-
-fn probe_sqlite(conn_str: &str) -> Result<()> {
-    let path = conn_str.trim();
-    ::rusqlite::Connection::open(path)
-        .map_err(|e| {
-            crate::Error::Config(format!("cannot open SQLite destination at {path}: {e}"))
-        })?
-        .execute_batch("SELECT 1")
-        .map_err(|e| {
-            crate::Error::Config(format!("SQLite destination probe failed at {path}: {e}"))
-        })?;
-    Ok(())
-}
-
-fn probe_duckdb(conn_str: &str) -> Result<()> {
-    let path = conn_str.trim();
-    let conn = ::duckdb::Connection::open(path).map_err(|e| {
-        crate::Error::Config(format!("cannot open DuckDB destination at {path}: {e}"))
-    })?;
-    conn.execute_batch("SELECT 1").map_err(|e| {
-        crate::Error::Config(format!("DuckDB destination probe failed at {path}: {e}"))
-    })?;
-    Ok(())
-}
 
 /// Per-`initialize` snapshot persisted into the device metadata file.
 /// Read back by `hydrate_initialize_config_from_metadata` when a
