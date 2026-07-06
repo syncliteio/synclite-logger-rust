@@ -25,6 +25,46 @@ pub const SYNCLITE_METADATA_VERSION_KEY: &str = "synclite_metadata_version";
 /// can detect an older store and upgrade it on initialization.
 pub const SYNCLITE_METADATA_VERSION: i64 = 1;
 
+/// Open a Postgres client for consolidator bookkeeping, applying the
+/// configured `dst-connection-timeout-s` so an unreachable destination
+/// cannot block the caller for the full OS TCP timeout. Offline-first:
+/// the consolidator worker owns all destination I/O, and a bounded
+/// connect keeps `initialize` / `Connection::close` responsive even when
+/// the destination is down.
+///
+/// If the connection string already carries an explicit `connect_timeout`
+/// we leave it untouched; otherwise we append the layout's value (skipped
+/// only when configured to 0, i.e. "no timeout").
+fn connect_pg(layout: &ConsolidatorLayout) -> Result<PgClient> {
+    let conn_str = pg_conn_str_with_timeout(
+        &layout.dst_connection_string,
+        layout.dst_connection_timeout_s,
+    );
+    PgClient::connect(&conn_str, NoTls).map_err(map_pg_err)
+}
+
+/// Append `connect_timeout=<secs>` to a Postgres connection string
+/// (URI or key/value form) unless one is already present or `secs == 0`.
+fn pg_conn_str_with_timeout(conn_str: &str, secs: u32) -> String {
+    if secs == 0 {
+        return conn_str.to_string();
+    }
+    let lower = conn_str.to_ascii_lowercase();
+    if lower.contains("connect_timeout=") {
+        return conn_str.to_string();
+    }
+    let trimmed = conn_str.trim();
+    let is_uri = lower.starts_with("postgres://") || lower.starts_with("postgresql://");
+    if is_uri {
+        let sep = if trimmed.contains('?') { '&' } else { '?' };
+        format!("{trimmed}{sep}connect_timeout={secs}")
+    } else if trimmed.is_empty() {
+        format!("connect_timeout={secs}")
+    } else {
+        format!("{trimmed} connect_timeout={secs}")
+    }
+}
+
 pub fn initialize_state_db(path: &Path) -> Result<()> {
     let conn = Connection::open(path).map_err(map_sql_err)?;
     conn.execute_batch(
@@ -326,7 +366,7 @@ pub fn bootstrap_destination_metadata(layout: &ConsolidatorLayout, dst_index: i3
             .map_err(map_duck_err)?;
         }
         DstType::Postgres => {
-            let mut client = PgClient::connect(&layout.dst_connection_string, NoTls).map_err(map_pg_err)?;
+            let mut client = connect_pg(layout)?;
             // The consolidator metadata tables (and later, the user
             // tables) live in dst_schema when one is configured. Pre-
             // ensure it now so the very first CREATE TABLE below doesn't
@@ -1363,8 +1403,7 @@ pub fn map_destination_checkpoint(
             }
         }
         DstType::Postgres => {
-            let conn_str = &layout.dst_connection_string;
-            let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+            let mut client = connect_pg(layout)?;
             if !postgres_has_checkpoint_device_columns(&mut client, layout)? {
                 return Err(Error::Config(
                     "consolidator: destination synclite_checkpoint must contain synclite_device_id and synclite_device_name".to_string(),
@@ -1991,8 +2030,7 @@ pub fn get_consolidator_property(
                 )
             }
             DstType::Postgres => {
-                let conn_str = &layout.dst_connection_string;
-                let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+                let mut client = connect_pg(layout)?;
                 dst_props_pg_get(
                     &mut client,
                     layout,
@@ -2069,8 +2107,7 @@ pub fn upsert_consolidator_properties(
                 )
             }
             DstType::Postgres => {
-                let conn_str = &layout.dst_connection_string;
-                let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+                let mut client = connect_pg(layout)?;
                 dst_props_pg_upsert(
                     &mut client,
                     layout,
@@ -2117,8 +2154,7 @@ pub fn delete_consolidator_property(
                 )
             }
             DstType::Postgres => {
-                let conn_str = &layout.dst_connection_string;
-                let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+                let mut client = connect_pg(layout)?;
                 dst_props_pg_delete(
                     &mut client,
                     layout,
@@ -2178,8 +2214,7 @@ pub fn upsert_consolidator_table_metadata(
                 )
             }
             DstType::Postgres => {
-                let conn_str = &layout.dst_connection_string;
-                let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+                let mut client = connect_pg(layout)?;
                 dst_tblmeta_pg_upsert(
                     &mut client,
                     layout,
@@ -2251,8 +2286,7 @@ pub fn get_consolidator_table_metadata(
                 }
             }
             DstType::Postgres => {
-                let conn_str = &layout.dst_connection_string;
-                let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+                let mut client = connect_pg(layout)?;
                 let meta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
                 let select_sql = format!(
                     "SELECT prop_value FROM {meta} \
@@ -2644,8 +2678,7 @@ pub fn get_initialized_tables(
                     }
                 }
                 DstType::Postgres => {
-                    let conn_str = &layout.dst_connection_string;
-                    let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+                    let mut client = connect_pg(layout)?;
                     let create_tblmeta_sql = pg_create_dst_table_metadata_sql(layout);
                     client
                         .batch_execute(create_tblmeta_sql.as_str())
@@ -2813,8 +2846,7 @@ pub fn reset_dst_schemas(layout: &ConsolidatorLayout, _dst_index: i32) -> Result
             Ok(())
         }
         DstType::Postgres => {
-            let conn_str = &layout.dst_connection_string;
-            let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+            let mut client = connect_pg(layout)?;
             client
                 .execute(
                     "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = 'create_sql'",
@@ -2857,8 +2889,7 @@ pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, _dst_index: i32) ->
             Ok(())
         }
         DstType::Postgres => {
-            let conn_str = &layout.dst_connection_string;
-            let mut client = PgClient::connect(conn_str, NoTls).map_err(map_pg_err)?;
+            let mut client = connect_pg(layout)?;
             client.batch_execute(CREATE_DST_TABLE_METADATA_TBL_SQL).map_err(map_pg_err)?;
             client
                 .execute(
