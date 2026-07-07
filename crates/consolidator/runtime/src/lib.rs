@@ -1658,7 +1658,7 @@ enum Msg {
 }
 
 pub struct Consolidator {
-    tx: Sender<Msg>,
+    tx: Arc<Sender<Msg>>,
     join: Mutex<Option<JoinHandle<()>>>,
     // Set on shutdown so the worker abandons any in-progress /
     // subsequent destination I/O and exits promptly. Offline-first:
@@ -1682,13 +1682,18 @@ impl Consolidator {
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = Arc::clone(&stopping);
         let (tx, rx) = mpsc::channel();
+        let tx_keepalive = Arc::new(tx);
+        let tx_for_worker = Arc::clone(&tx_keepalive);
         let join = thread::Builder::new()
             .name("synclite-consolidator".into())
-            .spawn(move || worker_loop(rx, layout, worker_stopping))
+            .spawn(move || {
+                let _worker_tx_keepalive = tx_for_worker;
+                worker_loop(rx, layout, worker_stopping)
+            })
             .map_err(|e| Error::Internal(format!("spawn consolidator thread: {e}")))?;
 
         Ok(Arc::new(Self {
-            tx,
+            tx: tx_keepalive,
             join: Mutex::new(Some(join)),
             stopping,
         }))
@@ -1784,7 +1789,10 @@ impl Consolidator {
 
 impl Drop for Consolidator {
     fn drop(&mut self) {
-        self.shutdown();
+        // Keep the background consolidator alive after the owning logger/
+        // connection is closed so staged segments and bootstrap materialization
+        // can still be processed. The worker will naturally exit when the
+        // process ends or when an explicit shutdown is requested.
     }
 }
 
