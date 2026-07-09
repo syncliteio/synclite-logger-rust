@@ -19,7 +19,9 @@
 
 use std::path::{Path, PathBuf};
 
+use duckdb::{params_from_iter as duck_params_from_iter, types::Value as DuckValue, Connection as DuckConnection};
 use logger_core::{Error, Result};
+use postgres::{Client as PgClient, NoTls};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::layout::DeviceLayout;
@@ -173,21 +175,6 @@ fn consolidator_stats_db_path(layout: &DeviceLayout) -> PathBuf {
     work_dir.join("synclite_consolidator_statistics.db")
 }
 
-fn device_work_dir(layout: &DeviceLayout, device_id: &str, device_name: &str) -> PathBuf {
-    let global = default_device_data_root()
-        .join(format!("synclite-{device_name}-{device_id}"));
-    if global.exists() {
-        return global;
-    }
-    let legacy = layout.device_home.join("synclite-syncer");
-    let work_dir = if legacy.exists() {
-        legacy
-    } else {
-        layout.device_home.join("synclite-consolidator")
-    };
-    work_dir.join(format!("synclite-{device_name}-{device_id}"))
-}
-
 fn read_device_id_name(layout: &DeviceLayout) -> Result<(String, String)> {
     let md = Metadata::open_or_create(&layout.metadata_path)?;
     let uuid = md
@@ -266,28 +253,191 @@ pub(crate) fn read_source_commit_id(db_path: &Path) -> Option<i64> {
     }
 }
 
-/// Read the consolidator's applied `commit_id` from the per-device
-/// state DB (Local metadata store, dst_index=1). This is the source
-/// of truth the consolidator updates after every apply.
-pub(crate) fn read_applied_commit_id(layout: &DeviceLayout) -> Option<i64> {
-    let (uuid, name) = read_device_id_name(layout).ok()?;
-    let dwd = device_work_dir(layout, &uuid, &name);
-    // Try dst_index 1..=8 — scan a handful of likely indices.
-    for dst_index in 1..=8 {
-        let p = dwd.join(format!("synclite_consolidator_metadata_{dst_index}.db"));
-        if !p.exists() {
-            continue;
-        }
-        let Some(conn) = open_ro(&p) else { continue };
-        if let Ok(v) = conn.query_row(
-            "SELECT commit_id FROM synclite_checkpoint LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        ) {
-            return Some(v);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataStoreMode {
+    Local,
+    Destination,
+}
+
+fn discover_metadata_store(layout: &DeviceLayout) -> Option<(MetadataStoreMode, i32)> {
+    let md = Metadata::open_or_create(&layout.metadata_path).ok()?;
+    for idx in 1..=64 {
+        let v = md
+            .get(&format!("metadata-store-{idx}"))
+            .ok()
+            .flatten()
+            .or_else(|| md.get(&format!("dst-metadata-store-{idx}")).ok().flatten());
+        if let Some(raw) = v {
+            let mode = match raw.trim().to_ascii_uppercase().as_str() {
+                "LOCAL" => MetadataStoreMode::Local,
+                "DESTINATION" => MetadataStoreMode::Destination,
+                _ => continue,
+            };
+            return Some((mode, idx));
         }
     }
-    // Fallback to device_status.last_consolidated_commit_id.
-    read_device_status_stats(layout).map(|s| s.last_consolidated_commit_id)
+
+    Some((MetadataStoreMode::Destination, 1))
+}
+
+fn quote_pg_ident(raw: &str) -> String {
+    format!("\"{}\"", raw.replace('"', "\"\""))
+}
+
+fn metadata_value(layout: &DeviceLayout, key: &str) -> Option<String> {
+    let md = Metadata::open_or_create(&layout.metadata_path).ok()?;
+    md.get(key).ok().flatten()
+}
+
+fn local_checkpoint_db_candidates(
+    layout: &DeviceLayout,
+    device_id: &str,
+    device_name: &str,
+    dst_index: i32,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    let default_root = default_device_data_root();
+    let device_dir_name = format!("synclite-{}-{}", device_name, device_id);
+    let file_name = format!("synclite_consolidator_metadata_{dst_index}.db");
+
+    out.push(
+        default_root
+            .join(&device_dir_name)
+            .join(&file_name),
+    );
+
+    // Multi-destination layouts use <device_data_root>/<dst_alias>/... .
+    if let Ok(entries) = std::fs::read_dir(&default_root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            out.push(
+                p.join(&device_dir_name)
+                    .join(&file_name),
+            );
+        }
+    }
+
+    let legacy_work_dir = layout.device_home.join("synclite-syncer");
+    if legacy_work_dir.exists() {
+        out.push(
+            legacy_work_dir
+                .join(&device_dir_name)
+                .join(&file_name),
+        );
+    }
+    out.push(
+        layout
+            .device_home
+            .join("synclite-consolidator")
+            .join(&device_dir_name)
+            .join(&file_name),
+    );
+
+    out
+}
+
+fn read_applied_commit_id_from_local_metadata(layout: &DeviceLayout) -> Option<i64> {
+    let (_, dst_index) = discover_metadata_store(layout)?;
+    let (device_id, device_name) = read_device_id_name(layout).ok()?;
+    let db_path = local_checkpoint_db_candidates(layout, &device_id, &device_name, dst_index)
+        .into_iter()
+        .find(|p| p.exists())?;
+    let conn = open_ro(&db_path)?;
+    let row: rusqlite::Result<Option<i64>> = conn.query_row(
+        "SELECT commit_id
+         FROM synclite_checkpoint
+         WHERE synclite_device_id = ?1 AND synclite_device_name = ?2",
+        rusqlite::params![device_id, device_name],
+        |r| r.get::<_, Option<i64>>(0),
+    );
+    row.ok().flatten()
+}
+
+fn read_applied_commit_id_from_destination(layout: &DeviceLayout) -> Option<i64> {
+    let dst_type = metadata_value(layout, "dst-type")?.trim().to_ascii_uppercase();
+    let raw_dst_conn = metadata_value(layout, "dst-connection-string")?;
+    let dst_conn = match dst_type.as_str() {
+        "SQLITE" => crate::parse_sqlite_path_from_connection(Some(&raw_dst_conn))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(raw_dst_conn.clone()),
+        "DUCKDB" => crate::parse_duckdb_path_from_connection(Some(&raw_dst_conn))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(raw_dst_conn.clone()),
+        "POSTGRES" => crate::translate_postgres_connection_string(&raw_dst_conn)
+            .map(|s| s.to_string())
+            .unwrap_or(raw_dst_conn.clone()),
+        _ => raw_dst_conn.clone(),
+    };
+    let dst_schema = metadata_value(layout, "dst-schema");
+    let (device_id, device_name) = read_device_id_name(layout).ok()?;
+
+    let dst_table = dst_schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{}.{}", quote_pg_ident(s), quote_pg_ident("synclite_checkpoint")))
+        .unwrap_or_else(|| "synclite_checkpoint".to_string());
+
+    match dst_type.as_str() {
+        "SQLITE" => {
+            let conn = open_ro(Path::new(&dst_conn))?;
+            let row: rusqlite::Result<Option<i64>> = conn.query_row(
+                "SELECT commit_id
+                 FROM synclite_checkpoint
+                 WHERE synclite_device_id = ?1 AND synclite_device_name = ?2",
+                rusqlite::params![device_id, device_name],
+                |r| r.get::<_, Option<i64>>(0),
+            );
+            row.ok().flatten()
+        }
+        "DUCKDB" => {
+            let conn = DuckConnection::open(&dst_conn).ok()?;
+            let sql = format!(
+                "SELECT commit_id
+                 FROM {dst_table}
+                 WHERE synclite_device_id = ? AND synclite_device_name = ?"
+            );
+            let mut stmt = conn.prepare(&sql).ok()?;
+            let mut rows = stmt
+                .query(duck_params_from_iter(
+                    [
+                        DuckValue::Text(device_id),
+                        DuckValue::Text(device_name),
+                    ]
+                    .iter(),
+                ))
+                .ok()?;
+            let row = rows.next().ok()??;
+            row.get::<_, Option<i64>>(0).ok().flatten()
+        }
+        "POSTGRES" => {
+            let mut client = PgClient::connect(&dst_conn, NoTls).ok()?;
+            let sql = format!(
+                "SELECT commit_id
+                 FROM {dst_table}
+                 WHERE synclite_device_id = $1 AND synclite_device_name = $2"
+            );
+            let row = client.query_opt(&sql, &[&device_id, &device_name]).ok()?;
+            let row = row?;
+            row.try_get::<_, Option<i64>>(0).ok().flatten()
+        }
+        _ => None,
+    }
+}
+
+/// Read the consolidator's applied `commit_id`.
+///
+/// Source is selected strictly by metadata-store mode:
+/// - `DESTINATION`: read `synclite_checkpoint` from the destination DB.
+/// - `LOCAL`: read `synclite_checkpoint` from local consolidator metadata DB.
+pub(crate) fn read_applied_commit_id(layout: &DeviceLayout) -> Option<i64> {
+    match discover_metadata_store(layout)?.0 {
+        MetadataStoreMode::Destination => read_applied_commit_id_from_destination(layout),
+        MetadataStoreMode::Local => read_applied_commit_id_from_local_metadata(layout),
+    }
 }
 

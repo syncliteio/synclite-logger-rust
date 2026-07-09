@@ -88,7 +88,17 @@ fn sync_statistics_reflect_applied_segments() {
     write_rows(&db, &[(1, "a"), (2, "b"), (3, "c")]);
     synclite::await_sync(&db, Duration::from_secs(60)).expect("sync");
 
-    let s = synclite::sync_statistics(&db).expect("stats");
+    // `await_sync` follows checkpoint progress; device_status counters
+    // can lag slightly behind checkpoint updates.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut s = synclite::sync_statistics(&db).expect("stats");
+    while std::time::Instant::now() < deadline
+        && (s.processed_oper_count < 3 || s.last_consolidated_commit_id <= 0)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+        s = synclite::sync_statistics(&db).expect("stats");
+    }
+
     assert!(
         s.log_segments_applied >= 1,
         "expected at least one segment applied, got {}",
