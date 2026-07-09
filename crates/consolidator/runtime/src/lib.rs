@@ -1459,33 +1459,35 @@ fn build_add_column_sql(
 }
 
 /// Java parity: quote a single identifier (table or column) per the
-/// destination dialect when `dst_quote_object_names` /
-/// `dst_quote_column_names` is enabled. SQLite, DuckDB, and Postgres all
-/// support standard double-quote identifier syntax; embedded quotes are
-/// doubled. Caller decides whether to quote (table vs. column flag).
-fn quote_ident_raw(name: &str) -> String {
-    let escaped = name.replace('"', "\"\"");
-    format!("\"{escaped}\"")
+/// destination dialect. Supports per-backend quoting:
+/// - SQLite, DuckDB, Postgres: double-quote (") with escaping by doubling
+fn quote_ident_raw(layout: &ConsolidatorLayout, name: &str) -> String {
+    match layout.dst_type {
+        DstType::Sqlite | DstType::DuckDb | DstType::Postgres => {
+            let escaped = name.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        }
+    }
 }
 
 fn quote_table(layout: &ConsolidatorLayout, name: &str) -> String {
     if layout.dst_quote_object_names && !name.is_empty() {
-        quote_ident_raw(name)
+        quote_ident_raw(layout, name)
     } else {
         name.to_string()
     }
 }
 
-/// Postgres-only: schema-qualify a system metadata table name when
+/// Schema-qualify a system metadata table name when
 /// `dst_use_schema_scope_resolution` is on and `dst_schema` is set.
 /// Used for the consolidator-owned bookkeeping tables (`synclite_checkpoint`,
 /// `synclite_consolidator_metadata`, `synclite_consolidator_table_metadata`)
 /// so they live in the same destination schema as user tables and never
-/// collide with stale objects in `public`.
+/// collide with stale objects in `public` (Postgres) or default schema (MySQL).
 fn pg_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
     if layout.dst_use_schema_scope_resolution {
         if let Some(schema) = layout.dst_schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            return format!("{}.{}", quote_ident_raw(schema), quote_ident_raw(name));
+            return format!("{}.{}", quote_ident_raw(layout, schema), quote_ident_raw(layout, name));
         }
     }
     name.to_string()
@@ -1493,10 +1495,22 @@ fn pg_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
 
 fn quote_col(layout: &ConsolidatorLayout, name: &str) -> String {
     if layout.dst_quote_column_names && !name.is_empty() {
-        quote_ident_raw(name)
+        quote_ident_raw(layout, name)
     } else {
         name.to_string()
     }
+}
+
+/// DuckDB analogue of [`pg_meta_table`]. Schema-qualify a system metadata table name when
+/// `dst_use_schema_scope_resolution` is on and `dst_schema` is set.
+/// Used for the consolidator-owned bookkeeping tables.
+fn duck_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
+    if layout.dst_use_schema_scope_resolution {
+        if let Some(schema) = layout.dst_schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return format!("{}.{}", quote_ident_raw(layout, schema), quote_ident_raw(layout, name));
+        }
+    }
+    quote_ident_raw(layout, name)
 }
 
 /// Java parity: prefix a table identifier with database/schema scope when
@@ -6640,7 +6654,14 @@ fn load_destination_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<
         }
         DstType::DuckDb => {
             let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-            let mut stmt = conn.prepare(query).map_err(map_duck_err)?;
+            let meta = duck_meta_table(layout, "synclite_consolidator_table_metadata");
+            let sql = format!(
+                "SELECT table_name, prop_value FROM {} \
+                WHERE synclite_device_id = ? AND synclite_device_name = ? AND prop_key = 'create_sql' \
+                ORDER BY table_name",
+                meta
+            );
+            let mut stmt = conn.prepare(&sql).map_err(map_duck_err)?;
             let mut rows = stmt
                 .query(duck_params_from_iter([
                     DuckValue::Text(layout.device_id.clone()),
@@ -6748,7 +6769,10 @@ fn fetch_schema_columns_from_replica(replica: &Connection, table_name: &str) -> 
         return Ok(Vec::new());
     }
 
-    let pragma = format!("PRAGMA table_info({})", quote_ident_raw(&sqlite_table));
+    let pragma = format!("PRAGMA table_info({})", {
+        let escaped = sqlite_table.replace('"', "\"\"");
+        format!("\"{}\"", escaped)
+    });
     let mut stmt = replica.prepare(&pragma).map_err(map_sql_err)?;
     let mut rows = stmt.query([]).map_err(map_sql_err)?;
 
@@ -7764,20 +7788,29 @@ fn ensure_sqlite_metadata_init_status_column(dest_conn: &Connection) -> Result<(
 /// so name + type + NOT NULL + PRIMARY KEY are sufficient (matches Java's
 /// `buildCreateSqlFromColumns` shape).
 fn sync_duckdb_destination_metadata(dest_conn: &DuckConnection, layout: &ConsolidatorLayout) -> Result<()> {
+    let meta = duck_meta_table(layout, "synclite_checkpoint");
+    let ctmeta = duck_meta_table(layout, "synclite_consolidator_table_metadata");
+    
+    let upd_sql = format!(
+        "UPDATE {} SET initialization_status = 1 WHERE synclite_device_id = ? AND synclite_device_name = ?",
+        meta
+    );
     duck_exec_with_params(
         dest_conn,
-        "UPDATE synclite_checkpoint
-         SET initialization_status = 1
-         WHERE synclite_device_id = ? AND synclite_device_name = ?",
+        &upd_sql,
         &[
             DuckValue::Text(layout.device_id.clone()),
             DuckValue::Text(layout.device_name.clone()),
         ],
     )?;
 
+    let del_sql = format!(
+        "DELETE FROM {} WHERE synclite_device_id = ? AND synclite_device_name = ? AND prop_key = 'create_sql'",
+        ctmeta
+    );
     duck_exec_with_params(
         dest_conn,
-        "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = ? AND synclite_device_name = ? AND prop_key = 'create_sql'",
+        &del_sql,
         &[
             DuckValue::Text(layout.device_id.clone()),
             DuckValue::Text(layout.device_name.clone()),
@@ -7809,11 +7842,16 @@ fn sync_duckdb_destination_metadata(dest_conn: &DuckConnection, layout: &Consoli
     for tbl in tables {
         let create_sql = build_create_sql_from_duckdb_columns(dest_conn, &tbl)?;
         let ts = current_update_timestamp();
-        duck_exec_with_params(
-            dest_conn,
-            "INSERT INTO synclite_consolidator_table_metadata(
+        let ctmeta = duck_meta_table(layout, "synclite_consolidator_table_metadata");
+        let ins_sql = format!(
+            "INSERT INTO {}(
                  synclite_device_id, synclite_device_name, synclite_update_timestamp, database_name, table_name, prop_key, prop_value
              ) VALUES(?, ?, ?, 'main', ?, 'create_sql', ?)",
+            ctmeta
+        );
+        duck_exec_with_params(
+            dest_conn,
+            &ins_sql,
             &[
                 DuckValue::Text(layout.device_id.clone()),
                 DuckValue::Text(layout.device_name.clone()),
@@ -8554,7 +8592,7 @@ fn ensure_pg_dst_schema(client: &mut PgClient, layout: &ConsolidatorLayout) -> R
     else {
         return Ok(());
     };
-    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(schema));
+    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(layout, schema));
     with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "Ensuring dst schema : {}", sql));
     client
         .batch_execute(&sql)
@@ -8572,7 +8610,7 @@ fn ensure_duckdb_dst_schema(conn: &DuckConnection, layout: &ConsolidatorLayout) 
     else {
         return Ok(());
     };
-    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(schema));
+    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(layout, schema));
     with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "Ensuring dst schema : {}", sql));
     conn.execute_batch(&sql).map_err(map_duck_err)
 }
@@ -9014,7 +9052,15 @@ fn is_benign_ddl_err_msg(msg: &str) -> bool {
     let l = msg.to_ascii_lowercase();
     l.contains("duplicate column")
         || l.contains("already exists")
-        || l.contains("no such column")
+    || l.contains("no such column")
+    || l.contains("unknown column")
+    || l.contains("can't drop")
+    || l.contains("does not exist")
+    || l.contains("doesn't exist")
+    || l.contains("column not found")
+    || l.contains("unknown table")
+    || l.contains("no such table")
+    || l.contains("table not found")
 }
 
 fn split_ddl_statements(sql: &str) -> impl Iterator<Item = &str> {
