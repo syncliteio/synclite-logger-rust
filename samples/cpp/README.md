@@ -80,8 +80,9 @@ cmake --build build --config Debug
 
 This produces the SyncLite shared library plus the matching import library.
 On Windows the packaged runtime is the single versioned DLL such as
-`libsynclite_1.0.0.dll`, and CMake stages that file next to the sample
-executable automatically.
+`libsynclite_1_0_0.dll`, and CMake stages that file next to the sample
+executable automatically. On Linux/macOS the corresponding files are
+`liblibsynclite_1_0_0.so` / `liblibsynclite_1_0_0.dylib`.
 
 Override paths / profile if needed:
 
@@ -103,9 +104,9 @@ synclite-c-sdk/
     synclite.h
     synclite.hpp
   lib/
-    synclite_c.dll               # Windows
-    synclite_c.dll.lib           # Windows import library
-    libsynclite_c.so             # Linux  (or libsynclite_c.dylib on macOS)
+    libsynclite_1_0_0.dll        # Windows
+    libsynclite_1_0_0.lib        # Windows import library
+    liblibsynclite_1_0_0.so      # Linux  (or liblibsynclite_1_0_0.dylib on macOS)
 ```
 
 Then point CMake at it:

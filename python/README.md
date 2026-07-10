@@ -19,6 +19,28 @@ maturin develop --release
 This compiles `crates/logger/bindings-python` (cdylib `_native`) and
 installs the `synclite` package into the active environment.
 
+## Distribution wheels (per-platform)
+
+`synclite` ships as **platform-specific wheels** — one per OS/arch — because
+the compiled `_native` extension links `libduckdb` natively; a single wheel
+cannot cover every platform. `pip install synclite` auto-selects the wheel
+matching the user's OS/arch. The full set is:
+
+| Platform | Wheel tag | Built by |
+| --- | --- | --- |
+| Windows x64 | `win_amd64` | host build (`delvewheel` repair) |
+| Linux x86_64 | `manylinux_2_28_x86_64` | Linux/WSL build (`patchelf`/auditwheel) |
+| Linux aarch64 | `manylinux_2_28_aarch64` | Linux/WSL build (`patchelf`/auditwheel) |
+| macOS x86_64 / arm64 | `macosx_*` | macOS runner (`delocate` repair) |
+
+The repository build produces the **host** wheel automatically. The
+**Linux `manylinux` wheels** require bundling `libduckdb.so` + RPATH-patching
+via [`patchelf`](https://github.com/NixOS/patchelf) (POSIX-only, no Windows
+binary), so on Windows the Maven build dispatches them into **WSL** — see
+`GETTING_STARTED.md` → "Building Linux Python wheels". The complete
+cross-platform set (including macOS) is produced by CI
+(`.github/workflows/python-wheels.yml`).
+
 ## Quickstart
 
 ```python
