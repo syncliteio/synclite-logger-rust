@@ -19,6 +19,7 @@ with failOnError=false as a second safety net.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 
@@ -78,10 +79,18 @@ def _run_via_wsl(project_dir: str, dist_dir: str, revision: str) -> None:
     log(f"dispatching Linux wheel build into WSL distro '{distro}'")
     # Convert the Windows paths to WSL paths inside the shell, then run the
     # committed build script. Trailing args map to $1/$2/$3 after the '_' ($0).
+    #
+    # The script is piped through `sed 's/\r$//'` (strip trailing CR) before
+    # bash so a Windows checkout that re-introduces CRLF line endings (VS Code
+    # autosave, git core.autocrlf, etc.) can never break it with the classic
+    # `$'\r': command not found` / `syntax error near unexpected token` failures.
+    # `bash -s -- "$proj" "$out" "$rev"` feeds the cleaned script on stdin and
+    # forwards the positional args.
     remote = (
         'set -u; '
         'proj="$(wslpath -u "$1")"; out="$(wslpath -u "$2")"; rev="$3"; '
-        'bash "$proj/scripts/' + SCRIPT_NAME + '" "$proj" "$out" "$rev"'
+        "sed 's/\\r$//' \"$proj/scripts/" + SCRIPT_NAME + '" '
+        '| bash -s -- "$proj" "$out" "$rev"'
     )
     cmd = [
         wsl_exe, "-d", distro, "-e", "bash", "-lc", remote,
@@ -99,10 +108,15 @@ def _run_native(project_dir: str, dist_dir: str, revision: str) -> None:
         log(f"build script not found at {script}; skipping")
         return
     log("running Linux wheel build natively (host is Linux)")
+    # Strip any trailing CR before bash so a CRLF checkout can't break the
+    # script (see _run_via_wsl for the rationale).
+    pipeline = (
+        "sed 's/\\r$//' " + shlex.quote(script)
+        + ' | bash -s -- '
+        + ' '.join(shlex.quote(a) for a in (project_dir, dist_dir, revision))
+    )
     try:
-        subprocess.run(
-            ["bash", script, project_dir, dist_dir, revision], check=False
-        )
+        subprocess.run(["bash", "-c", pipeline], check=False)
     except FileNotFoundError:
         log("bash not found; skipping Linux wheel build")
     except Exception as exc:  # noqa: BLE001 - best-effort
