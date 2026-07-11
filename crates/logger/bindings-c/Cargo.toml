@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [lib]
-name = "libsynclite_1_0_0"
+name = "synclite_1_0_0"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
