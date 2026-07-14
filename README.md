@@ -718,7 +718,7 @@ under `target/release/`:
 
 | Artifact | Source crate | Crate type | Consumer |
 |----------|--------------|------------|----------|
-| `libsynclite.rlib` | `synclite` | `rlib` | Rust apps via `synclite = "0.1"` in `Cargo.toml` |
+| `libsynclite.rlib` | `synclite` | `rlib` | Rust apps via `synclite = { package = "synclite-rs", version = "0.1" }` in `Cargo.toml` |
 | `synclite_c.dll` / `libsynclite_c.so` / `libsynclite_c.dylib` | `synclite-c` | `cdylib` | C / C++ / Go / Python (cffi) / any FFI host |
 | `synclite_c.lib` / `libsynclite_c.a` | `synclite-c` | `staticlib` | Static linking into native binaries |
 | Component `.rlib`s (`logger-core`, `logger-runtime`, `consolidator-runtime`, …) | individual crates | `rlib` | Internal; re-exported through `synclite` |
@@ -738,7 +738,7 @@ right one is selected at compile time for your host. On the first call
 to `SyncLite::initialize`, the runtime extracts the binary to
 `<temp>/synclite-cdc-<crate-version>/` and points the loader at it via
 `SYNCLITE_CDC_LIB_DIR`. No extra files to bundle, no extra steps for
-your end users — `cargo add synclite` is enough.
+your end users — `cargo add synclite-rs` is enough.
 
 On hosts without an embedded prebuilt (e.g., macOS today),
 the loader falls back to its standard search path: `SYNCLITE_CDC_LIB_DIR`,
