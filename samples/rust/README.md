@@ -245,7 +245,7 @@ If you copy this folder outside the platform repo, swap the path
 dependencies in [`Cargo.toml`](Cargo.toml) for the published versions:
 
 ```toml
-synclite = "0.1"
+synclite = { package = "synclite-rs", version = "0.1" }
 logger-core = "0.1"
 logger-db-traits = "0.1"
 ```
