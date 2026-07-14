@@ -31,9 +31,9 @@ the platform repo. Replace the path dependencies above with:
 
 ```toml
 [dependencies]
-synclite          = "0.1"
-logger-core       = "0.1"
-logger-db-traits  = "0.1"
+synclite          = { package = "synclite-rs", version = "1.0.0" }
+logger-core       = "1.0.0"
+logger-db-traits  = "1.0.0"
 ```
 
 Both options expose the exact same `synclite::` API — the sample
@@ -245,7 +245,7 @@ If you copy this folder outside the platform repo, swap the path
 dependencies in [`Cargo.toml`](Cargo.toml) for the published versions:
 
 ```toml
-synclite = { package = "synclite-rs", version = "0.1" }
-logger-core = "0.1"
-logger-db-traits = "0.1"
+synclite = { package = "synclite-rs", version = "1.0.0" }
+logger-core = "1.0.0"
+logger-db-traits = "1.0.0"
 ```
