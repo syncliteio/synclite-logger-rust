@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "Shared observability primitives for tracing, metrics, and diagnostics across SyncLite components."
 
 [dependencies]
 parking_lot.workspace = true
