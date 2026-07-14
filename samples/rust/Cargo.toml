@@ -9,12 +9,12 @@ publish = false
 # If you copy this folder out of the platform repo, replace the path
 # dependencies with published versions:
 #
-#   synclite = "0.1"
+#   synclite = { package = "synclite-rs", version = "0.1" }
 #
 [workspace]
 
 [dependencies]
-synclite = { path = "../../crates/synclite" }
+synclite = { path = "../../crates/synclite", package = "synclite-rs" }
 logger-core = { path = "../../crates/logger/core" }
 logger-db-traits = { path = "../../crates/logger/db-traits" }
 rusqlite = { version = "0.39", features = ["bundled"] }
