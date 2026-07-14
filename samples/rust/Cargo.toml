@@ -9,7 +9,7 @@ publish = false
 # If you copy this folder out of the platform repo, replace the path
 # dependencies with published versions:
 #
-#   synclite = { package = "synclite-rs", version = "0.1" }
+#   synclite = { package = "synclite-rs", version = "1.0.0" }
 #
 [workspace]
 
