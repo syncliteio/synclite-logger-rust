@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "PyO3 bindings exposing SyncLite runtime APIs to Python."
 
 [lib]
 name = "_native"
