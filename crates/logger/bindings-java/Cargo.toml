@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "JNI bindings that bridge Java SyncLite APIs to the Rust runtime."
 
 [lib]
 name = "synclite_jni"
