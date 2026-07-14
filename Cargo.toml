@@ -100,7 +100,7 @@ logger-shipper = { package = "logger-shipper", path = "crates/logger/shipper" }
 consolidator-core = { path = "crates/consolidator/core" }
 consolidator-state = { path = "crates/consolidator/state" }
 consolidator-runtime = { path = "crates/consolidator/runtime" }
-synclite = { path = "crates/synclite", package = "synclite" }
+synclite = { path = "crates/synclite", package = "synclite-rs" }
 logger-runtime = { package = "logger-runtime", path = "crates/logger/runtime" }
 synclite-observability = { path = "crates/observability" }
 
