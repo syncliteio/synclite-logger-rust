@@ -7,12 +7,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "Runtime adapter that wires SyncLite config and device initialization for language bindings."
 
 [dependencies]
 logger-core.workspace = true
 logger-config.workspace = true
 logger-db-traits.workspace = true
 synclite.workspace = true
-
-
-
