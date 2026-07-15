@@ -30,8 +30,9 @@ edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
 authors = ["SyncLite contributors"]
-repository = "https://github.com/synclite/synclite"
+repository = "https://github.com/syncliteio/synclite-logger-rust"
 homepage = "https://www.synclite.io"
+documentation = "https://github.com/syncliteio/SyncLite/blob/main/DOCUMENTATION.md"
 
 [workspace.dependencies]
 # Core
