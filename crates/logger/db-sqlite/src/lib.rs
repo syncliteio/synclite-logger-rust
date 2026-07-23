@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use logger_core::{
@@ -56,6 +56,15 @@ pub struct SqliteDeviceConfig {
     pub max_inlined_log_args: u32,
     /// Skip in-doubt restart recovery on open.
     pub skip_restart_recovery: bool,
+    /// Auto-switch the active segment once it has accumulated this many log
+    /// records. Checked only at commit boundaries so a transaction never
+    /// spans two segments. `None` disables count-based switching.
+    /// Java default: 1_000_000.
+    pub log_segment_switch_log_count_threshold: Option<u64>,
+    /// Auto-switch the active segment once it is older than this many
+    /// milliseconds. Checked only at commit boundaries. `None` disables
+    /// time-based switching. Java default: 5_000.
+    pub log_segment_switch_duration_threshold_ms: Option<u64>,
 }
 
 impl SqliteDeviceConfig {
@@ -71,6 +80,8 @@ impl SqliteDeviceConfig {
             device_type: DeviceType::SQLITE,
             max_inlined_log_args: 16,
             skip_restart_recovery: false,
+            log_segment_switch_log_count_threshold: Some(1_000_000),
+            log_segment_switch_duration_threshold_ms: Some(5_000),
         }
     }
 }
@@ -101,6 +112,7 @@ pub struct SqliteDevice {
     last_committed_commit_id: u64,
     next_operation_id: u64,
     txn_runtime: TxnLogRuntime,
+    current_segment_created_at: Instant,
     restart_segment_path: Option<PathBuf>,
     restart_slave_commit_id: u64,
     restart_txn_fate: Option<TxnFate>,
@@ -154,6 +166,7 @@ impl SqliteDevice {
             last_committed_commit_id: 0,
             next_operation_id: 0,
             txn_runtime: TxnLogRuntime::new(),
+            current_segment_created_at: Instant::now(),
             restart_segment_path: restart_state.as_ref().map(|s| s.0.clone()),
             restart_slave_commit_id: restart_state.as_ref().map(|s| s.1).unwrap_or(0),
             restart_txn_fate: restart_state.as_ref().map(|s| s.2),
@@ -214,6 +227,31 @@ impl SqliteDevice {
         }
         self.current_segment_seq = next_seq;
         self.next_change_number = 0;
+        self.current_segment_created_at = Instant::now();
+        Ok(())
+    }
+
+    /// Java-parity segment auto-switch, evaluated only at commit boundaries
+    /// so a transaction is never split across two segment files. Rolls the
+    /// active segment once it has accumulated enough log records (count)
+    /// or has aged past the duration threshold (time).
+    fn maybe_auto_switch_segment(&mut self) -> Result<()> {
+        // `next_change_number` is the number of log records written to the
+        // current segment; it resets to 0 on every roll.
+        if self.next_change_number == 0 {
+            return Ok(());
+        }
+        let count_hit = self
+            .cfg
+            .log_segment_switch_log_count_threshold
+            .is_some_and(|t| self.next_change_number >= t);
+        let time_hit = self
+            .cfg
+            .log_segment_switch_duration_threshold_ms
+            .is_some_and(|ms| self.current_segment_created_at.elapsed().as_millis() as u64 >= ms);
+        if count_hit || time_hit {
+            self.roll_segment()?;
+        }
         Ok(())
     }
 
@@ -718,6 +756,8 @@ impl DbDevice for SqliteDevice {
         self.last_committed_commit_id = committed_id;
         self.next_commit_id = next_monotonic_commit_id(self.next_commit_id);
         self.next_operation_id = 0;
+        // Commit boundary: safe to roll the segment without splitting a txn.
+        self.maybe_auto_switch_segment()?;
         Ok(())
     }
 

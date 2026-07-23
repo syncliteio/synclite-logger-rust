@@ -1271,6 +1271,8 @@ impl Logger {
         let log_segment_flush_batch_size = cfg
             .log_segment_flush_batch_size
             .unwrap_or(DEFAULT_LOG_SEGMENT_FLUSH_BATCH_SIZE);
+        let log_segment_switch_log_count_threshold = cfg.log_segment_switch_log_count_threshold;
+        let log_segment_switch_duration_threshold_ms = cfg.log_segment_switch_duration_threshold_ms;
         let max_inlined_log_args = cfg.max_inlined_log_args.unwrap_or(16);
 
         let device: Box<dyn DbDevice> = match backend {
@@ -1284,6 +1286,12 @@ impl Logger {
                 dcfg.device_type = device_type;
                 dcfg.max_inlined_log_args = max_inlined_log_args;
                 dcfg.skip_restart_recovery = cfg.skip_restart_recovery.unwrap_or(false);
+                dcfg.log_segment_switch_log_count_threshold =
+                    log_segment_switch_log_count_threshold
+                        .or(dcfg.log_segment_switch_log_count_threshold);
+                dcfg.log_segment_switch_duration_threshold_ms =
+                    log_segment_switch_duration_threshold_ms
+                        .or(dcfg.log_segment_switch_duration_threshold_ms);
                 Box::new(SqliteDevice::open(dcfg)?)
             }
             Backend::DuckDb => {
@@ -1296,6 +1304,12 @@ impl Logger {
                 dcfg.device_type = device_type;
                 dcfg.max_inlined_log_args = max_inlined_log_args;
                 dcfg.skip_restart_recovery = cfg.skip_restart_recovery.unwrap_or(false);
+                dcfg.log_segment_switch_log_count_threshold =
+                    log_segment_switch_log_count_threshold
+                        .or(dcfg.log_segment_switch_log_count_threshold);
+                dcfg.log_segment_switch_duration_threshold_ms =
+                    log_segment_switch_duration_threshold_ms
+                        .or(dcfg.log_segment_switch_duration_threshold_ms);
                 Box::new(DuckDbDevice::open(dcfg)?)
             }
         };
