@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use duckdb::{appender_params_from_iter, params_from_iter, types::Value as DuckValue, Connection};
 use rusqlite::Connection as SqliteConnection;
@@ -57,6 +57,15 @@ pub struct DuckDbDeviceConfig {
     pub max_inlined_log_args: u32,
     /// Skip in-doubt restart recovery on open.
     pub skip_restart_recovery: bool,
+    /// Auto-switch the active segment once it has accumulated this many log
+    /// records. Checked only at commit boundaries so a transaction never
+    /// spans two segments. `None` disables count-based switching.
+    /// Java default: 1_000_000.
+    pub log_segment_switch_log_count_threshold: Option<u64>,
+    /// Auto-switch the active segment once it is older than this many
+    /// milliseconds. Checked only at commit boundaries. `None` disables
+    /// time-based switching. Java default: 5_000.
+    pub log_segment_switch_duration_threshold_ms: Option<u64>,
 }
 
 impl DuckDbDeviceConfig {
@@ -72,6 +81,8 @@ impl DuckDbDeviceConfig {
             device_type: DeviceType::DUCKDB,
             max_inlined_log_args: 16,
             skip_restart_recovery: false,
+            log_segment_switch_log_count_threshold: Some(1_000_000),
+            log_segment_switch_duration_threshold_ms: Some(5_000),
         }
     }
 }
@@ -104,6 +115,7 @@ pub struct DuckDbDevice {
     next_operation_id: u64,
     txn_runtime: TxnLogRuntime,
     txn_stage: Option<TxnStage>,
+    current_segment_created_at: Instant,
     restart_segment_path: Option<PathBuf>,
     restart_slave_commit_id: u64,
     restart_txn_fate: Option<TxnFate>,
@@ -269,6 +281,7 @@ impl DuckDbDevice {
             next_operation_id: 0,
             txn_runtime: TxnLogRuntime::new(),
             txn_stage: None,
+            current_segment_created_at: Instant::now(),
             restart_segment_path: restart_state.as_ref().map(|s| s.0.clone()),
             restart_slave_commit_id: restart_state.as_ref().map(|s| s.1).unwrap_or(0),
             restart_txn_fate: restart_state.as_ref().map(|s| s.2),
@@ -325,6 +338,31 @@ impl DuckDbDevice {
         }
         self.current_segment_seq = next_seq;
         self.next_change_number = 0;
+        self.current_segment_created_at = Instant::now();
+        Ok(())
+    }
+
+    /// Java-parity segment auto-switch, evaluated only at commit boundaries
+    /// so a transaction is never split across two segment files. Rolls the
+    /// active segment once its main-segment log-record count exceeds the
+    /// count threshold or it has aged past the duration threshold.
+    fn maybe_auto_switch_segment(&mut self) -> Result<()> {
+        // `next_change_number` is the number of log records written to the
+        // current main segment; it resets to 0 on every roll.
+        if self.next_change_number == 0 {
+            return Ok(());
+        }
+        let count_hit = self
+            .cfg
+            .log_segment_switch_log_count_threshold
+            .is_some_and(|t| self.next_change_number >= t);
+        let time_hit = self
+            .cfg
+            .log_segment_switch_duration_threshold_ms
+            .is_some_and(|ms| self.current_segment_created_at.elapsed().as_millis() as u64 >= ms);
+        if count_hit || time_hit {
+            self.roll_segment()?;
+        }
         Ok(())
     }
 
@@ -1044,6 +1082,8 @@ impl DbDevice for DuckDbDevice {
         self.last_committed_commit_id = committed_id;
         self.next_commit_id = next_monotonic_commit_id(self.next_commit_id);
         self.next_operation_id = 0;
+        // Commit boundary: safe to roll the segment without splitting a txn.
+        self.maybe_auto_switch_segment()?;
         Ok(())
     }
 
