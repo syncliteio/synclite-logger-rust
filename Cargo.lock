@@ -964,7 +964,6 @@ dependencies = [
  "consolidator-core",
  "consolidator-state",
  "duckdb",
- "fs2",
  "libloading",
  "logger-core",
  "postgres",
@@ -2417,7 +2416,7 @@ dependencies = [
  "logger-core",
  "logger-db-traits",
  "pyo3",
- "synclite",
+ "synclite-rs",
 ]
 
 [[package]]
@@ -2496,7 +2495,7 @@ dependencies = [
  "logger-config",
  "logger-core",
  "logger-db-traits",
- "synclite",
+ "synclite-rs",
 ]
 
 [[package]]
@@ -4179,7 +4178,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "synclite"
+name = "synclite-bindings-java"
+version = "1.0.0"
+dependencies = [
+ "consolidator-core",
+ "consolidator-runtime",
+ "jni",
+ "synclite-rs",
+]
+
+[[package]]
+name = "synclite-c"
+version = "1.0.0"
+dependencies = [
+ "logger-core",
+ "logger-db-traits",
+ "logger-runtime",
+ "synclite-rs",
+]
+
+[[package]]
+name = "synclite-observability"
+version = "1.0.0"
+dependencies = [
+ "file-rotate",
+ "parking_lot",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+]
+
+[[package]]
+name = "synclite-rs"
 version = "1.0.0"
 dependencies = [
  "consolidator-core",
@@ -4199,38 +4230,6 @@ dependencies = [
  "tempfile",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "synclite-bindings-java"
-version = "1.0.0"
-dependencies = [
- "consolidator-core",
- "consolidator-runtime",
- "jni",
- "synclite",
-]
-
-[[package]]
-name = "synclite-c"
-version = "1.0.0"
-dependencies = [
- "logger-core",
- "logger-db-traits",
- "logger-runtime",
- "synclite",
-]
-
-[[package]]
-name = "synclite-observability"
-version = "1.0.0"
-dependencies = [
- "file-rotate",
- "parking_lot",
- "serde",
- "tempfile",
- "thiserror 1.0.69",
- "time",
 ]
 
 [[package]]
