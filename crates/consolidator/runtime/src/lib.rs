@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,6 @@ use std::time::Duration;
 use consolidator_core::{ApplyProgress, ConsolidatorLayout, DstIdempotentDataIngestionMethod, DstType, DestinationSyncMode, MetadataStore};
 use consolidator_state::*;
 use duckdb::{params_from_iter as duck_params_from_iter, types::Value as DuckValue, Connection as DuckConnection};
-use fs2::FileExt;
 use libloading::Library;
 use postgres::{Client as PgClient, NoTls};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension};
@@ -123,23 +122,18 @@ const DEVICE_PROCESSING_LOCK_FILE_NAME: &str = "synclite_device_processing.lock"
 const DEVICE_METADATA_FILE_NAME: &str = "synclite_device_metadata.db";
 
 struct DeviceProcessingLock {
-    file: File,
+    // Holds a SQLite connection with an open `BEGIN IMMEDIATE` transaction.
+    // SQLite's RESERVED lock is held for the lifetime of this value and is
+    // released when the transaction is rolled back / the connection dropped.
+    conn: Connection,
 }
 
-fn is_lock_contention_error(err: &std::io::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    if err.raw_os_error() == Some(33)
-        || msg.contains("locked")
-        || msg.contains("another process")
-        || msg.contains("would block")
-        || msg.contains("resource temporarily unavailable")
-    {
-        return true;
-    }
-
-    match err.kind() {
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => true,
-        std::io::ErrorKind::Other | std::io::ErrorKind::PermissionDenied => true,
+fn is_sqlite_busy_err(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(e, _) => {
+            e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+        }
         _ => false,
     }
 }
@@ -150,21 +144,45 @@ impl DeviceProcessingLock {
         let lock_path = layout
             .device_work_dir
             .join(DEVICE_PROCESSING_LOCK_FILE_NAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
+        //
+        // Cross-process, cross-language device processing lock.
+        //
+        // This lock must mutually exclude a Rust consolidator and a Java
+        // consolidator operating on the same device directory. A raw OS
+        // advisory lock does NOT achieve this on POSIX: Rust's fs2 uses
+        // flock() while Java's FileChannel.tryLock() uses fcntl() locks, and
+        // flock/fcntl live in independent lock spaces (they do not exclude
+        // each other on Linux/macOS).
+        //
+        // Instead we use SQLite's file-locking protocol as the lock: both
+        // rusqlite and the Java SQLite driver implement the identical on-disk
+        // locking protocol (fcntl byte-range locks at fixed offsets on Unix,
+        // LockFileEx on Windows). Opening the same lock DB and issuing
+        // `BEGIN IMMEDIATE` acquires SQLite's RESERVED lock; a second holder
+        // gets SQLITE_BUSY. This gives genuine cross-language, cross-platform
+        // mutual exclusion with no extra dependency, and the OS releases the
+        // lock automatically if the process dies.
+        //
+        let conn = Connection::open(&lock_path).map_err(|e| {
+            Error::Config(format!(
+                "consolidator: failed to open device lock db {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+        // busy_timeout=0 so contention returns SQLITE_BUSY immediately instead
+        // of blocking. Keep the lock DB in the default rollback-journal mode
+        // (NOT WAL) so classic exclusive-writer semantics apply.
+        let _ = conn.busy_timeout(Duration::from_secs(0));
 
         for attempt in 0..8 {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Some(Self { file })),
-                Err(e) if is_lock_contention_error(&e) && attempt < 7 => {
+            match conn.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => return Ok(Some(Self { conn })),
+                Err(e) if is_sqlite_busy_err(&e) && attempt < 7 => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(e) if is_lock_contention_error(&e) => return Ok(None),
+                Err(e) if is_sqlite_busy_err(&e) => return Ok(None),
                 Err(e) => {
-                    cdc_debug_eprintln!("[lock-debug] try_lock failed: {e:?} path={} kind={:?}", layout.device_work_dir.display(), e.kind());
+                    cdc_debug_eprintln!("[lock-debug] try_lock failed: {e:?} path={}", layout.device_work_dir.display());
                     return Err(Error::Config(format!(
                         "consolidator: failed to lock device work dir {}: {e}",
                         layout.device_work_dir.display()
@@ -178,7 +196,9 @@ impl DeviceProcessingLock {
 
 impl Drop for DeviceProcessingLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        // Release SQLite's RESERVED lock by ending the transaction. Dropping
+        // the connection alone rolls back a pending txn, but be explicit.
+        let _ = self.conn.execute_batch("ROLLBACK");
     }
 }
 
