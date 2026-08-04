@@ -2637,7 +2637,7 @@ fn write_device_metadata_i64_best_effort(layout: &ConsolidatorLayout, key: &str,
             return;
         }
     }
-    let conn = match Connection::open(&path) {
+    let mut conn = match Connection::open(&path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, key, value, "device metadata write: open failed");
@@ -2650,11 +2650,28 @@ fn write_device_metadata_i64_best_effort(layout: &ConsolidatorLayout, key: &str,
         tracing::warn!(path = %path.display(), error = %e, key, value, "device metadata write: ensure-table failed");
         return;
     }
+    // Java's MetadataManager creates `metadata(key text, value text)` without
+    // a UNIQUE/PRIMARY KEY constraint. SQLite's `ON CONFLICT(key)` therefore
+    // fails against Java-created device metadata DBs, leaving the cleanup
+    // watermark absent and causing every periodic scan to re-clean/log the
+    // same segment. Replace the key explicitly so this also repairs legacy
+    // duplicate rows.
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, key, value, "device metadata write: begin failed");
+            return;
+        }
+    };
     let value_str = value.to_string();
-    if let Err(e) = conn.execute(
-        "INSERT INTO metadata(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, value_str],
-    ) {
+    let result = tx
+        .execute("DELETE FROM metadata WHERE key = ?1", [key])
+        .and_then(|_| tx.execute(
+            "INSERT INTO metadata(key, value) VALUES(?1, ?2)",
+            rusqlite::params![key, value_str],
+        ))
+        .and_then(|_| tx.commit());
+    if let Err(e) = result {
         tracing::warn!(path = %path.display(), error = %e, key, value, "device metadata write: upsert failed");
     }
 }
