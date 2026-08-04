@@ -212,7 +212,9 @@ impl DataTypeMapper {
 
             "date" => self.best_effort_date(),
 
-            "datetime" | "datetime2" | "time" | "timestamp" => self.best_effort_datetime(),
+            "time" => self.best_effort_time(),
+
+            "datetime" | "datetime2" | "timestamp" => self.best_effort_datetime(),
 
             _ => self.best_effort_text(),
         }
@@ -257,6 +259,19 @@ impl DataTypeMapper {
 
     fn best_effort_datetime(&self) -> String {
         "timestamp".to_string()
+    }
+
+    fn best_effort_time(&self) -> String {
+        // Java parity: only Postgres has a dedicated native `time` mapping
+        // (PGDataTypeMapper.getBestEffortTimeDataType). A source `time` value
+        // forced into a `timestamp` column fails PG's implicit cast
+        // (`invalid input syntax for type timestamp: '10:30:00'`). SQLite never
+        // reaches this path (its BEST_EFFORT is identity) and DuckDB keeps the
+        // historical datetime->timestamp behaviour.
+        match self.dst_type {
+            DstType::Postgres => "time".to_string(),
+            _ => self.best_effort_datetime(),
+        }
     }
 
     fn best_effort_array(&self, src: &str) -> String {
@@ -349,6 +364,23 @@ mod tests {
         let m = mapper(DstType::Postgres, DstDataTypeMapping::BestEffort);
         assert_eq!(m.map_type("blob"), "bytea");
         assert_eq!(m.map_type("real"), "double precision");
+    }
+
+    #[test]
+    fn best_effort_postgres_time_maps_to_time_not_timestamp() {
+        let m = mapper(DstType::Postgres, DstDataTypeMapping::BestEffort);
+        assert_eq!(m.map_type("time"), "time");
+        // date/datetime/timestamp still widen to timestamp.
+        assert_eq!(m.map_type("date"), "timestamp");
+        assert_eq!(m.map_type("datetime"), "timestamp");
+        assert_eq!(m.map_type("timestamp"), "timestamp");
+    }
+
+    #[test]
+    fn best_effort_duckdb_time_keeps_timestamp() {
+        // DuckDB keeps the historical datetime->timestamp behaviour for time.
+        let m = mapper(DstType::DuckDb, DstDataTypeMapping::BestEffort);
+        assert_eq!(m.map_type("time"), "timestamp");
     }
 
     #[test]
