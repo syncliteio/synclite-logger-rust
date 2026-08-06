@@ -181,6 +181,21 @@ impl Connection {
         self.runtime.flush()
     }
 
+    /// Perform the transaction-safe idle segment roll used by managed
+    /// bindings. No action is taken while caller-controlled autocommit is off.
+    pub fn flush_idle_segment_if_needed(&mut self) -> Result<()> {
+        if self.user_auto_commit {
+            self.runtime.flush_idle_segment_if_needed()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Configured interval for the managed idle segment ticker.
+    pub fn idle_segment_switch_interval(&self) -> Option<std::time::Duration> {
+        self.runtime.idle_segment_switch_interval()
+    }
+
     /// Close the connection.
     pub fn close(mut self) -> Result<()> {
         if !self.user_auto_commit {
