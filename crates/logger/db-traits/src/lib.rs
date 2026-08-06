@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::time::Duration;
+
 use logger_core::{record::{ArgValue, CommandLogRecord}, Backend, Result};
 
 /// A SQL parameter / bound argument.
@@ -177,6 +179,21 @@ pub trait DbDevice: Send {
     /// Backends that don't write segments may leave this as a no-op.
     fn roll_segment(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    /// Roll the active log segment only when the device is idle at a completed
+    /// transaction boundary and its configured switch threshold is met.
+    ///
+    /// This is intended for a background ticker. Implementations must leave an
+    /// open transaction untouched so its records can never span segments.
+    fn roll_idle_segment_if_needed(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Interval for an optional managed idle-segment ticker. `None` disables
+    /// the ticker when duration-based segment switching is disabled.
+    fn idle_segment_switch_interval(&self) -> Option<Duration> {
+        None
     }
 
     /// Close the device, finalizing the in-flight log segment so a consumer
