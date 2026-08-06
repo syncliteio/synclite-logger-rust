@@ -17,7 +17,8 @@
 //! strings on the Python side to keep the binding small.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use logger_core::DeviceType;
@@ -30,6 +31,73 @@ use synclite::{
     rusqlite as sl_sqlite,
     DestinationOptions as RustDestinationOptions, DstSyncMode, DstType, SyncLiteOptions,
 };
+
+/// Owns the background ticker for one managed Python connection.
+///
+/// The worker holds only a weak reference to the connection state and uses
+/// `try_lock`, so it never blocks application writes or prolongs a connection's
+/// lifetime after close.
+struct IdleSegmentSwitcher {
+    shutdown_tx: mpsc::Sender<()>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl IdleSegmentSwitcher {
+    fn start<C>(
+        inner: &Arc<Mutex<Option<C>>>,
+        idle_flush: fn(&mut C) -> synclite::Result<()>,
+        interval: Duration,
+        name: &'static str,
+    ) -> PyResult<Self>
+    where
+        C: Send + 'static,
+    {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let weak_inner: Weak<Mutex<Option<C>>> = Arc::downgrade(inner);
+        let join = thread::Builder::new()
+            .name(name.into())
+            .spawn(move || loop {
+                match shutdown_rx.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+
+                let Some(inner) = weak_inner.upgrade() else {
+                    break;
+                };
+                let Ok(mut guard) = inner.try_lock() else {
+                    continue;
+                };
+                let Some(connection) = guard.as_mut() else {
+                    break;
+                };
+                // Idle flushing is best-effort. The caller-visible operation
+                // remains authoritative; a future tick retries after a
+                // transient segment/shipper failure.
+                let _ = idle_flush(connection);
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("start idle segment switcher: {e}")))?;
+        Ok(Self {
+            shutdown_tx,
+            join: Mutex::new(Some(join)),
+        })
+    }
+
+    fn stop(&self) {
+        let _ = self.shutdown_tx.send(());
+        if let Ok(mut join) = self.join.lock() {
+            if let Some(handle) = join.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for IdleSegmentSwitcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 // ---------- module-level: initialize / await_sync ----------------------------
 
@@ -144,7 +212,8 @@ impl PyDestinationOptions {
 /// SyncLite-wrapped SQLite-family connection — `rusqlite`-shaped.
 #[pyclass(module = "synclite._native", name = "Connection", unsendable)]
 struct PyConnection {
-    inner: Mutex<Option<sl_sqlite::Connection>>,
+    inner: Arc<Mutex<Option<sl_sqlite::Connection>>>,
+    idle_segment_switcher: Option<IdleSegmentSwitcher>,
 }
 
 #[pymethods]
@@ -155,7 +224,7 @@ impl PyConnection {
     #[staticmethod]
     fn open(db_path: &str) -> PyResult<Self> {
         let c = sl_sqlite::Connection::open(db_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     /// Initialize + open in one call using path-derived defaults
@@ -163,7 +232,7 @@ impl PyConnection {
     #[staticmethod]
     fn initialize(db_path: &str) -> PyResult<Self> {
         let c = sl_sqlite::Connection::initialize(db_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     /// Open from an existing `synclite.conf` file (legacy `synclite_logger.conf`
@@ -172,14 +241,14 @@ impl PyConnection {
     #[staticmethod]
     fn open_with_config(conf_path: &str) -> PyResult<Self> {
         let c = sl_sqlite::Connection::open_with_config(conf_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     /// Initialize + open from an existing config file.
     #[staticmethod]
     fn initialize_with_config(conf_path: &str) -> PyResult<Self> {
         let c = sl_sqlite::Connection::initialize_with_config(conf_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     /// Execute a mutating statement.
@@ -245,6 +314,9 @@ impl PyConnection {
     }
 
     fn close(&self) -> PyResult<()> {
+        if let Some(switcher) = &self.idle_segment_switcher {
+            switcher.stop();
+        }
         let mut guard = self.lock_inner()?;
         match guard.take() {
             Some(c) => c.close().map_err(map_err),
@@ -267,10 +339,23 @@ impl PyConnection {
 }
 
 impl PyConnection {
-    fn wrap(c: sl_sqlite::Connection) -> Self {
-        Self {
-            inner: Mutex::new(Some(c)),
-        }
+    fn wrap(c: sl_sqlite::Connection) -> PyResult<Self> {
+        let interval = c.idle_segment_switch_interval();
+        let inner = Arc::new(Mutex::new(Some(c)));
+        let idle_segment_switcher = interval
+            .map(|interval| {
+                IdleSegmentSwitcher::start(
+                    &inner,
+                    sl_sqlite::Connection::flush_idle_segment_if_needed,
+                    interval,
+                    "synclite-idle-segment-switch-sqlite",
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            inner,
+            idle_segment_switcher,
+        })
     }
 
     fn lock_inner(&self) -> PyResult<std::sync::MutexGuard<'_, Option<sl_sqlite::Connection>>> {
@@ -365,7 +450,8 @@ impl PyStatement {
 /// SyncLite-wrapped DuckDB-family connection — `duckdb`-shaped.
 #[pyclass(module = "synclite._native", name = "DuckDBConnection", unsendable)]
 struct PyDuckConnection {
-    inner: Mutex<Option<sl_duck::Connection>>,
+    inner: Arc<Mutex<Option<sl_duck::Connection>>>,
+    idle_segment_switcher: Option<IdleSegmentSwitcher>,
 }
 
 #[pymethods]
@@ -373,25 +459,25 @@ impl PyDuckConnection {
     #[staticmethod]
     fn open(db_path: &str) -> PyResult<Self> {
         let c = sl_duck::Connection::open(db_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     #[staticmethod]
     fn initialize(db_path: &str) -> PyResult<Self> {
         let c = sl_duck::Connection::initialize(db_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     #[staticmethod]
     fn open_with_config(conf_path: &str) -> PyResult<Self> {
         let c = sl_duck::Connection::open_with_config(conf_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     #[staticmethod]
     fn initialize_with_config(conf_path: &str) -> PyResult<Self> {
         let c = sl_duck::Connection::initialize_with_config(conf_path).map_err(map_err)?;
-        Ok(Self::wrap(c))
+        Self::wrap(c)
     }
 
     #[pyo3(signature = (sql, params = None))]
@@ -449,6 +535,9 @@ impl PyDuckConnection {
     }
 
     fn close(&self) -> PyResult<()> {
+        if let Some(switcher) = &self.idle_segment_switcher {
+            switcher.stop();
+        }
         let mut guard = self.lock_inner()?;
         match guard.take() {
             Some(c) => c.close().map_err(map_err),
@@ -471,10 +560,23 @@ impl PyDuckConnection {
 }
 
 impl PyDuckConnection {
-    fn wrap(c: sl_duck::Connection) -> Self {
-        Self {
-            inner: Mutex::new(Some(c)),
-        }
+    fn wrap(c: sl_duck::Connection) -> PyResult<Self> {
+        let interval = c.idle_segment_switch_interval();
+        let inner = Arc::new(Mutex::new(Some(c)));
+        let idle_segment_switcher = interval
+            .map(|interval| {
+                IdleSegmentSwitcher::start(
+                    &inner,
+                    sl_duck::Connection::flush_idle_segment_if_needed,
+                    interval,
+                    "synclite-idle-segment-switch-duckdb",
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            inner,
+            idle_segment_switcher,
+        })
     }
 
     fn lock_inner(&self) -> PyResult<std::sync::MutexGuard<'_, Option<sl_duck::Connection>>> {
