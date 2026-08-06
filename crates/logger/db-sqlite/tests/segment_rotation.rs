@@ -138,6 +138,47 @@ fn duration_threshold_rotates_on_commit_boundary() {
 }
 
 #[test]
+fn idle_rolls_committed_segment_but_never_open_transaction() {
+    let dir = tempdir().unwrap();
+    let mut cfg =
+        SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
+    cfg.log_segment_switch_log_count_threshold = None;
+    cfg.log_segment_switch_duration_threshold_ms = Some(1);
+
+    let mut device = SqliteDevice::open(cfg.clone()).unwrap();
+    device.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    device.commit().unwrap();
+
+    // The age threshold passes with no subsequent writer activity. This is
+    // the path used by the managed connection's periodic idle ticker.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    device.roll_idle_segment_if_needed().unwrap();
+    let rolled_sequence = device.current_segment_sequence();
+    assert!(rolled_sequence.0 > 0, "committed idle segment must roll");
+
+    // A new transaction may age past the threshold too, but the idle check
+    // must leave it in its current segment until its COMMIT/ROLLBACK fate is
+    // known.
+    device
+        .execute(
+            "INSERT INTO t(k, v) VALUES (?, ?)",
+            &[ArgValue::Int(1), ArgValue::Text("pending".into())],
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    device.roll_idle_segment_if_needed().unwrap();
+    assert_eq!(
+        device.current_segment_sequence(),
+        rolled_sequence,
+        "idle ticker must not split an open transaction"
+    );
+
+    device.commit().unwrap();
+    Box::new(device).close().unwrap();
+    assert_commit_boundaries(&cfg.segment_dir);
+}
+
+#[test]
 fn disabled_thresholds_keep_single_segment() {
     let dir = tempdir().unwrap();
     let mut cfg =
