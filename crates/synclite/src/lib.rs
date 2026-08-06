@@ -1459,6 +1459,20 @@ impl Logger {
         self.device.roll_segment()
     }
 
+    /// Roll the active segment only if it is idle, already at a completed
+    /// transaction boundary, and has reached its configured switch threshold.
+    ///
+    /// Used by managed connection tickers to make bursty applications ship
+    /// their final segment without requiring an explicit caller `flush()`.
+    pub fn flush_idle_segment_if_needed(&mut self) -> Result<()> {
+        self.device.roll_idle_segment_if_needed()
+    }
+
+    /// Configured interval for a managed idle segment ticker, if enabled.
+    pub fn idle_segment_switch_interval(&self) -> Option<std::time::Duration> {
+        self.device.idle_segment_switch_interval()
+    }
+
     /// Roll back the active logical transaction.
     pub fn rollback(&mut self) -> Result<()> {
         self.device.rollback()
