@@ -1098,6 +1098,27 @@ impl DbDevice for DuckDbDevice {
         DuckDbDevice::roll_segment(self)
     }
 
+    fn roll_idle_segment_if_needed(&mut self) -> Result<()> {
+        // Do not let an idle ticker roll while a user transaction or its
+        // sidecar staging state is still open; that would split its log.
+        if self.user_txn_open
+            || self.txn_runtime.is_open()
+            || self.next_operation_id != 0
+            || self.txn_stage.is_some()
+        {
+            return Ok(());
+        }
+        self.maybe_auto_switch_segment()
+    }
+
+    fn idle_segment_switch_interval(&self) -> Option<std::time::Duration> {
+        self.cfg.log_segment_switch_duration_threshold_ms.map(|ms| {
+            // Mirror Java SyncTxnLogger.startLogging(): zero is invalid, so
+            // use its 1-second safety fallback rather than spinning.
+            std::time::Duration::from_millis(if ms == 0 { 1_000 } else { ms })
+        })
+    }
+
     fn rollback(&mut self) -> Result<()> {
         let has_pending_work = self.next_operation_id > 0
             || self.txn_runtime.is_open()
