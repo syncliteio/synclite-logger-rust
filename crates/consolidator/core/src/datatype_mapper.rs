@@ -184,9 +184,11 @@ impl DataTypeMapper {
         }
         let normalized = normalize_type_for_switch(src);
         match normalized.as_str() {
-            "smallserial" | "serial" | "bigserial" | "bit" | "integer" | "int" | "tinyint"
+            "smallserial" | "serial" | "bigserial" | "integer" | "int" | "tinyint"
             | "smallint" | "mediumint" | "bigint" | "int2" | "int4" | "int8" | "long"
             | "byteint" | "unsigned" => self.best_effort_integer(),
+
+            "bit" | "varbit" => self.best_effort_bit_string(src),
 
             "text" | "varchar" | "varchar2" | "nvarchar" | "char" | "nchar" | "native"
             | "character" | "varying" | "nvarchar2" | "xmltype" | "xml" | "json" => {
@@ -223,6 +225,13 @@ impl DataTypeMapper {
     fn best_effort_integer(&self) -> String {
         // All three destinations: bigint.
         "bigint".to_string()
+    }
+
+    fn best_effort_bit_string(&self, src: &str) -> String {
+        match self.dst_type {
+            DstType::Postgres => src.to_string(),
+            DstType::Sqlite | DstType::DuckDb => "text".to_string(),
+        }
     }
 
     fn best_effort_text(&self) -> String {
@@ -364,6 +373,17 @@ mod tests {
         let m = mapper(DstType::Postgres, DstDataTypeMapping::BestEffort);
         assert_eq!(m.map_type("blob"), "bytea");
         assert_eq!(m.map_type("real"), "double precision");
+    }
+
+    #[test]
+    fn bit_strings_are_not_mapped_to_integer_types() {
+        let pg = mapper(DstType::Postgres, DstDataTypeMapping::BestEffort);
+        assert_eq!(pg.map_type("BIT(8)"), "BIT(8)");
+        assert_eq!(pg.map_type("BIT VARYING(16)"), "BIT VARYING(16)");
+
+        let duck = mapper(DstType::DuckDb, DstDataTypeMapping::BestEffort);
+        assert_eq!(duck.map_type("BIT(8)"), "text");
+        assert_eq!(duck.map_type("VARBIT"), "text");
     }
 
     #[test]
