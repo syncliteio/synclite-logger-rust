@@ -1,0 +1,19 @@
+# napi-rs generated bindings (recreated by `npm run build`)
+index.js
+index.d.ts
+*.node
+
+# Bundled native libraries fetched/copied at build time
+*.dll
+*.so
+*.dylib
+
+# Packed offline tarballs (recreated by `npm run pack:offline`)
+dist/
+
+# npm install output
+node_modules/
+package-lock.json
+
+# Python bytecode cache
+scripts/__pycache__/
