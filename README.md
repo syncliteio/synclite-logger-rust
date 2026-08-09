@@ -133,6 +133,7 @@ honor all three mappers (filter / value / data-type).
 | **C/C++ toolchain (system linker)** | Platform default (64-bit) | Always — `cargo` shells out to the platform linker to produce cdylibs, and transitive crates (`rusqlite`, `duckdb`) ship native code. **Windows:** [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **"Desktop development with C++"** workload (MSVC v143 + Windows 10/11 SDK) — required by the default `x86_64-pc-windows-msvc` Rust target. Without this you get `error: linker 'link.exe' not found`; run the build from the **"x64 Native Tools Command Prompt for VS"** or any shell where `link.exe` is on `PATH`. **Linux:** `build-essential` (gcc + ld + make) plus `pkg-config`. **macOS:** Xcode Command Line Tools (`xcode-select --install`). |
 | **CMake** | 3.16+ | Required by the `duckdb` crate native build. Pre-installed on most CI images; otherwise install via your package manager. |
 | **Python 3.8+** + [`maturin`](https://www.maturin.rs/) | latest | Only for the [PyO3 wheel](python/) (`pip install maturin && maturin develop`). |
+| **Node.js** + npm | 18+ | Only for the N-API npm package under [`nodejs/`](nodejs/): `npm install && npm run build`. Maven stages this as `lib/nodejs/synclite-*.tgz`. |
 | [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) + [Zig](https://ziglang.org/download/) | latest stable | Only for the multi-arch Linux cross-compile (see [Cross-compile for Linux](#cross-compile-for-linux-multi-arch-cdylibs) below). Not needed for a single-host build. |
 | **macOS host** | any supported | Only if you need `.dylib` artifacts — Apple SDK isn't redistributable so macOS cdylibs must be built on a macOS box. |
 
@@ -171,6 +172,7 @@ This produces, under `target/`:
 |---|---|
 | `target/release/synclite_jni.{dll,so,dylib}` | Host-arch JNI cdylib for the Java logger. |
 | `target/release/synclite_c.{dll,so,dylib}` + `.{lib,a}` | Host-arch C ABI cdylib + staticlib for C/C++/Go/Python. |
+| `nodejs/synclite_node.node` | Host-arch Node.js N-API addon (built with `cd nodejs && npm install && npm run build`). |
 | `target/release/libsynclite.rlib` (and component `.rlib`s) | Rust artifacts for in-tree consumers. |
 | `target/x86_64-unknown-linux-gnu/release/libsynclite_jni.so`, `libsynclite_c.so` | Linux x86_64 cdylibs (cross-compiled). |
 | `target/aarch64-unknown-linux-gnu/release/libsynclite_jni.so`, `libsynclite_c.so` | Linux aarch64 cdylibs (cross-compiled). |

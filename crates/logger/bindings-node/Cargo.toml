@@ -1,0 +1,22 @@
+[package]
+name = "synclite-bindings-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Node.js N-API bindings for the SyncLite Rust runtime."
+
+[lib]
+name = "synclite_node_1_0_0"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2.16", default-features = false, features = ["napi8"] }
+napi-derive = "2.16"
+serde_json.workspace = true
+synclite.workspace = true
+logger-core.workspace = true
+logger-db-traits.workspace = true
