@@ -167,11 +167,32 @@ def main(argv: list[str]) -> int:
 
         repaired = sorted(glob.glob(os.path.join(out_dir, "synclite-*.whl")))
         if not repaired:
-            print(
-                f"[repair_wheel] ERROR: repair tool produced no wheel in {out_dir}",
-                file=sys.stderr,
-            )
-            return 1
+            # delvewheel may refuse to repair a wheel it thinks is already repaired
+            # (detected by metadata in the wheel). Fall back to manual bundling.
+            if sys.platform.startswith("win"):
+                print(
+                    "[repair_wheel] no output from delvewheel (possibly already repaired); "
+                    "attempting manual DLL bundling instead"
+                )
+                try:
+                    repaired_wheel = _bundle_native_dlls_in_wheel(wheel, deps_dir)
+                except Exception as exc:
+                    print(
+                        f"[repair_wheel] manual bundling failed: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                os.remove(wheel)
+                dest = os.path.join(dist_dir, os.path.basename(repaired_wheel))
+                shutil.move(repaired_wheel, dest)
+                print(f"[repair_wheel] output wheel: {dest}")
+                return 0
+            else:
+                print(
+                    f"[repair_wheel] ERROR: repair tool produced no wheel in {out_dir}",
+                    file=sys.stderr,
+                )
+                return 1
 
         # Replace the unpatched wheel in dist/ with the repaired one.
         os.remove(wheel)
