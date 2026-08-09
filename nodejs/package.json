@@ -1,0 +1,19 @@
+{
+  "name": "synclite",
+  "version": "1.0.0",
+  "description": "Node.js bindings for the SyncLite Rust runtime",
+  "main": "synclite.js",
+  "types": "synclite.d.ts",
+  "files": ["synclite.js", "synclite.d.ts", "index.js", "index.d.ts", "scripts/ensure-dll.js", "*.node", "*.dll", "README.md"],
+  "scripts": {
+    "build": "napi build --platform --release --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_0_0 .",
+    "build:linux:x64": "napi build --platform --release --zig --target x86_64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_0_0 .",
+    "build:linux:arm64": "napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_0_0 .",
+    "pack:offline": "node scripts/pack-offline.js",
+    "postinstall": "node scripts/ensure-dll.js"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}
