@@ -19,7 +19,7 @@ logger-core = { path = "../../crates/logger/core" }
 logger-db-traits = { path = "../../crates/logger/db-traits" }
 rusqlite = { version = "0.39", features = ["bundled"] }
 duckdb = { version = "1.4", features = ["bundled"] }
-postgres = "0.19"
+postgres = "0.19.14"
 
 [[example]]
 name = "synclite_rusqlite"

@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "consolidator-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde_json",
  "tracing",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "consolidator-runtime"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "consolidator-core",
  "consolidator-state",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "consolidator-state"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "consolidator-core",
  "duckdb",
@@ -2411,7 +2411,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "logger-archiver"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2429,7 +2429,7 @@ dependencies = [
 
 [[package]]
 name = "logger-bindings-python"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-config",
  "logger-core",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "logger-config"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "java-properties",
  "logger-core",
@@ -2450,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "logger-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "regex",
  "serde",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "logger-db-duckdb"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "duckdb",
  "logger-core",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "logger-db-sqlite"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-core",
  "logger-db-traits",
@@ -2482,14 +2482,14 @@ dependencies = [
 
 [[package]]
 name = "logger-db-traits"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-core",
 ]
 
 [[package]]
 name = "logger-log"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-core",
  "parking_lot",
@@ -2499,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "logger-metadata"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-core",
  "parking_lot",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "logger-runtime"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-config",
  "logger-core",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "logger-shipper"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-archiver",
  "logger-core",
@@ -2997,9 +2997,9 @@ checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "postgres"
-version = "0.19.13"
+version = "0.19.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aacf632d0554ff75f58183694f41dc8999c8a3a43a386994d0ec2d034f1dfbe1"
+checksum = "33ad20e0aa0b24f5a394eab4f78c781d248982b22b25cecc7e3aa46a681605bd"
 dependencies = [
  "bytes",
  "fallible-iterator 0.2.0",
@@ -3011,9 +3011,9 @@ dependencies = [
 
 [[package]]
 name = "postgres-protocol"
-version = "0.6.11"
+version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56201207dac53e2f38e848e31b4b91616a6bb6e0c7205b77718994a7f49e70fc"
+checksum = "08808e3c483c46e999108051c78334f473d5adb59d78bb80a1268c7e6aa6c514"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -3029,9 +3029,9 @@ dependencies = [
 
 [[package]]
 name = "postgres-types"
-version = "0.2.13"
+version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dc729a129e682e8d24170cd30ae1aa01b336b096cbb56df6d534ffec133d186"
+checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
  "fallible-iterator 0.2.0",
@@ -4249,7 +4249,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-bindings-java"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "consolidator-core",
  "consolidator-runtime",
@@ -4259,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-bindings-node"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-core",
  "logger-db-traits",
@@ -4271,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-c"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "logger-core",
  "logger-db-traits",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-observability"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "file-rotate",
  "parking_lot",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-rs"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "consolidator-core",
  "consolidator-runtime",
@@ -4497,9 +4497,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-postgres"
-version = "0.7.17"
+version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dd8df5ef180f6364759a6f00f7aadda4fbbac86cdee37480826a6ff9f3574ce"
+checksum = "a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3"
 dependencies = [
  "async-trait",
  "byteorder",

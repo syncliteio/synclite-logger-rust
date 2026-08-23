@@ -29,9 +29,9 @@ if (fs.existsSync(dllPath)) {
 // Look for the tarball in common installation locations
 const possibleTarballLocations = [
   // When installed from file path (npm install /path/to/tarball)
-  path.join(pkgDir, '..', '..', '..', 'lib', 'nodejs', `synclite-1.0.0-${process.platform}-${process.arch === 'x64' ? 'x64' : arch}-msvc.tgz`),
+  path.join(pkgDir, '..', '..', '..', 'lib', 'nodejs', `synclite-1.1.0-${process.platform}-${process.arch === 'x64' ? 'x64' : arch}-msvc.tgz`),
   // When installed from file in current directory
-  path.join(process.cwd(), `synclite-1.0.0-win32-${arch}-msvc.tgz`),
+  path.join(process.cwd(), `synclite-1.1.0-win32-${arch}-msvc.tgz`),
 ];
 
 for (const tarballPath of possibleTarballLocations) {

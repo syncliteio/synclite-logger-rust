@@ -10,7 +10,7 @@ homepage.workspace = true
 description = "C ABI and static/dynamic library bindings for SyncLite."
 
 [lib]
-name = "synclite_1_0_0"
+name = "synclite_1_1_0"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]

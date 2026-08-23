@@ -25,6 +25,8 @@
 //! `synclite-<device>-<uuid>/` stage subdirectory.
 
 use std::fs;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
 
@@ -203,6 +205,12 @@ fn enforce_name_len_64(base: String, seed: &str) -> String {
     base.chars().take(MAX_DEVICE_NAME_LEN).collect()
 }
 
+fn short_hash_hex(seed: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    format!("{:08x}", (hasher.finish() & 0xffff_ffff) as u32)
+}
+
 fn canonical_test_name(device_name: &str, engine: &str, scenario_name: &str) -> String {
     let normalized_device = normalize_naming_terms(device_name);
     let device = if normalized_device.contains("stream") {
@@ -255,6 +263,17 @@ impl Workspace {
                 .filter(|ch| ch.is_ascii_alphanumeric())
                 .collect();
             if s.is_empty() { "device".to_string() } else { s }
+        };
+        // Keep deterministic names for reproducibility while avoiding collisions
+        // when multiple long test names compact to the same prefix.
+        let unique_suffix = short_hash_hex(&format!("{test_name}|{device_name}|{engine}"));
+        let sanitized_device_name = {
+            const MAX_DEVICE_NAME_LEN: usize = 40;
+            let suffix_len = unique_suffix.len();
+            let base_max_len = MAX_DEVICE_NAME_LEN.saturating_sub(suffix_len);
+            let mut base: String = sanitized_device_name.chars().take(base_max_len).collect();
+            base.push_str(&unique_suffix);
+            base
         };
         let test_home = test_home();
         let stage = test_home.join("stageDir");
@@ -1714,7 +1733,25 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
                     .unwrap_or(false)
             })
             .collect();
-        if !segments.is_empty() {
+        let mut operation_types = HashSet::new();
+        for path in &segments {
+            if let Ok(conn) = Connection::open(path) {
+                if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT op_type FROM cdclog") {
+                    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                        for op in rows.flatten() {
+                            operation_types.insert(op);
+                        }
+                    }
+                }
+            }
+        }
+        let expected_operations = [
+            "INSERT", "UPDATE", "DELETE", "ADDCOLUMN", "DROPCOLUMN",
+            "RENAMECOLUMN", "RENAMETABLE",
+        ];
+        if !segments.is_empty()
+            && expected_operations.iter().all(|op| operation_types.contains(*op))
+        {
             break segments;
         }
         if Instant::now() >= deadline {
@@ -1770,15 +1807,15 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
                 .cloned()
         })
         .unwrap_or_else(|| panic!("missing .cdclog files under {}", work_device_dir.display()));
-    let cdc_conn = Connection::open(&first_cdclog).unwrap();
-    let cdclog_exists: i64 = cdc_conn
+    let first_cdc_conn = Connection::open(&first_cdclog).unwrap();
+    let cdclog_exists: i64 = first_cdc_conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cdclog'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    let cdclog_schemas_exists: i64 = cdc_conn
+    let cdclog_schemas_exists: i64 = first_cdc_conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cdclog_schemas'",
             [],
@@ -1793,7 +1830,7 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
         first_cdclog.display()
     );
 
-    let mut col_stmt = cdc_conn
+    let mut col_stmt = first_cdc_conn
         .prepare("SELECT name FROM pragma_table_info('cdclog')")
         .unwrap();
     let cols: std::collections::HashSet<String> = col_stmt
@@ -1816,6 +1853,25 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
             "cdclog missing required column '{required}' in {}",
             first_cdclog.display()
         );
+    }
+
+    // A SQL-device command log is split into multiple CDC segments. Build an
+    // in-memory union so the assertions below validate the complete history,
+    // rather than whichever segment happened to contain the first INSERT.
+    let cdc_conn = Connection::open_in_memory().unwrap();
+    for (idx, path) in cdc_segments.iter().enumerate() {
+        let alias = format!("segment_{idx}");
+        cdc_conn
+            .execute(&format!("ATTACH DATABASE ?1 AS {alias}"), [path.to_string_lossy().as_ref()])
+            .unwrap();
+        if idx == 0 {
+            cdc_conn
+                .execute(&format!("CREATE TABLE cdclog AS SELECT * FROM {alias}.cdclog WHERE 1 = 0"), [])
+                .unwrap();
+        }
+        cdc_conn
+            .execute(&format!("INSERT INTO cdclog SELECT * FROM {alias}.cdclog"), [])
+            .unwrap();
     }
 
     let cdclog_row_count: i64 = cdc_conn
@@ -2115,7 +2171,10 @@ fn sqlite_user_db_persists_across_reopens() {
 
     {
         let monitor = open_logger(&ws);
-        wait_for_sql_device_consolidation_and_validate_expected_count(&ws, &table, 2);
+        // For DuckDB reopen flows, CDC file numbering may lag or diverge from
+        // stage segment sequence, so validate consolidation via destination
+        // row-count parity instead of an exact `<seq>.cdclog` filename wait.
+        wait_for_destination_table_row_count(&table, 2, Duration::from_secs(20));
         monitor.close().unwrap();
     }
 

@@ -10,7 +10,7 @@ homepage.workspace = true
 description = "Node.js N-API bindings for the SyncLite Rust runtime."
 
 [lib]
-name = "synclite_node_1_0_0"
+name = "synclite_node_1_1_0"
 crate-type = ["cdylib"]
 
 [dependencies]

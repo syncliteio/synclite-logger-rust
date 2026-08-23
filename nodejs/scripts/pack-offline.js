@@ -38,8 +38,8 @@ for (const file of ['package.json', 'synclite.js', 'synclite.d.ts', 'index.js', 
 // Include the postinstall helper referenced by package.json scripts.postinstall.
 fs.mkdirSync(path.join(staging, 'scripts'), { recursive: true });
 fs.copyFileSync(
-  path.join(root, 'scripts', 'ensure-dll.js'),
-  path.join(staging, 'scripts', 'ensure-dll.js'),
+  path.join(root, 'scripts', 'ensure-dlls.js'),
+  path.join(staging, 'scripts', 'ensure-dlls.js'),
 );
 
 // Copy platform-specific DLL dependencies for Windows packages

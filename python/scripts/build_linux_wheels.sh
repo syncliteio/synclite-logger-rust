@@ -29,7 +29,7 @@ set -uo pipefail
 
 PROJECT_DIR="${1:-}"
 OUT_DIR="${2:-}"
-REVISION="${3:-1.0.0}"
+REVISION="${3:-1.1.0}"
 
 DUCKDB_DOWNLOAD_LIB="${DUCKDB_DOWNLOAD_LIB:-true}"
 MANYLINUX="${SYNCLITE_MANYLINUX:-manylinux_2_28}"

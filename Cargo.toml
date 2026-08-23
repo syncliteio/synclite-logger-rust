@@ -26,7 +26,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
@@ -64,7 +64,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # download a pre-built shared library from DuckDB's GitHub releases instead of
 # compiling the full C++ source tree, which cuts hundreds of Compiling lines.
 duckdb = { version = "=1.10502.0", default-features = false }
-postgres = "0.19"
+postgres = "0.19.14"
 
 # Logging / tracing
 tracing = "0.1"
@@ -90,21 +90,21 @@ russh-keys = { version = "0.45" }
 async-trait = "0.1"
 
 # Internal crates (path deps resolved at workspace root)
-logger-core = { package = "logger-core", path = "crates/logger/core", version = "1.0.0" }
-logger-config = { package = "logger-config", path = "crates/logger/config", version = "1.0.0" }
-logger-metadata = { package = "logger-metadata", path = "crates/logger/metadata", version = "1.0.0" }
-logger-db-traits = { package = "logger-db-traits", path = "crates/logger/db-traits", version = "1.0.0" }
-logger-log = { package = "logger-log", path = "crates/logger/log", version = "1.0.0" }
-logger-db-sqlite = { package = "logger-db-sqlite", path = "crates/logger/db-sqlite", version = "1.0.0" }
-logger-db-duckdb = { package = "logger-db-duckdb", path = "crates/logger/db-duckdb", version = "1.0.0" }
-logger-archiver = { package = "logger-archiver", path = "crates/logger/archiver", version = "1.0.0" }
-logger-shipper = { package = "logger-shipper", path = "crates/logger/shipper", version = "1.0.0" }
-consolidator-core = { path = "crates/consolidator/core", version = "1.0.0" }
-consolidator-state = { path = "crates/consolidator/state", version = "1.0.0" }
-consolidator-runtime = { path = "crates/consolidator/runtime", version = "1.0.0" }
-synclite = { path = "crates/synclite", package = "synclite-rs", version = "1.0.0" }
-logger-runtime = { package = "logger-runtime", path = "crates/logger/runtime", version = "1.0.0" }
-synclite-observability = { path = "crates/observability", version = "1.0.0" }
+logger-core = { package = "logger-core", path = "crates/logger/core", version = "1.1.0" }
+logger-config = { package = "logger-config", path = "crates/logger/config", version = "1.1.0" }
+logger-metadata = { package = "logger-metadata", path = "crates/logger/metadata", version = "1.1.0" }
+logger-db-traits = { package = "logger-db-traits", path = "crates/logger/db-traits", version = "1.1.0" }
+logger-log = { package = "logger-log", path = "crates/logger/log", version = "1.1.0" }
+logger-db-sqlite = { package = "logger-db-sqlite", path = "crates/logger/db-sqlite", version = "1.1.0" }
+logger-db-duckdb = { package = "logger-db-duckdb", path = "crates/logger/db-duckdb", version = "1.1.0" }
+logger-archiver = { package = "logger-archiver", path = "crates/logger/archiver", version = "1.1.0" }
+logger-shipper = { package = "logger-shipper", path = "crates/logger/shipper", version = "1.1.0" }
+consolidator-core = { path = "crates/consolidator/core", version = "1.1.0" }
+consolidator-state = { path = "crates/consolidator/state", version = "1.1.0" }
+consolidator-runtime = { path = "crates/consolidator/runtime", version = "1.1.0" }
+synclite = { path = "crates/synclite", package = "synclite-rs", version = "1.1.0" }
+logger-runtime = { package = "logger-runtime", path = "crates/logger/runtime", version = "1.1.0" }
+synclite-observability = { path = "crates/observability", version = "1.1.0" }
 
 # Test-only
 tempfile = "3.10"
