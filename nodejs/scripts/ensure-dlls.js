@@ -2,17 +2,26 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
-// Post-install script to ensure duckdb.dll is available on Windows
-// This works around a Windows tar limitation where .dll files in gzipped tarballs
-// are not extracted by tar.exe
+/**
+ * Post-install script for SyncLite Node.js N-API bindings.
+ *
+ * On Windows, npm/tar cannot extract .dll files from gzipped tarballs due to
+ * Windows file locking. This script verifies DLL presence after extraction.
+ *
+ * Works with both:
+ * 1. Main package (synclite@1.1.0) — multiple .node files included
+ * 2. Platform-specific packages (@synclite/synclite-{platform}@1.1.0) — single .node file
+ *
+ * For platform-specific packages, duckdb.dll is bundled and extracted by npm pack.
+ * For the main package, this script looks for DLLs alongside the installed addon.
+ */
 
 const platform = process.platform;
 const arch = process.arch;
 
+// Not Windows, no DLL needed
 if (platform !== 'win32') {
-  // Not Windows, no DLL needed
   process.exit(0);
 }
 
@@ -25,38 +34,15 @@ if (fs.existsSync(dllPath)) {
   process.exit(0);
 }
 
-// Try to extract DLL from the original tarball if available
-// Look for the tarball in common installation locations
-const possibleTarballLocations = [
-  // When installed from file path (npm install /path/to/tarball)
-  path.join(pkgDir, '..', '..', '..', 'lib', 'nodejs', `synclite-1.1.0-${process.platform}-${process.arch === 'x64' ? 'x64' : arch}-msvc.tgz`),
-  // When installed from file in current directory
-  path.join(process.cwd(), `synclite-1.1.0-win32-${arch}-msvc.tgz`),
-];
-
-for (const tarballPath of possibleTarballLocations) {
-  if (fs.existsSync(tarballPath)) {
-    try {
-      console.log(`Extracting duckdb.dll from ${tarballPath}...`);
-      // Use tar to extract just the DLL file
-      execSync(`tar -xzOf "${tarballPath}" package/duckdb.dll > "${dllPath}"`, {
-        stdio: 'pipe',
-        shell: true,
-      });
-      
-      if (fs.existsSync(dllPath)) {
-        console.log('✓ duckdb.dll extracted successfully');
-        process.exit(0);
-      }
-    } catch (e) {
-      // Extraction failed, continue to next location
-    }
-  }
-}
-
-// DLL not found and extraction failed
-console.warn('⚠ Warning: duckdb.dll not found. The addon may fail to load.');
-console.warn('This typically means the tar extraction did not preserve .dll files.');
-console.warn('If you encounter "The specified module could not be found" errors,');
-console.warn('please ensure duckdb.dll is in the same directory as the .node addon.');
-process.exit(0); // Don't fail npm install, just warn
+// For platform-specific packages or when DLL was supposed to be bundled
+// Just warn — the addon may still work if DLL is in system PATH or installed elsewhere
+console.warn('⚠ Warning: duckdb.dll not found in package directory.');
+console.warn('  This may be expected for platform-specific packages on non-Windows systems.');
+console.warn('  On Windows, ensure duckdb.dll is available via:');
+console.warn('    1. System PATH');
+console.warn('    2. Alongside the .node addon file');
+console.warn('    3. In the Windows/System32 directory');
+console.warn('');
+console.warn('  If you encounter "The specified module could not be found" errors,');
+console.warn('  please report this issue at: https://github.com/syncliteio/SyncLite/issues');
+process.exit(0);
