@@ -28,15 +28,15 @@
     "@napi-rs/cli": "^2.18.4"
   },
   "optionalDependencies": {
-    "@synclite/synclite-win32-x64-msvc": "1.1.0",
-    "@synclite/synclite-win32-ia32-msvc": "1.1.0",
-    "@synclite/synclite-win32-arm64-msvc": "1.1.0",
-    "@synclite/synclite-linux-x64-gnu": "1.1.0",
-    "@synclite/synclite-linux-x64-musl": "1.1.0",
-    "@synclite/synclite-linux-arm64-gnu": "1.1.0",
-    "@synclite/synclite-linux-arm64-musl": "1.1.0",
-    "@synclite/synclite-darwin-universal": "1.1.0",
-    "@synclite/synclite-android-arm64": "1.1.0",
-    "@synclite/synclite-android-arm-eabi": "1.1.0"
+    "synclite-win32-x64-msvc": "1.1.0",
+    "synclite-win32-ia32-msvc": "1.1.0",
+    "synclite-win32-arm64-msvc": "1.1.0",
+    "synclite-linux-x64-gnu": "1.1.0",
+    "synclite-linux-x64-musl": "1.1.0",
+    "synclite-linux-arm64-gnu": "1.1.0",
+    "synclite-linux-arm64-musl": "1.1.0",
+    "synclite-darwin-universal": "1.1.0",
+    "synclite-android-arm64": "1.1.0",
+    "synclite-android-arm-eabi": "1.1.0"
   }
 }
