@@ -26,7 +26,6 @@ const dist = path.join(root, 'dist');
 fs.mkdirSync(dist, { recursive: true });
 
 const MAIN_PACKAGE_NAME = 'synclite';
-const SCOPE = 'synclite';
 const VERSION = '1.1.0';
 
 // Purge stale tarballs from the old flat `synclite-<version>-<platform>.tgz`
@@ -59,7 +58,13 @@ const PLATFORM_PACKAGES = [
 
 function getPlatformPackageJson(platformTag) {
   return {
-    name: `@${SCOPE}/${MAIN_PACKAGE_NAME}-${platformTag}`,
+    // Unscoped, flat `synclite-<platform>` naming — this MUST match the
+    // package names the napi-rs generated index.js falls back to via
+    // require('synclite-<platform>') when no local .node file is present.
+    // Do NOT scope this (e.g. `@synclite/...`); index.js has no knowledge
+    // of any npm scope and the optional-dependency fallback would silently
+    // never resolve.
+    name: `${MAIN_PACKAGE_NAME}-${platformTag}`,
     version: VERSION,
     description: `SyncLite Node.js native binary for ${platformTag}`,
     main: 'index.js',
@@ -92,7 +97,7 @@ function getPlatformPackageJson(platformTag) {
 function getMainPackageJson() {
   const optionalDependencies = {};
   for (const platform of PLATFORM_PACKAGES) {
-    optionalDependencies[`@${SCOPE}/${MAIN_PACKAGE_NAME}-${platform}`] = VERSION;
+    optionalDependencies[`${MAIN_PACKAGE_NAME}-${platform}`] = VERSION;
   }
 
   return {
@@ -140,7 +145,7 @@ function getMainPackageJson() {
 }
 
 function packPlatformPackage(platformTag) {
-  console.log(`\n📦 Packing platform package: @${SCOPE}/${MAIN_PACKAGE_NAME}-${platformTag}@${VERSION}`);
+  console.log(`\n📦 Packing platform package: ${MAIN_PACKAGE_NAME}-${platformTag}@${VERSION}`);
 
   // Find the .node file for this platform
   const addon = `index.${platformTag}.node`;
@@ -211,7 +216,7 @@ function packPlatformPackage(platformTag) {
   // Clean up staging directory
   fs.rmSync(staging, { recursive: true, force: true });
 
-  const packageName = `${SCOPE}-synclite-${platformTag}`;
+  const packageName = `${MAIN_PACKAGE_NAME}-${platformTag}`;
   const tarballPath = path.join(dist, `${packageName}-${VERSION}.tgz`);
 
   if (fs.existsSync(tarballPath)) {
