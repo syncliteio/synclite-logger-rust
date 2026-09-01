@@ -4,21 +4,38 @@
   "description": "Node.js bindings for the SyncLite Rust runtime",
   "main": "synclite.js",
   "types": "synclite.d.ts",
-  "files": ["synclite.js", "synclite.d.ts", "index.js", "index.d.ts", "scripts/ensure-dlls.js", "*.node", "*.dll", "README.md"],
+  "napi": {
+    "package": {
+      "name": "@synclite/native"
+    }
+  },
+  "files": [
+    "synclite.js",
+    "synclite.d.ts",
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
   "scripts": {
-    "build": "napi build --platform --release --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 .",
-    "build:linux:x64": "napi build --platform --release --zig --target x86_64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 .",
-    "build:linux:arm64": "napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 .",
+    "build": "napi build --platform --release --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 . && node scripts/verify-loader-scope.js",
+    "build:linux:x64": "napi build --platform --release --zig --target x86_64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 . && node scripts/verify-loader-scope.js",
+    "build:linux:arm64": "napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 . && node scripts/verify-loader-scope.js",
     "pack:offline": "node scripts/pack-offline.js",
-    "pack:offline:all": "npm run pack:offline && npm run pack:offline -- win32-x64-msvc && npm run pack:offline -- linux-x64-gnu && npm run pack:offline -- linux-arm64-gnu",
-    "postinstall": "node scripts/ensure-dlls.js"
+    "pack:offline:all": "npm run pack:offline && npm run pack:offline -- win32-x64-msvc && npm run pack:offline -- linux-x64-gnu && npm run pack:offline -- linux-arm64-gnu"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/syncliteio/SyncLite.git",
     "directory": "synclite-logger-rust/nodejs"
   },
-  "keywords": ["synclite", "database", "sync", "replication", "node-api", "napi"],
+  "keywords": [
+    "synclite",
+    "database",
+    "sync",
+    "replication",
+    "node-api",
+    "napi"
+  ],
   "author": "SyncLite Contributors",
   "license": "Apache-2.0",
   "engines": {
@@ -28,15 +45,11 @@
     "@napi-rs/cli": "^2.18.4"
   },
   "optionalDependencies": {
-    "synclite-win32-x64-msvc": "1.1.0",
-    "synclite-win32-ia32-msvc": "1.1.0",
-    "synclite-win32-arm64-msvc": "1.1.0",
-    "synclite-linux-x64-gnu": "1.1.0",
-    "synclite-linux-x64-musl": "1.1.0",
-    "synclite-linux-arm64-gnu": "1.1.0",
-    "synclite-linux-arm64-musl": "1.1.0",
-    "synclite-darwin-universal": "1.1.0",
-    "synclite-android-arm64": "1.1.0",
-    "synclite-android-arm-eabi": "1.1.0"
+    "@synclite/native-linux-arm64-gnu": "1.1.0",
+    "@synclite/native-linux-x64-gnu": "1.1.0",
+    "@synclite/native-win32-x64-msvc": "file:dist/synclite-native-win32-x64-msvc-1.1.0.tgz"
+  },
+  "dependencies": {
+    "synclite": "file:dist/synclite-1.1.0.tgz"
   }
 }
