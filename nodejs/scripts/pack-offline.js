@@ -29,6 +29,20 @@ const MAIN_PACKAGE_NAME = 'synclite';
 const SCOPE = 'synclite';
 const VERSION = '1.1.0';
 
+// Purge stale tarballs from the old flat `synclite-<version>-<platform>.tgz`
+// naming scheme so the assembly step can never pick up leftovers that no
+// longer match this script's current output. Scoped to that specific old
+// pattern only — must NOT touch this script's own outputs
+// (`synclite-<version>.tgz` and `synclite-synclite-<platform>-<version>.tgz`),
+// since main + each platform are packed via separate invocations that all
+// share this same dist/ directory.
+const staleTarballPattern = new RegExp(`^${MAIN_PACKAGE_NAME}-${VERSION.replace(/\./g, '\\.')}-.+\\.tgz$`);
+for (const file of fs.readdirSync(dist)) {
+  if (staleTarballPattern.test(file)) {
+    fs.rmSync(path.join(dist, file), { force: true });
+  }
+}
+
 // Supported platforms for optional dependencies in the main package
 const PLATFORM_PACKAGES = [
   'win32-x64-msvc',
