@@ -4,7 +4,7 @@
  *
  * USAGE:
  *   node pack-offline.js              → Pack main "synclite" package with optional deps
- *   node pack-offline.js win32-x64-msvc → Pack "@synclite/synclite-win32-x64-msvc" platform pkg
+ *   node pack-offline.js win32-x64-msvc → Pack "@synclite/native-win32-x64-msvc" platform pkg
  *
  * Main package mode:
  *   Creates dist/synclite-1.1.0.tgz with optional dependencies on all supported platforms.
@@ -12,9 +12,8 @@
  *   The index.js loader tries local .node file first, then falls back to optional dep packages.
  *
  * Platform-specific mode:
- *   Creates dist/@synclite/synclite-{platform}-1.1.0.tgz with the native binary.
- *   Published as optional peer package; npm install skips if platform doesn't match.
- *   No postinstall overhead for platform packages.
+ *   Creates a tarball whose package is @synclite/native-{platform}, containing
+ *   only that platform's native binary. npm skips non-matching packages via os/cpu.
  */
 
 const fs = require('node:fs');
@@ -27,17 +26,36 @@ fs.mkdirSync(dist, { recursive: true });
 
 const MAIN_PACKAGE_NAME = 'synclite';
 const VERSION = '1.1.0';
+const PLATFORM_PACKAGE_SCOPE = '@synclite';
+const PLATFORM_PACKAGE_NAME = 'native';
 
-// Purge stale tarballs from the old flat `synclite-<version>-<platform>.tgz`
-// naming scheme so the assembly step can never pick up leftovers that no
-// longer match this script's current output. Scoped to that specific old
-// pattern only — must NOT touch this script's own outputs
-// (`synclite-<version>.tgz` and `synclite-synclite-<platform>-<version>.tgz`),
-// since main + each platform are packed via separate invocations that all
-// share this same dist/ directory.
-const staleTarballPattern = new RegExp(`^${MAIN_PACKAGE_NAME}-${VERSION.replace(/\./g, '\\.')}-.+\\.tgz$`);
+function runNpmPack(cwd) {
+  if (process.platform === 'win32') {
+    return spawnSync(
+      path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe'),
+      ['/d', '/c', `npm pack --pack-destination ${dist}`],
+      { cwd, stdio: 'inherit', shell: false },
+    );
+  }
+  return spawnSync('npm', ['pack', '--pack-destination', dist], {
+    cwd,
+    stdio: 'inherit',
+    shell: false,
+  });
+}
+
+// Purge artifacts from both previous naming schemes. Do not touch this
+// script's own outputs (`synclite-<version>.tgz` and the scoped-package
+// tarballs `synclite-native-<platform>-<version>.tgz`), because the main
+// package and each platform are packed by separate invocations sharing dist/.
+const escapedVersion = VERSION.replace(/\./g, '\\.');
+const staleTarballPatterns = [
+  new RegExp(`^${MAIN_PACKAGE_NAME}-${escapedVersion}-.+\\.tgz$`),
+  new RegExp(`^${MAIN_PACKAGE_NAME}-(?:win32|linux)-.+-${escapedVersion}\\.tgz$`),
+  new RegExp(`^${MAIN_PACKAGE_NAME}-${MAIN_PACKAGE_NAME}-.+-${escapedVersion}\\.tgz$`),
+];
 for (const file of fs.readdirSync(dist)) {
-  if (staleTarballPattern.test(file)) {
+  if (staleTarballPatterns.some((pattern) => pattern.test(file))) {
     fs.rmSync(path.join(dist, file), { force: true });
   }
 }
@@ -45,30 +63,20 @@ for (const file of fs.readdirSync(dist)) {
 // Supported platforms for optional dependencies in the main package
 const PLATFORM_PACKAGES = [
   'win32-x64-msvc',
-  'win32-ia32-msvc',
-  'win32-arm64-msvc',
   'linux-x64-gnu',
-  'linux-x64-musl',
   'linux-arm64-gnu',
-  'linux-arm64-musl',
-  'darwin-universal',
-  'android-arm64',
-  'android-arm-eabi',
 ];
 
 function getPlatformPackageJson(platformTag) {
+  const [os, cpu] = platformTag.split('-');
   return {
-    // Unscoped, flat `synclite-<platform>` naming — this MUST match the
-    // package names the napi-rs generated index.js falls back to via
-    // require('synclite-<platform>') when no local .node file is present.
-    // Do NOT scope this (e.g. `@synclite/...`); index.js has no knowledge
-    // of any npm scope and the optional-dependency fallback would silently
-    // never resolve.
-    name: `${MAIN_PACKAGE_NAME}-${platformTag}`,
+    name: `${PLATFORM_PACKAGE_SCOPE}/${PLATFORM_PACKAGE_NAME}-${platformTag}`,
     version: VERSION,
     description: `SyncLite Node.js native binary for ${platformTag}`,
     main: 'index.js',
     types: 'index.d.ts',
+    os: [os],
+    cpu: [cpu],
     files: [
       'index.js',
       'index.d.ts',
@@ -97,7 +105,7 @@ function getPlatformPackageJson(platformTag) {
 function getMainPackageJson() {
   const optionalDependencies = {};
   for (const platform of PLATFORM_PACKAGES) {
-    optionalDependencies[`${MAIN_PACKAGE_NAME}-${platform}`] = VERSION;
+    optionalDependencies[`${PLATFORM_PACKAGE_SCOPE}/${PLATFORM_PACKAGE_NAME}-${platform}`] = VERSION;
   }
 
   return {
@@ -111,9 +119,6 @@ function getMainPackageJson() {
       'synclite.d.ts',
       'index.js',
       'index.d.ts',
-      'scripts/ensure-dlls.js',
-      '*.node',
-      '*.dll',
       'README.md',
     ],
     scripts: {
@@ -124,7 +129,6 @@ function getMainPackageJson() {
         'napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 .',
       'pack:offline': 'node scripts/pack-offline.js',
       'pack:offline:all': 'npm run pack:offline && npm run pack:offline -- win32-x64-msvc && npm run pack:offline -- linux-x64-gnu && npm run pack:offline -- linux-arm64-gnu',
-      postinstall: 'node scripts/ensure-dlls.js',
     },
     repository: {
       type: 'git',
@@ -145,7 +149,7 @@ function getMainPackageJson() {
 }
 
 function packPlatformPackage(platformTag) {
-  console.log(`\n📦 Packing platform package: ${MAIN_PACKAGE_NAME}-${platformTag}@${VERSION}`);
+  console.log(`\n📦 Packing platform package: ${PLATFORM_PACKAGE_SCOPE}/${PLATFORM_PACKAGE_NAME}-${platformTag}@${VERSION}`);
 
   // Find the .node file for this platform
   const addon = `index.${platformTag}.node`;
@@ -201,11 +205,7 @@ function packPlatformPackage(platformTag) {
   }
 
   // Pack with npm
-  const result = spawnSync('npm', ['pack', '--pack-destination', dist], {
-    cwd: staging,
-    stdio: 'inherit',
-    shell: process.platform === 'win32',
-  });
+  const result = runNpmPack(staging);
 
   if (result.status !== 0) {
     console.error(`❌ npm pack failed for platform: ${platformTag}`);
@@ -216,7 +216,10 @@ function packPlatformPackage(platformTag) {
   // Clean up staging directory
   fs.rmSync(staging, { recursive: true, force: true });
 
-  const packageName = `${MAIN_PACKAGE_NAME}-${platformTag}`;
+  // npm removes @ and / from a scoped package when deriving the tarball name.
+  // This filename is conventional; the embedded package name is the canonical
+  // identity used by npm and by the generated N-API loader.
+  const packageName = `${PLATFORM_PACKAGE_SCOPE.slice(1)}-${PLATFORM_PACKAGE_NAME}-${platformTag}`;
   const tarballPath = path.join(dist, `${packageName}-${VERSION}.tgz`);
 
   if (fs.existsSync(tarballPath)) {
@@ -242,7 +245,8 @@ function packMainPackage() {
   // Write main package.json with optional dependencies
   fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2));
 
-  // Copy essential files (including all .node files for cross-platform distribution)
+  // The published main package contains only the JavaScript loader. The native
+  // addon is installed from the matching optional platform package.
   const filesToCopy = ['synclite.js', 'synclite.d.ts', 'index.js', 'index.d.ts', 'README.md'];
   for (const file of filesToCopy) {
     const src = path.join(root, file);
@@ -251,35 +255,8 @@ function packMainPackage() {
     }
   }
 
-  // Copy all .node files (for manual cross-platform consumption)
-  for (const file of fs.readdirSync(root)) {
-    if (file.endsWith('.node')) {
-      fs.copyFileSync(path.join(root, file), path.join(staging, file));
-    }
-  }
-
-  // Include postinstall helper
-  fs.mkdirSync(path.join(staging, 'scripts'), { recursive: true });
-  if (fs.existsSync(path.join(root, 'scripts', 'ensure-dlls.js'))) {
-    fs.copyFileSync(
-      path.join(root, 'scripts', 'ensure-dlls.js'),
-      path.join(staging, 'scripts', 'ensure-dlls.js'),
-    );
-  }
-
-  // Copy Windows DLLs if present (for manual cross-platform consumption)
-  for (const file of fs.readdirSync(root)) {
-    if (file.endsWith('.dll')) {
-      fs.copyFileSync(path.join(root, file), path.join(staging, file));
-    }
-  }
-
   // Pack with npm
-  const result = spawnSync('npm', ['pack', '--pack-destination', dist], {
-    cwd: staging,
-    stdio: 'inherit',
-    shell: process.platform === 'win32',
-  });
+  const result = runNpmPack(staging);
 
   if (result.status !== 0) {
     console.error(`❌ npm pack failed for main package`);
