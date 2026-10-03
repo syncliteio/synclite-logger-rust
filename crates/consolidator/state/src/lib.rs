@@ -7,11 +7,16 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use duckdb::{params_from_iter as duck_params_from_iter, types::Value as DuckValue, Connection as DuckConnection};
+use consolidator_core::{
+    retry_dst, ApplyProgress, ConsolidatorLayout, DestinationSyncMode, DstType, MetadataStore,
+};
+use duckdb::{
+    params_from_iter as duck_params_from_iter, types::Value as DuckValue,
+    Connection as DuckConnection,
+};
+use logger_core::{Error, Result};
 use postgres::{Client as PgClient, NoTls};
 use rusqlite::{params, Connection, OptionalExtension};
-use consolidator_core::{ApplyProgress, ConsolidatorLayout, DstType, DestinationSyncMode, MetadataStore, retry_dst};
-use logger_core::{Error, Result};
 
 const DEFAULT_DST_ALIAS: &str = "DB-1";
 
@@ -200,7 +205,12 @@ fn destination_backend_name(layout: &ConsolidatorLayout) -> &'static str {
 /// Postgres-only: schema-qualify a system metadata table name when
 /// `dst_schema` is set, so metadata always lands in the configured schema.
 fn pg_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
-    if let Some(schema) = layout.dst_schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(schema) = layout
+        .dst_schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let q_schema = schema.replace('"', "\"\"");
         let q_name = name.replace('"', "\"\"");
         return format!("\"{q_schema}\".\"{q_name}\"");
@@ -329,7 +339,8 @@ pub fn bootstrap_destination_metadata(layout: &ConsolidatorLayout, dst_index: i3
     match layout.dst_type {
         DstType::Sqlite => {
             let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
-            conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_sql_err)?;
+            conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+                .map_err(map_sql_err)?;
             conn.execute_batch(CREATE_DST_TABLE_METADATA_TBL_SQL)
                 .map_err(map_sql_err)?;
             conn.execute_batch(
@@ -348,7 +359,8 @@ pub fn bootstrap_destination_metadata(layout: &ConsolidatorLayout, dst_index: i3
         }
         DstType::DuckDb => {
             let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-            conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_duck_err)?;
+            conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+                .map_err(map_duck_err)?;
             conn.execute_batch(CREATE_DST_TABLE_METADATA_TBL_SQL)
                 .map_err(map_duck_err)?;
             conn.execute_batch(
@@ -505,7 +517,11 @@ pub fn initialize_from_backup(
     put_metric_i64(device_stats_conn, "destination_initialized", 1)?;
     update_dashboard(consolidator_stats_conn, "initialized_devices", 1)?;
     update_dashboard(consolidator_stats_conn, "total_device_initializations", 1)?;
-    update_dashboard(consolidator_stats_conn, "last_heartbeat_time", now_epoch_ms())?;
+    update_dashboard(
+        consolidator_stats_conn,
+        "last_heartbeat_time",
+        now_epoch_ms(),
+    )?;
     update_device_status_commit(
         consolidator_stats_conn,
         device_stats_conn,
@@ -517,8 +533,16 @@ pub fn initialize_from_backup(
     )?;
 
     if let Ok(meta) = std::fs::metadata(backup_path) {
-        put_metric_i64(device_stats_conn, "initialization_backup_size_bytes", meta.len() as i64)?;
-        update_dashboard(consolidator_stats_conn, "total_processed_log_size", meta.len() as i64)?;
+        put_metric_i64(
+            device_stats_conn,
+            "initialization_backup_size_bytes",
+            meta.len() as i64,
+        )?;
+        update_dashboard(
+            consolidator_stats_conn,
+            "total_processed_log_size",
+            meta.len() as i64,
+        )?;
     }
 
     Ok(true)
@@ -550,18 +574,53 @@ pub fn record_stage_path<F>(
 where
     F: Fn(&ConsolidatorLayout, &Path) -> Result<ApplyProgress>,
 {
-    let heartbeat_now = now_epoch_ms();
-    let latency_ms = compute_segment_latency_ms(path, heartbeat_now);
-
     let mut apply_progress: Option<ApplyProgress> = None;
     if layout.destination_apply_enabled {
         apply_progress = Some(apply_segment(layout, path)?);
-        update_table_statistics_from_segment(layout, device_stats_conn, path)?;
     }
 
+    // Progress is correctness-critical; statistics are not. Once apply has
+    // committed, a statistics failure must not make the caller replay data.
+    // Persist the LOCAL checkpoint before attempting any observability writes.
+    if let Some(seq) = parse_segment_seq(path) {
+        if let Some(progress) = apply_progress {
+            map_local_checkpoint(state_conn, seq as i64, progress)?;
+        } else {
+            update_synclite_checkpoint_for_segment(state_conn, seq as i64)?;
+        }
+    }
+    if let Err(error) = record_stage_statistics(
+        layout,
+        state_conn,
+        device_stats_conn,
+        consolidator_stats_conn,
+        path,
+        apply_progress,
+    ) {
+        tracing::warn!(error = %error, path = %path.display(),
+            "segment applied and checkpointed; statistics update failed (not replaying committed data)");
+    }
+    Ok(())
+}
+
+fn record_stage_statistics(
+    layout: &ConsolidatorLayout,
+    state_conn: &Connection,
+    device_stats_conn: &Connection,
+    consolidator_stats_conn: &Connection,
+    path: &Path,
+    apply_progress: Option<ApplyProgress>,
+) -> Result<()> {
+    let heartbeat_now = now_epoch_ms();
+    let latency_ms = compute_segment_latency_ms(path, heartbeat_now);
+    if layout.destination_apply_enabled {
+        update_table_statistics_from_segment(layout, device_stats_conn, path)?;
+    }
     record_event(state_conn, "stage-path-ready", path)?;
 
-    let oper_inc = apply_progress.map(|p| p.applied_txn_cnt.max(0)).unwrap_or(0);
+    let oper_inc = apply_progress
+        .map(|p| p.applied_txn_cnt.max(0))
+        .unwrap_or(0);
     let txn_inc = if oper_inc > 0 { 1 } else { 0 };
     let log_size_inc = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
     let updated_rows = device_stats_conn
@@ -576,26 +635,43 @@ where
         .map_err(map_sql_err)?;
     let _ = updated_rows;
 
-    let total_segments = get_dashboard_counter(consolidator_stats_conn, "total_log_segments_applied")? + 1;
-    let total_oper = get_dashboard_counter(consolidator_stats_conn, "total_processed_oper_count")? + oper_inc;
-    let total_txn = get_dashboard_counter(consolidator_stats_conn, "total_processed_txn_count")? + txn_inc;
-    let total_size = get_dashboard_counter(consolidator_stats_conn, "total_processed_log_size")? + log_size_inc;
-    update_dashboard(consolidator_stats_conn, "total_log_segments_applied", total_segments)?;
-    update_dashboard(consolidator_stats_conn, "total_processed_oper_count", total_oper)?;
-    update_dashboard(consolidator_stats_conn, "total_processed_txn_count", total_txn)?;
-    update_dashboard(consolidator_stats_conn, "total_processed_log_size", total_size)?;
+    let total_segments =
+        get_dashboard_counter(consolidator_stats_conn, "total_log_segments_applied")? + 1;
+    let total_oper =
+        get_dashboard_counter(consolidator_stats_conn, "total_processed_oper_count")? + oper_inc;
+    let total_txn =
+        get_dashboard_counter(consolidator_stats_conn, "total_processed_txn_count")? + txn_inc;
+    let total_size =
+        get_dashboard_counter(consolidator_stats_conn, "total_processed_log_size")? + log_size_inc;
+    update_dashboard(
+        consolidator_stats_conn,
+        "total_log_segments_applied",
+        total_segments,
+    )?;
+    update_dashboard(
+        consolidator_stats_conn,
+        "total_processed_oper_count",
+        total_oper,
+    )?;
+    update_dashboard(
+        consolidator_stats_conn,
+        "total_processed_txn_count",
+        total_txn,
+    )?;
+    update_dashboard(
+        consolidator_stats_conn,
+        "total_processed_log_size",
+        total_size,
+    )?;
     update_dashboard(consolidator_stats_conn, "latency", latency_ms)?;
-    update_dashboard(consolidator_stats_conn, "last_heartbeat_time", heartbeat_now)?;
+    update_dashboard(
+        consolidator_stats_conn,
+        "last_heartbeat_time",
+        heartbeat_now,
+    )?;
 
     if let Some(seq) = parse_segment_seq(path) {
         put_metric_i64(device_stats_conn, "last_segment_sequence", seq as i64)?;
-        if let Some(progress) = apply_progress {
-            // Keep local progress metadata current for status/reporting parity,
-            // irrespective of destination metadata-store mode.
-            map_local_checkpoint(state_conn, seq as i64, progress)?;
-        } else {
-            update_synclite_checkpoint_for_segment(state_conn, seq as i64)?;
-        }
     }
 
     let commit_id = get_commit_id(state_conn)?;
@@ -612,7 +688,10 @@ where
     Ok(())
 }
 
-pub fn ensure_synclite_checkpoint_seeded(state_conn: &Connection, backup_db_path: &Path) -> Result<()> {
+pub fn ensure_synclite_checkpoint_seeded(
+    state_conn: &Connection,
+    backup_db_path: &Path,
+) -> Result<()> {
     let existing = state_conn.query_row(
         "SELECT commit_id FROM synclite_checkpoint LIMIT 1",
         [],
@@ -629,7 +708,9 @@ pub fn ensure_synclite_checkpoint_seeded(state_conn: &Connection, backup_db_path
 
     let backup_conn = Connection::open(backup_db_path).map_err(map_sql_err)?;
     let first_commit_id = backup_conn
-        .query_row("SELECT commit_id FROM synclite_txn", [], |row| row.get::<_, i64>(0))
+        .query_row("SELECT commit_id FROM synclite_txn", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap_or(0);
 
     state_conn
@@ -660,14 +741,21 @@ pub fn update_synclite_checkpoint_for_segment(state_conn: &Connection, seq: i64)
 
 pub fn get_commit_id(state_conn: &Connection) -> Result<i64> {
     let commit_id = state_conn
-        .query_row("SELECT commit_id FROM synclite_checkpoint LIMIT 1", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT commit_id FROM synclite_checkpoint LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .unwrap_or(0);
     Ok(commit_id)
 }
 
-pub fn upsert_device_status(conn: &Connection, layout: &ConsolidatorLayout, status: &str, status_description: &str) -> Result<()> {
+pub fn upsert_device_status(
+    conn: &Connection,
+    layout: &ConsolidatorLayout,
+    status: &str,
+    status_description: &str,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO device_status(\n\
              synclite_device_id, synclite_device_name, synclite_device_type, status, status_description,\n\
@@ -892,7 +980,12 @@ fn update_table_statistics_from_segment(
         device_stats_conn
             .execute(
                 update_sql,
-                params![DEFAULT_DST_ALIAS, layout.database_name, schema_name, table_name],
+                params![
+                    DEFAULT_DST_ALIAS,
+                    layout.database_name,
+                    schema_name,
+                    table_name
+                ],
             )
             .map_err(map_sql_err)?;
     }
@@ -1186,14 +1279,16 @@ fn map_pg_err_ctx(e: postgres::Error, sql: Option<&str>) -> Error {
         (None, false) => cause_chain,
         (None, true) => e.to_string(),
     };
-    let sql_ctx = sql.map(|s| {
-        let trimmed = s.trim();
-        if trimmed.len() > 240 {
-            format!(" sql=`{}...`", &trimmed[..240])
-        } else {
-            format!(" sql=`{}`", trimmed)
-        }
-    }).unwrap_or_default();
+    let sql_ctx = sql
+        .map(|s| {
+            let trimmed = s.trim();
+            if trimmed.len() > 240 {
+                format!(" sql=`{}...`", &trimmed[..240])
+            } else {
+                format!(" sql=`{}`", trimmed)
+            }
+        })
+        .unwrap_or_default();
     Error::Config(format!("consolidator: pg[{code}]{sql_ctx} {detail}"))
 }
 
@@ -1246,7 +1341,10 @@ fn duckdb_has_checkpoint_device_columns(conn: &DuckConnection) -> Result<bool> {
     Ok(has_device_id && has_device_name)
 }
 
-fn postgres_has_checkpoint_device_columns(client: &mut PgClient, layout: &ConsolidatorLayout) -> Result<bool> {
+fn postgres_has_checkpoint_device_columns(
+    client: &mut PgClient,
+    layout: &ConsolidatorLayout,
+) -> Result<bool> {
     let count: i64 = if let Some(schema) = pg_meta_schema(layout) {
         client
             .query_one(
@@ -1341,7 +1439,8 @@ pub fn map_destination_checkpoint(
             }
         }
         DstType::DuckDb => {
-            let dst_conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
+            let dst_conn =
+                DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
             if !duckdb_has_checkpoint_device_columns(&dst_conn)? {
                 return Err(Error::Config(
                     "consolidator: destination synclite_checkpoint must contain synclite_device_id and synclite_device_name".to_string(),
@@ -1471,7 +1570,11 @@ pub fn map_destination_checkpoint(
     Ok(())
 }
 
-pub fn map_local_checkpoint(state_conn: &Connection, seq: i64, progress: ApplyProgress) -> Result<()> {
+pub fn map_local_checkpoint(
+    state_conn: &Connection,
+    seq: i64,
+    progress: ApplyProgress,
+) -> Result<()> {
     state_conn
         .execute(
             "UPDATE synclite_checkpoint\n\
@@ -1482,7 +1585,12 @@ pub fn map_local_checkpoint(state_conn: &Connection, seq: i64, progress: ApplyPr
                      ELSE cdc_log_segment_sequence_number\n\
                  END,\n\
                  txn_count = txn_count + ?4",
-            params![progress.applied_commit, progress.applied_change, seq, progress.applied_txn_cnt],
+            params![
+                progress.applied_commit,
+                progress.applied_change,
+                seq,
+                progress.applied_txn_cnt
+            ],
         )
         .map_err(map_sql_err)?;
     Ok(())
@@ -1526,7 +1634,8 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 fn open_local_props(path: &Path) -> Result<Connection> {
     ensure_parent_dir(path)?;
     let conn = Connection::open(path).map_err(map_sql_err)?;
-    conn.execute_batch(CREATE_LOCAL_PROP_TBL_SQL).map_err(map_sql_err)?;
+    conn.execute_batch(CREATE_LOCAL_PROP_TBL_SQL)
+        .map_err(map_sql_err)?;
     Ok(conn)
 }
 
@@ -1628,7 +1737,8 @@ fn dst_props_sqlite_get(
     device_name: &str,
     key: &str,
 ) -> Result<Option<String>> {
-    conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_sql_err)?;
+    conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+        .map_err(map_sql_err)?;
     conn.query_row(
         "SELECT prop_value FROM synclite_consolidator_metadata \
          WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 AND prop_key = ?3",
@@ -1645,7 +1755,8 @@ fn dst_props_sqlite_upsert(
     device_name: &str,
     kvs: &[(&str, String)],
 ) -> Result<()> {
-    conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_sql_err)?;
+    conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+        .map_err(map_sql_err)?;
     let tx = conn.transaction().map_err(map_sql_err)?;
     for (k, v) in kvs {
         tx.execute(
@@ -1671,7 +1782,8 @@ fn dst_props_sqlite_delete(
     device_name: &str,
     key: &str,
 ) -> Result<()> {
-    conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_sql_err)?;
+    conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+        .map_err(map_sql_err)?;
     conn.execute(
         "DELETE FROM synclite_consolidator_metadata \
          WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 AND prop_key = ?3",
@@ -1687,7 +1799,8 @@ fn dst_props_duck_get(
     device_name: &str,
     key: &str,
 ) -> Result<Option<String>> {
-    conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_duck_err)?;
+    conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+        .map_err(map_duck_err)?;
     let res: duckdb::Result<String> = conn.query_row(
         "SELECT prop_value FROM synclite_consolidator_metadata \
          WHERE synclite_device_id = ? AND synclite_device_name = ? AND prop_key = ?",
@@ -1714,7 +1827,8 @@ fn dst_props_duck_upsert(
     device_name: &str,
     kvs: &[(&str, String)],
 ) -> Result<()> {
-    conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_duck_err)?;
+    conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+        .map_err(map_duck_err)?;
     for (k, v) in kvs {
         let del_vals = [
             DuckValue::Text(device_uuid.to_string()),
@@ -1750,7 +1864,8 @@ fn dst_props_duck_delete(
     device_name: &str,
     key: &str,
 ) -> Result<()> {
-    conn.execute_batch(CREATE_DST_PROP_TBL_SQL).map_err(map_duck_err)?;
+    conn.execute_batch(CREATE_DST_PROP_TBL_SQL)
+        .map_err(map_duck_err)?;
     let vals = [
         DuckValue::Text(device_uuid.to_string()),
         DuckValue::Text(device_name.to_string()),
@@ -1778,10 +1893,7 @@ fn dst_props_pg_get(
          WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = $3"
     );
     let rows = client
-        .query(
-            select_sql.as_str(),
-            &[&device_uuid, &device_name, &key],
-        )
+        .query(select_sql.as_str(), &[&device_uuid, &device_name, &key])
         .map_err(|e| map_pg_err_with_sql(e, &select_sql))?;
     if let Some(row) = rows.into_iter().next() {
         let v: Option<String> = row.get(0);
@@ -1809,14 +1921,17 @@ fn dst_props_pg_upsert(
     );
     let mut tx = client.transaction().map_err(map_pg_err)?;
     for (k, v) in kvs {
-        tx.execute(
-            delete_sql.as_str(),
-            &[&device_uuid, &device_name, k],
-        )
-        .map_err(|e| map_pg_err_with_sql(e, &delete_sql))?;
+        tx.execute(delete_sql.as_str(), &[&device_uuid, &device_name, k])
+            .map_err(|e| map_pg_err_with_sql(e, &delete_sql))?;
         tx.execute(
             insert_sql.as_str(),
-            &[&device_uuid, &device_name, &current_update_timestamp(), k, v],
+            &[
+                &device_uuid,
+                &device_name,
+                &current_update_timestamp(),
+                k,
+                v,
+            ],
         )
         .map_err(|e| map_pg_err_with_sql(e, &insert_sql))?;
     }
@@ -1837,10 +1952,7 @@ fn dst_props_pg_delete(
          WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = $3"
     );
     client
-        .execute(
-            delete_sql.as_str(),
-            &[&device_uuid, &device_name, &key],
-        )
+        .execute(delete_sql.as_str(), &[&device_uuid, &device_name, &key])
         .map_err(|e| map_pg_err_with_sql(e, &delete_sql))?;
     Ok(())
 }
@@ -1945,7 +2057,15 @@ fn dst_tblmeta_pg_upsert(
     .map_err(|e| map_pg_err_with_sql(e, &delete_sql))?;
     tx.execute(
         insert_sql.as_str(),
-        &[&device_uuid, &device_name, &current_update_timestamp(), &db, &table, &key, &value],
+        &[
+            &device_uuid,
+            &device_name,
+            &current_update_timestamp(),
+            &db,
+            &table,
+            &key,
+            &value,
+        ],
     )
     .map_err(|e| map_pg_err_with_sql(e, &insert_sql))?;
     tx.commit().map_err(map_pg_err)?;
@@ -1979,7 +2099,10 @@ pub fn seed_device_metadata(layout: &ConsolidatorLayout) -> Result<()> {
 }
 
 /// Reads a string property from the device-metadata file.
-pub fn get_device_metadata_string(layout: &ConsolidatorLayout, key: &str) -> Result<Option<String>> {
+pub fn get_device_metadata_string(
+    layout: &ConsolidatorLayout,
+    key: &str,
+) -> Result<Option<String>> {
     let conn = open_device_metadata(layout)?;
     local_get_string(&conn, key)
 }
@@ -2003,42 +2126,36 @@ pub fn get_consolidator_property(
     dst_index: i32,
     key: &str,
 ) -> Result<Option<String>> {
-    retry_dst(layout, "get_consolidator_property", || match layout.metadata_store {
-        MetadataStore::Local => {
-            let conn = open_local_props(&layout.consolidator_metadata_path(dst_index))?;
-            local_get_string(&conn, key)
-        }
-        MetadataStore::Destination => {
-            bootstrap_destination_metadata(layout, dst_index)?;
-            match layout.dst_type {
-            DstType::Sqlite => {
-                let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
-                dst_props_sqlite_get(
-                    &conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    key,
-                )
+    retry_dst(layout, "get_consolidator_property", || {
+        match layout.metadata_store {
+            MetadataStore::Local => {
+                let conn = open_local_props(&layout.consolidator_metadata_path(dst_index))?;
+                local_get_string(&conn, key)
             }
-            DstType::DuckDb => {
-                let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-                dst_props_duck_get(
-                    &conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    key,
-                )
-            }
-            DstType::Postgres => {
-                let mut client = connect_pg(layout)?;
-                dst_props_pg_get(
-                    &mut client,
-                    layout,
-                    &layout.device_id,
-                    &layout.device_name,
-                    key,
-                )
-            }
+            MetadataStore::Destination => {
+                bootstrap_destination_metadata(layout, dst_index)?;
+                match layout.dst_type {
+                    DstType::Sqlite => {
+                        let conn =
+                            Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+                        dst_props_sqlite_get(&conn, &layout.device_id, &layout.device_name, key)
+                    }
+                    DstType::DuckDb => {
+                        let conn = DuckConnection::open(&layout.dst_connection_string)
+                            .map_err(map_duck_err)?;
+                        dst_props_duck_get(&conn, &layout.device_id, &layout.device_name, key)
+                    }
+                    DstType::Postgres => {
+                        let mut client = connect_pg(layout)?;
+                        dst_props_pg_get(
+                            &mut client,
+                            layout,
+                            &layout.device_id,
+                            &layout.device_name,
+                            key,
+                        )
+                    }
+                }
             }
         }
     })
@@ -2078,44 +2195,41 @@ pub fn upsert_consolidator_properties(
     if kvs.is_empty() {
         return Ok(());
     }
-    retry_dst(layout, "upsert_consolidator_properties", || match layout.metadata_store {
-        MetadataStore::Local => {
-            let mut conn = open_local_props(&layout.consolidator_metadata_path(dst_index))?;
-            local_upsert_many(&mut conn, kvs)
-        }
-        MetadataStore::Destination => {
-            bootstrap_destination_metadata(layout, dst_index)?;
-            match layout.dst_type {
-            DstType::Sqlite => {
-                let mut conn =
-                    Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
-                dst_props_sqlite_upsert(
-                    &mut conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    kvs,
-                )
+    retry_dst(layout, "upsert_consolidator_properties", || {
+        match layout.metadata_store {
+            MetadataStore::Local => {
+                let mut conn = open_local_props(&layout.consolidator_metadata_path(dst_index))?;
+                local_upsert_many(&mut conn, kvs)
             }
-            DstType::DuckDb => {
-                let conn =
-                    DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-                dst_props_duck_upsert(
-                    &conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    kvs,
-                )
-            }
-            DstType::Postgres => {
-                let mut client = connect_pg(layout)?;
-                dst_props_pg_upsert(
-                    &mut client,
-                    layout,
-                    &layout.device_id,
-                    &layout.device_name,
-                    kvs,
-                )
-            }
+            MetadataStore::Destination => {
+                bootstrap_destination_metadata(layout, dst_index)?;
+                match layout.dst_type {
+                    DstType::Sqlite => {
+                        let mut conn =
+                            Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+                        dst_props_sqlite_upsert(
+                            &mut conn,
+                            &layout.device_id,
+                            &layout.device_name,
+                            kvs,
+                        )
+                    }
+                    DstType::DuckDb => {
+                        let conn = DuckConnection::open(&layout.dst_connection_string)
+                            .map_err(map_duck_err)?;
+                        dst_props_duck_upsert(&conn, &layout.device_id, &layout.device_name, kvs)
+                    }
+                    DstType::Postgres => {
+                        let mut client = connect_pg(layout)?;
+                        dst_props_pg_upsert(
+                            &mut client,
+                            layout,
+                            &layout.device_id,
+                            &layout.device_name,
+                            kvs,
+                        )
+                    }
+                }
             }
         }
     })
@@ -2127,42 +2241,36 @@ pub fn delete_consolidator_property(
     dst_index: i32,
     key: &str,
 ) -> Result<()> {
-    retry_dst(layout, "delete_consolidator_property", || match layout.metadata_store {
-        MetadataStore::Local => {
-            let conn = open_local_props(&layout.consolidator_metadata_path(dst_index))?;
-            local_delete(&conn, key)
-        }
-        MetadataStore::Destination => {
-            bootstrap_destination_metadata(layout, dst_index)?;
-            match layout.dst_type {
-            DstType::Sqlite => {
-                let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
-                dst_props_sqlite_delete(
-                    &conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    key,
-                )
+    retry_dst(layout, "delete_consolidator_property", || {
+        match layout.metadata_store {
+            MetadataStore::Local => {
+                let conn = open_local_props(&layout.consolidator_metadata_path(dst_index))?;
+                local_delete(&conn, key)
             }
-            DstType::DuckDb => {
-                let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-                dst_props_duck_delete(
-                    &conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    key,
-                )
-            }
-            DstType::Postgres => {
-                let mut client = connect_pg(layout)?;
-                dst_props_pg_delete(
-                    &mut client,
-                    layout,
-                    &layout.device_id,
-                    &layout.device_name,
-                    key,
-                )
-            }
+            MetadataStore::Destination => {
+                bootstrap_destination_metadata(layout, dst_index)?;
+                match layout.dst_type {
+                    DstType::Sqlite => {
+                        let conn =
+                            Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+                        dst_props_sqlite_delete(&conn, &layout.device_id, &layout.device_name, key)
+                    }
+                    DstType::DuckDb => {
+                        let conn = DuckConnection::open(&layout.dst_connection_string)
+                            .map_err(map_duck_err)?;
+                        dst_props_duck_delete(&conn, &layout.device_id, &layout.device_name, key)
+                    }
+                    DstType::Postgres => {
+                        let mut client = connect_pg(layout)?;
+                        dst_props_pg_delete(
+                            &mut client,
+                            layout,
+                            &layout.device_id,
+                            &layout.device_name,
+                            key,
+                        )
+                    }
+                }
             }
         }
     })
@@ -2179,56 +2287,61 @@ pub fn upsert_consolidator_table_metadata(
     key: &str,
     value: &str,
 ) -> Result<()> {
-    retry_dst(layout, "upsert_consolidator_table_metadata", || match layout.metadata_store {
-        MetadataStore::Local => {
-            let mut conn = open_local_table_metadata(&layout.consolidator_metadata_path(dst_index))?;
-            local_table_meta_upsert(&mut conn, db, schema, table, key, value)
-        }
-        MetadataStore::Destination => {
-            bootstrap_destination_metadata(layout, dst_index)?;
-            match layout.dst_type {
-            DstType::Sqlite => {
+    retry_dst(
+        layout,
+        "upsert_consolidator_table_metadata",
+        || match layout.metadata_store {
+            MetadataStore::Local => {
                 let mut conn =
-                    Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
-                dst_tblmeta_sqlite_upsert(
-                    &mut conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    db,
-                    table,
-                    key,
-                    value,
-                )
+                    open_local_table_metadata(&layout.consolidator_metadata_path(dst_index))?;
+                local_table_meta_upsert(&mut conn, db, schema, table, key, value)
             }
-            DstType::DuckDb => {
-                let conn =
-                    DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-                dst_tblmeta_duck_upsert(
-                    &conn,
-                    &layout.device_id,
-                    &layout.device_name,
-                    db,
-                    table,
-                    key,
-                    value,
-                )
+            MetadataStore::Destination => {
+                bootstrap_destination_metadata(layout, dst_index)?;
+                match layout.dst_type {
+                    DstType::Sqlite => {
+                        let mut conn =
+                            Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+                        dst_tblmeta_sqlite_upsert(
+                            &mut conn,
+                            &layout.device_id,
+                            &layout.device_name,
+                            db,
+                            table,
+                            key,
+                            value,
+                        )
+                    }
+                    DstType::DuckDb => {
+                        let conn = DuckConnection::open(&layout.dst_connection_string)
+                            .map_err(map_duck_err)?;
+                        dst_tblmeta_duck_upsert(
+                            &conn,
+                            &layout.device_id,
+                            &layout.device_name,
+                            db,
+                            table,
+                            key,
+                            value,
+                        )
+                    }
+                    DstType::Postgres => {
+                        let mut client = connect_pg(layout)?;
+                        dst_tblmeta_pg_upsert(
+                            &mut client,
+                            layout,
+                            &layout.device_id,
+                            &layout.device_name,
+                            db,
+                            table,
+                            key,
+                            value,
+                        )
+                    }
+                }
             }
-            DstType::Postgres => {
-                let mut client = connect_pg(layout)?;
-                dst_tblmeta_pg_upsert(
-                    &mut client,
-                    layout,
-                    &layout.device_id,
-                    &layout.device_name,
-                    db,
-                    table,
-                    key,
-                    value,
-                )
-            }
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Reads a per-table metadata value (LOCAL or DESTINATION mode).
@@ -2239,35 +2352,33 @@ pub fn get_consolidator_table_metadata(
     table: &str,
     key: &str,
 ) -> Result<Option<String>> {
-    retry_dst(layout, "get_consolidator_table_metadata", || match layout.metadata_store {
-        MetadataStore::Local => {
-            let conn = open_local_table_metadata(&layout.consolidator_metadata_path(dst_index))?;
-            local_table_meta_get(&conn, db, table, key)
-        }
-        MetadataStore::Destination => {
-            bootstrap_destination_metadata(layout, dst_index)?;
-            match layout.dst_type {
-            DstType::Sqlite => {
-                let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
-                conn.query_row(
-                    "SELECT prop_value FROM synclite_consolidator_table_metadata \
+    retry_dst(layout, "get_consolidator_table_metadata", || {
+        match layout.metadata_store {
+            MetadataStore::Local => {
+                let conn =
+                    open_local_table_metadata(&layout.consolidator_metadata_path(dst_index))?;
+                local_table_meta_get(&conn, db, table, key)
+            }
+            MetadataStore::Destination => {
+                bootstrap_destination_metadata(layout, dst_index)?;
+                match layout.dst_type {
+                    DstType::Sqlite => {
+                        let conn =
+                            Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+                        conn.query_row(
+                            "SELECT prop_value FROM synclite_consolidator_table_metadata \
                      WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 \
                        AND database_name = ?3 AND table_name = ?4 AND prop_key = ?5",
-                    params![
-                        &layout.device_id,
-                        &layout.device_name,
-                        db,
-                        table,
-                        key
-                    ],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(map_sql_err)
-            }
-            DstType::DuckDb => {
-                let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-                let res: duckdb::Result<String> = conn.query_row(
+                            params![&layout.device_id, &layout.device_name, db, table, key],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(map_sql_err)
+                    }
+                    DstType::DuckDb => {
+                        let conn = DuckConnection::open(&layout.dst_connection_string)
+                            .map_err(map_duck_err)?;
+                        let res: duckdb::Result<String> = conn.query_row(
                     "SELECT prop_value FROM synclite_consolidator_table_metadata \
                      WHERE synclite_device_id = ? AND synclite_device_name = ? AND database_name = ? AND table_name = ? AND prop_key = ?",
                     duck_params_from_iter([
@@ -2279,28 +2390,29 @@ pub fn get_consolidator_table_metadata(
                     ].iter()),
                     |r| r.get::<_, String>(0),
                 );
-                match res {
-                    Ok(v) => Ok(Some(v)),
-                    Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(e) => Err(map_duck_err(e)),
-                }
-            }
-            DstType::Postgres => {
-                let mut client = connect_pg(layout)?;
-                let meta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
-                let select_sql = format!(
-                    "SELECT prop_value FROM {meta} \
+                        match res {
+                            Ok(v) => Ok(Some(v)),
+                            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+                            Err(e) => Err(map_duck_err(e)),
+                        }
+                    }
+                    DstType::Postgres => {
+                        let mut client = connect_pg(layout)?;
+                        let meta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
+                        let select_sql = format!(
+                            "SELECT prop_value FROM {meta} \
                      WHERE synclite_device_id = $1 AND synclite_device_name = $2 \
                        AND database_name = $3 AND table_name = $4 AND prop_key = $5"
-                );
-                let rows = client
-                    .query(
-                        select_sql.as_str(),
-                        &[&layout.device_id, &layout.device_name, &db, &table, &key],
-                    )
-                    .map_err(|e| map_pg_err_with_sql(e, &select_sql))?;
-                Ok(rows.into_iter().next().and_then(|r| r.get(0)))
-            }
+                        );
+                        let rows = client
+                            .query(
+                                select_sql.as_str(),
+                                &[&layout.device_id, &layout.device_name, &db, &table, &key],
+                            )
+                            .map_err(|e| map_pg_err_with_sql(e, &select_sql))?;
+                        Ok(rows.into_iter().next().and_then(|r| r.get(0)))
+                    }
+                }
             }
         }
     })
@@ -2316,9 +2428,8 @@ pub fn mark_initialization_complete(
     dst_index: i32,
     snapshot_name: &str,
 ) -> Result<()> {
-    let new_count = get_consolidator_property_long(layout, dst_index, "initialization_count")?
-        .unwrap_or(0)
-        + 1;
+    let new_count =
+        get_consolidator_property_long(layout, dst_index, "initialization_count")?.unwrap_or(0) + 1;
     let kvs: Vec<(&str, String)> = vec![
         ("initialized_snapshot_name", snapshot_name.to_string()),
         ("initialization_status", "1".to_string()),
@@ -2485,7 +2596,9 @@ pub fn record_initial_table_schemas(
             )
             .map_err(map_sql_err)?;
         let rows: Vec<(String, Option<String>)> = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
             .map_err(map_sql_err)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_sql_err)?;
@@ -2633,7 +2746,8 @@ pub fn get_initialized_tables(
             }
             MetadataStore::Destination => match layout.dst_type {
                 DstType::Sqlite => {
-                    let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+                    let conn =
+                        Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
                     conn.execute_batch(CREATE_DST_TABLE_METADATA_TBL_SQL)
                         .map_err(map_sql_err)?;
                     let mut stmt = conn
@@ -2654,8 +2768,10 @@ pub fn get_initialized_tables(
                     }
                 }
                 DstType::DuckDb => {
-                    let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-                    conn.execute(CREATE_DST_TABLE_METADATA_TBL_SQL, []).map_err(map_duck_err)?;
+                    let conn = DuckConnection::open(&layout.dst_connection_string)
+                        .map_err(map_duck_err)?;
+                    conn.execute(CREATE_DST_TABLE_METADATA_TBL_SQL, [])
+                        .map_err(map_duck_err)?;
                     let mut stmt = conn
                         .prepare(
                             "SELECT table_name, prop_value FROM synclite_consolidator_table_metadata \
@@ -2689,7 +2805,10 @@ pub fn get_initialized_tables(
                          WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = 'initial_rows'"
                     );
                     let rows = client
-                        .query(select_sql.as_str(), &[&layout.device_id, &layout.device_name])
+                        .query(
+                            select_sql.as_str(),
+                            &[&layout.device_id, &layout.device_name],
+                        )
                         .map_err(|e| map_pg_err_with_sql(e, &select_sql))?;
                     for r in rows {
                         let t: String = r.get(0);
@@ -2794,7 +2913,8 @@ pub fn reset_local_schemas(layout: &ConsolidatorLayout, dst_index: i32) -> Resul
     }
     retry_dst(layout, "reset_local_schemas", || {
         let conn = Connection::open(&path).map_err(map_sql_err)?;
-        conn.execute("DELETE FROM schema", []).map_err(map_sql_err)?;
+        conn.execute("DELETE FROM schema", [])
+            .map_err(map_sql_err)?;
         Ok(())
     })
 }
@@ -2810,7 +2930,8 @@ pub fn reset_local_table_metadata(layout: &ConsolidatorLayout, dst_index: i32) -
     }
     retry_dst(layout, "reset_local_table_metadata", || {
         let conn = Connection::open(&path).map_err(map_sql_err)?;
-        conn.execute("DELETE FROM table_metadata", []).map_err(map_sql_err)?;
+        conn.execute("DELETE FROM table_metadata", [])
+            .map_err(map_sql_err)?;
         Ok(())
     })
 }
@@ -2863,41 +2984,48 @@ pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, _dst_index: i32) ->
     if layout.metadata_store != MetadataStore::Destination {
         return Ok(());
     }
-    retry_dst(layout, "reset_dst_table_metadata", || match layout.dst_type {
-        DstType::Sqlite => {
-            let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
-            conn.execute_batch(CREATE_DST_TABLE_METADATA_TBL_SQL).map_err(map_sql_err)?;
-            conn.execute(
+    retry_dst(layout, "reset_dst_table_metadata", || {
+        match layout.dst_type {
+            DstType::Sqlite => {
+                let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+                conn.execute_batch(CREATE_DST_TABLE_METADATA_TBL_SQL)
+                    .map_err(map_sql_err)?;
+                conn.execute(
                 "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = ?1 AND synclite_device_name = ?2",
                 params![layout.device_id, layout.device_name],
             )
             .map_err(map_sql_err)?;
-            Ok(())
-        }
-        DstType::DuckDb => {
-            let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
-            conn.execute(CREATE_DST_TABLE_METADATA_TBL_SQL, []).map_err(map_duck_err)?;
-            let p: Vec<DuckValue> = vec![
-                DuckValue::Text(layout.device_id.clone()),
-                DuckValue::Text(layout.device_name.clone()),
-            ];
-            conn.execute(
+                Ok(())
+            }
+            DstType::DuckDb => {
+                let conn =
+                    DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
+                conn.execute(CREATE_DST_TABLE_METADATA_TBL_SQL, [])
+                    .map_err(map_duck_err)?;
+                let p: Vec<DuckValue> = vec![
+                    DuckValue::Text(layout.device_id.clone()),
+                    DuckValue::Text(layout.device_name.clone()),
+                ];
+                conn.execute(
                 "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = ? AND synclite_device_name = ?",
                 duck_params_from_iter(p.iter()),
             )
             .map_err(map_duck_err)?;
-            Ok(())
-        }
-        DstType::Postgres => {
-            let mut client = connect_pg(layout)?;
-            client.batch_execute(CREATE_DST_TABLE_METADATA_TBL_SQL).map_err(map_pg_err)?;
-            client
+                Ok(())
+            }
+            DstType::Postgres => {
+                let mut client = connect_pg(layout)?;
+                client
+                    .batch_execute(CREATE_DST_TABLE_METADATA_TBL_SQL)
+                    .map_err(map_pg_err)?;
+                client
                 .execute(
                     "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = $1 AND synclite_device_name = $2",
                     &[&layout.device_id, &layout.device_name],
                 )
                 .map_err(map_pg_err)?;
-            Ok(())
+                Ok(())
+            }
         }
     })
 }
@@ -2926,6 +3054,3 @@ pub fn delete_local_schema_for_table(
         Ok(())
     })
 }
-
-
-

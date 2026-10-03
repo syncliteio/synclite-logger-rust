@@ -3,8 +3,8 @@ use std::path::Path;
 use logger_core::{Backend, DeviceType, Error, Result};
 use logger_db_traits::{Row, Value};
 
-use crate::{default_config_for_backend, derive_device_name, SyncLiteOptions, Logger};
 use crate::sql_split::split_sqls;
+use crate::{default_config_for_backend, derive_device_name, Logger, SyncLiteOptions};
 
 const DEFAULT_BATCH_CAPACITY: usize = 4096;
 
@@ -203,7 +203,6 @@ impl Connection {
         }
         self.runtime.close()
     }
-
 }
 
 impl<'a> Statement<'a> {
@@ -233,15 +232,13 @@ impl<'a> Statement<'a> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
-        let out = self.conn.runtime.execute_prepared_batch(&self.sql, &batch)?;
+        let out = self
+            .conn
+            .runtime
+            .execute_prepared_batch(&self.sql, &batch)?;
         if self.conn.user_auto_commit {
             self.conn.runtime.commit()?;
         }
         Ok(out)
     }
 }
-
-
-
-
-

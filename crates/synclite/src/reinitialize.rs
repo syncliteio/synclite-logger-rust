@@ -235,8 +235,12 @@ fn remove_dir_all_if_exists(dir: &Path) -> Result<()> {
 }
 
 fn clean_destination_metadata(snap: &Snapshot) -> Result<()> {
-    let Some(dst_type) = snap.dst_type.as_deref() else { return Ok(()); };
-    let Some(conn_str) = snap.dst_conn_str.as_deref() else { return Ok(()); };
+    let Some(dst_type) = snap.dst_type.as_deref() else {
+        return Ok(());
+    };
+    let Some(conn_str) = snap.dst_conn_str.as_deref() else {
+        return Ok(());
+    };
     match dst_type {
         "SQLITE" => clean_sqlite(conn_str, snap),
         "DUCKDB" => clean_duckdb(conn_str, snap),
@@ -307,15 +311,12 @@ fn table_exists_sqlite(conn: &SqlConn, table: &str) -> bool {
     .is_ok()
 }
 
-fn delete_by_device_sqlite(
-    conn: &SqlConn,
-    table: &str,
-    snap: &Snapshot,
-) -> Result<()> {
+fn delete_by_device_sqlite(conn: &SqlConn, table: &str, snap: &Snapshot) -> Result<()> {
     if !table_exists_sqlite(conn, table) {
         return Ok(());
     }
-    let sql = format!("DELETE FROM {table} WHERE synclite_device_id=?1 AND synclite_device_name=?2");
+    let sql =
+        format!("DELETE FROM {table} WHERE synclite_device_id=?1 AND synclite_device_name=?2");
     conn.execute(&sql, [&snap.uuid, &snap.device_name])
         .map_err(|e| Error::Config(format!("reinitialize: delete from {table}: {e}")))?;
     Ok(())
@@ -329,7 +330,11 @@ fn delete_by_device_sqlite_md(conn: &SqlConn, snap: &Snapshot) -> Result<()> {
         "DELETE FROM synclite_checkpoint WHERE synclite_device_id=?1 AND synclite_device_name=?2",
         [&snap.uuid, &snap.device_name],
     )
-    .map_err(|e| Error::Config(format!("reinitialize: delete from synclite_checkpoint: {e}")))?;
+    .map_err(|e| {
+        Error::Config(format!(
+            "reinitialize: delete from synclite_checkpoint: {e}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -386,14 +391,11 @@ fn table_exists_duck(conn: &DuckConn, table: &str) -> bool {
         "SELECT 1 FROM information_schema.tables WHERE table_name = '{}' LIMIT 1",
         table.replace('\'', "''")
     );
-    conn.query_row(&sql, [], |_| Ok::<(), duckdb::Error>(())).is_ok()
+    conn.query_row(&sql, [], |_| Ok::<(), duckdb::Error>(()))
+        .is_ok()
 }
 
-fn delete_by_device_duck(
-    conn: &DuckConn,
-    table: &str,
-    snap: &Snapshot,
-) -> Result<()> {
+fn delete_by_device_duck(conn: &DuckConn, table: &str, snap: &Snapshot) -> Result<()> {
     if !table_exists_duck(conn, table) {
         return Ok(());
     }
@@ -411,7 +413,11 @@ fn delete_by_device_duck_md(conn: &DuckConn, snap: &Snapshot) -> Result<()> {
         "DELETE FROM synclite_checkpoint WHERE synclite_device_id=? AND synclite_device_name=?",
         [&snap.uuid, &snap.device_name],
     )
-    .map_err(|e| Error::Config(format!("reinitialize: delete from synclite_checkpoint: {e}")))?;
+    .map_err(|e| {
+        Error::Config(format!(
+            "reinitialize: delete from synclite_checkpoint: {e}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -424,7 +430,8 @@ fn clean_postgres(conn_str: &str, snap: &Snapshot) -> Result<()> {
         snap.dst_index,
         "reinit_clean_postgres",
         || {
-            let translated = crate::translate_postgres_connection_string(conn_str).unwrap_or(conn_str);
+            let translated =
+                crate::translate_postgres_connection_string(conn_str).unwrap_or(conn_str);
             let mut client = PgClient::connect(translated.trim(), NoTls)
                 .map_err(|e| Error::Config(format!("reinitialize: connect postgres: {e}")))?;
             let schema = snap.dst_schema.as_deref().unwrap_or("public");
@@ -510,7 +517,11 @@ fn pg_delete_by_device_md(client: &mut PgClient, schema: &str, snap: &Snapshot) 
     );
     client
         .execute(sql.as_str(), &[&snap.uuid, &snap.device_name])
-        .map_err(|e| Error::Config(format!("reinitialize: delete from synclite_checkpoint: {e}")))?;
+        .map_err(|e| {
+            Error::Config(format!(
+                "reinitialize: delete from synclite_checkpoint: {e}"
+            ))
+        })?;
     Ok(())
 }
 

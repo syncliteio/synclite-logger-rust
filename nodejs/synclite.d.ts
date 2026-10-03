@@ -13,14 +13,27 @@ export interface InitializeOptions {
   device_name: string;
   db_path: string;
   destination?: DestinationOptions;
+  destinations?: never;
+  config_path?: string;
+}
+
+export interface MultiDestinationInitializeOptions {
+  device_type: string;
+  device_name: string;
+  db_path: string;
+  destinations: DestinationOptions[];
+  destination?: never;
   config_path?: string;
 }
 
 /**
- * Register a device + destination ahead of any `open(...)` call. Accepts an
- * options object (preferred) or a pre-serialized JSON string.
+ * Register a device with zero, one, or multiple destinations ahead of any
+ * `open(...)` call. Accepts an options object (preferred) or a pre-serialized
+ * JSON string.
  */
-export declare function initialize(options: InitializeOptions | string): void;
+export declare function initialize(
+  options: InitializeOptions | MultiDestinationInitializeOptions | string,
+): void;
 
 /** Block until the embedded shipper and consolidator apply pending commits. */
 export declare function awaitSync(dbPath: string, timeoutSeconds: number): void;

@@ -173,12 +173,11 @@ pub fn make_callback(
 }
 
 fn parse_seq(name: &str) -> Option<u64> {
-    name.strip_suffix(".sqllog").and_then(|n| n.parse::<u64>().ok())
+    name.strip_suffix(".sqllog")
+        .and_then(|n| n.parse::<u64>().ok())
 }
 
 fn is_txn_file_for_seq(seq: u64, name: &str) -> bool {
     let prefix = format!("{seq}.sqllog.");
     name.starts_with(&prefix) && name.ends_with(".txn")
 }
-
-

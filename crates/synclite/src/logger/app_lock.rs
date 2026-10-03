@@ -17,12 +17,15 @@ pub struct AppLock {
 impl AppLock {
     /// Acquire the native lock file `<db_path>.synclite/<db_name>.lock`.
     pub fn try_lock(db_path: &Path) -> Result<Self> {
-        let db_name = db_path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-            Error::Config(format!(
-                "cannot derive database file name for lock: {}",
-                db_path.display()
-            ))
-        })?;
+        let db_name = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "cannot derive database file name for lock: {}",
+                    db_path.display()
+                ))
+            })?;
 
         let lock_dir: PathBuf = format!("{}{}", db_path.display(), DEVICE_HOME_SUFFIX).into();
         std::fs::create_dir_all(&lock_dir)?;
@@ -49,5 +52,3 @@ impl Drop for AppLock {
         let _ = FileExt::unlock(&self.file);
     }
 }
-
-

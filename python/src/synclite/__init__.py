@@ -2,7 +2,8 @@
 
 Mirrors the Rust user-facing API: `Connection` / `Statement` for the
 SQLite-family devices, `DuckDBConnection` / `DuckDBStatement` for the
-DuckDB-family devices, plus module-level `initialize` and `await_sync`.
+DuckDB-family devices, plus module-level `initialize`,
+and `await_sync`.
 """
 
 from pathlib import Path

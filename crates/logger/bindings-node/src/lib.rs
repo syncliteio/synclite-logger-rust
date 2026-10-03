@@ -128,11 +128,45 @@ fn parse_dst_sync_mode(s: &str) -> Result<DstSyncMode> {
     }
 }
 
-/// Register a device + destination ahead of any `open(...)` call. Accepts a
+fn parse_destination(
+    dest: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<RustDestinationOptions> {
+    let dst_type = dest
+        .get("dst_type")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| napi_error(format!("{context} requires \"dst_type\"")))?;
+    let dst_connection_string = dest
+        .get("dst_connection_string")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| napi_error(format!("{context} requires \"dst_connection_string\"")))?;
+    let dst_sync_mode = dest
+        .get("dst_sync_mode")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("CONSOLIDATION");
+    Ok(RustDestinationOptions {
+        dst_type: parse_dst_type(dst_type)?,
+        dst_connection_string: dst_connection_string.to_string(),
+        dst_database: dest
+            .get("dst_database")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
+        dst_schema: dest
+            .get("dst_schema")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
+        dst_sync_mode: parse_dst_sync_mode(dst_sync_mode)?,
+    })
+}
+
+/// Register a device with zero, one, or multiple destinations ahead of any
+/// `open(...)` call. Accepts a
 /// JSON string mirroring the Python `initialize(...)` keyword arguments:
 /// `{ "device_type", "device_name", "db_path", "destination": { "dst_type",
 /// "dst_connection_string", "dst_database", "dst_schema", "dst_sync_mode" },
-/// "config_path" }`. `destination` and `config_path` are optional.
+/// "destinations": [{ ... }], "config_path" }`. `destination`, `destinations`,
+/// and `config_path` are optional; the two destination forms are mutually
+/// exclusive.
 #[napi]
 pub fn initialize(config_json: String) -> Result<()> {
     let parsed: JsonValue = serde_json::from_str(&config_json)
@@ -156,43 +190,49 @@ pub fn initialize(config_json: String) -> Result<()> {
 
     let destination = match config.get("destination") {
         None | Some(JsonValue::Null) => None,
-        Some(JsonValue::Object(dest)) => {
-            let dst_type = dest
-                .get("dst_type")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| napi_error("destination requires \"dst_type\""))?;
-            let dst_connection_string = dest
-                .get("dst_connection_string")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| napi_error("destination requires \"dst_connection_string\""))?;
-            let dst_sync_mode = dest
-                .get("dst_sync_mode")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("CONSOLIDATION");
-            Some(RustDestinationOptions {
-                dst_type: parse_dst_type(dst_type)?,
-                dst_connection_string: dst_connection_string.to_string(),
-                dst_database: dest
-                    .get("dst_database")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
-                dst_schema: dest
-                    .get("dst_schema")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
-                dst_sync_mode: parse_dst_sync_mode(dst_sync_mode)?,
-            })
-        }
+        Some(JsonValue::Object(dest)) => Some(parse_destination(dest, "destination")?),
         Some(_) => return Err(napi_error("\"destination\" must be a JSON object")),
     };
+
+    let destinations = match config.get("destinations") {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::Array(destinations)) => {
+            if destinations.is_empty() {
+                return Err(napi_error(
+                    "\"destinations\" must contain at least one destination",
+                ));
+            }
+            let mut parsed = Vec::with_capacity(destinations.len());
+            for (index, destination) in destinations.iter().enumerate() {
+                let context = format!("destinations[{index}]");
+                let JsonValue::Object(destination) = destination else {
+                    return Err(napi_error(format!("{context} must be a JSON object")));
+                };
+                parsed.push(parse_destination(destination, &context)?);
+            }
+            Some(parsed)
+        }
+        Some(_) => return Err(napi_error("\"destinations\" must be an array")),
+    };
+
+    if destination.is_some() && destinations.is_some() {
+        return Err(napi_error(
+            "initialize accepts either \"destination\" or \"destinations\", not both",
+        ));
+    }
 
     let opts = SyncLiteOptions {
         config_path: get_str("config_path").map(std::path::PathBuf::from),
         ..SyncLiteOptions::default()
     };
 
-    synclite::initialize(device, &device_name, &db_path, destination, opts)
-        .map_err(|e| napi_error(e.to_string()))
+    match destinations {
+        Some(destinations) => {
+            synclite::initialize(device, &device_name, &db_path, destinations, opts)
+        }
+        None => synclite::initialize(device, &device_name, &db_path, destination, opts),
+    }
+    .map_err(|e| napi_error(e.to_string()))
 }
 
 macro_rules! connection_api {

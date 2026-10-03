@@ -94,4 +94,3 @@ pub(crate) fn split_sqls(sql: &str) -> Vec<String> {
     }
     out
 }
-

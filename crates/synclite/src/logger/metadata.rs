@@ -17,8 +17,8 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection};
 use logger_core::{Error, Result};
+use rusqlite::{params, Connection};
 
 /// Key under which the on-disk metadata schema version is stored.
 pub const SYNCLITE_METADATA_VERSION_KEY: &str = "synclite_metadata_version";
@@ -47,7 +47,10 @@ impl Metadata {
         .map_err(map_err)?;
         conn.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES(?1, ?2)",
-            params![SYNCLITE_METADATA_VERSION_KEY, SYNCLITE_METADATA_VERSION.to_string()],
+            params![
+                SYNCLITE_METADATA_VERSION_KEY,
+                SYNCLITE_METADATA_VERSION.to_string()
+            ],
         )
         .map_err(map_err)?;
         Ok(Self { conn })
@@ -93,5 +96,3 @@ impl Metadata {
 fn map_err(e: rusqlite::Error) -> Error {
     Error::Config(format!("metadata: {e}"))
 }
-
-
