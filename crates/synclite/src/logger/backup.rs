@@ -16,9 +16,9 @@
 use std::path::Path;
 
 use duckdb::Connection as DuckConnection;
-use rusqlite::{params_from_iter, types::Value as SqlValue, Connection as SqlConn};
 use logger_config::SyncLiteConfig;
 use logger_core::{Backend, Error, Result};
+use rusqlite::{params_from_iter, types::Value as SqlValue, Connection as SqlConn};
 
 use crate::layout::{ArchiveLayout, DeviceLayout};
 use crate::metadata::Metadata;
@@ -143,9 +143,7 @@ fn take_backup(src: &Path, dst: &Path, dst_type: Backend, cfg: &SyncLiteConfig) 
     if !copied_any_tables {
         materialize_empty_sqlite_backup(&dst_conn)?;
     } else if cfg.vacuum_data_backup.unwrap_or(true) {
-        dst_conn
-            .execute_batch("VACUUM;")
-            .map_err(map_sql_err)?;
+        dst_conn.execute_batch("VACUUM;").map_err(map_sql_err)?;
     }
     Ok(())
 }
@@ -185,7 +183,11 @@ fn build_create_table(table: &str, cols: &[ColumnInfo]) -> String {
         let piece = format!("{} {} {} {} {}", c.name, c.ty, nn, dflt, pk);
         parts.push(piece.split_whitespace().collect::<Vec<_>>().join(" "));
     }
-    format!("CREATE TABLE IF NOT EXISTS {} ({})", table, parts.join(", "))
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({})",
+        table,
+        parts.join(", ")
+    )
 }
 
 // ----- SQLite source --------------------------------------------------------
@@ -387,7 +389,3 @@ fn map_sql_err(e: rusqlite::Error) -> Error {
 fn map_duck_err(e: duckdb::Error) -> Error {
     Error::Config(format!("backup: {e}"))
 }
-
-
-
-

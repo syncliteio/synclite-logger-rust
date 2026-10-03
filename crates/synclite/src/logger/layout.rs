@@ -75,12 +75,7 @@ pub struct ArchiveLayout {
 
 impl ArchiveLayout {
     /// Compute archive paths.
-    pub fn new(
-        stage_dir: &Path,
-        device_name: &str,
-        uuid: &str,
-        db_file_name: &str,
-    ) -> Self {
+    pub fn new(stage_dir: &Path, device_name: &str, uuid: &str, db_file_name: &str) -> Self {
         let archive_name = if device_name.is_empty() {
             format!("{ARCHIVE_NAME_PREFIX}{uuid}")
         } else {
@@ -97,4 +92,3 @@ impl ArchiveLayout {
         }
     }
 }
-

@@ -111,6 +111,8 @@ impl Drop for IdleSegmentSwitcher {
     db_path,
     destination = None,
     config_path = None,
+    *,
+    destinations = None,
 ))]
 fn initialize(
     device_type: &str,
@@ -118,14 +120,29 @@ fn initialize(
     db_path: &str,
     destination: Option<PyRef<'_, PyDestinationOptions>>,
     config_path: Option<&str>,
+    destinations: Option<Vec<PyRef<'_, PyDestinationOptions>>>,
 ) -> PyResult<()> {
     let dt = parse_device_type(device_type)?;
-    let dest = destination.map(|d| d.to_rust());
     let opts = SyncLiteOptions {
         config_path: config_path.map(PathBuf::from),
         ..SyncLiteOptions::default()
     };
-    synclite::initialize(dt, device_name, db_path, dest, opts).map_err(map_err)
+    match (destination, destinations) {
+        (Some(_), Some(_)) => Err(PyValueError::new_err(
+            "initialize accepts either destination or destinations, not both",
+        )),
+        (destination, None) => {
+            let destination = destination.map(|value| value.to_rust()).transpose()?;
+            synclite::initialize(dt, device_name, db_path, destination, opts).map_err(map_err)
+        }
+        (None, Some(destinations)) => {
+            let destinations = destinations
+                .into_iter()
+                .map(|value| value.to_rust())
+                .collect::<PyResult<Vec<_>>>()?;
+            synclite::initialize(dt, device_name, db_path, destinations, opts).map_err(map_err)
+        }
+    }
 }
 
 /// `synclite::await_sync` — block until the embedded shipper +
@@ -195,15 +212,14 @@ impl PyDestinationOptions {
 }
 
 impl PyDestinationOptions {
-    fn to_rust(&self) -> RustDestinationOptions {
-        RustDestinationOptions {
-            dst_type: parse_dst_type(&self.dst_type).unwrap_or(DstType::Sqlite),
+    fn to_rust(&self) -> PyResult<RustDestinationOptions> {
+        Ok(RustDestinationOptions {
+            dst_type: parse_dst_type(&self.dst_type)?,
             dst_connection_string: self.dst_connection_string.clone(),
             dst_database: self.dst_database.clone(),
             dst_schema: self.dst_schema.clone(),
-            dst_sync_mode: parse_dst_sync_mode(&self.dst_sync_mode)
-                .unwrap_or(DstSyncMode::Consolidation),
-        }
+            dst_sync_mode: parse_dst_sync_mode(&self.dst_sync_mode)?,
+        })
     }
 }
 

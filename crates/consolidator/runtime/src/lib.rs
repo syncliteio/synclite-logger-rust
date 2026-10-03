@@ -13,8 +13,8 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -114,12 +114,61 @@ fn acquire_schema_replica(layout: &ConsolidatorLayout) -> Result<SchemaReplicaGu
 // key (see `DeviceLogCleaner.LAST_CLEANED_KEY`). Must match Java exactly.
 const LAST_CLEANED_SEGMENT_KEY: &str = "last_cleaned_log_segment_seq_num";
 const LAST_STAGE_CLEANED_SEGMENT_KEY: &str = "last_stage_cleaned_log_segment_sequence_number";
+const CLEANUP_AUTHORIZED_SEGMENT_KEY: &str = "runtime_cleanup_authorized_segment_sequence_number";
 const DEVICE_PROCESSING_LOCK_FILE_NAME: &str = "synclite_device_processing.lock";
 // Java parity: `SyncLiteDeviceInfo.getMetadataFileName()`. Per-device
 // consolidator metadata DB, sibling of `state_db_path` inside
 // `device_work_dir`. Holds device-scoped (not destination-scoped) state
 // such as the DeviceLogCleaner watermark.
 const DEVICE_METADATA_FILE_NAME: &str = "synclite_device_metadata.db";
+
+// Cleanup is a local observation of successful ordered replay, not a query to
+// other destinations. Never hold this registry lock across destination or file
+// I/O. Missing/restarted workers have no progress until they replay/recover a
+// segment; forgetting progress only retains files, never authorizes deletion.
+type CleanupGroup = (PathBuf, String, String);
+type CleanupPeers = HashMap<i32, Vec<Weak<AtomicI64>>>;
+static CLEANUP_PROGRESS: OnceLock<Mutex<HashMap<CleanupGroup, CleanupPeers>>> = OnceLock::new();
+
+struct CleanupProgress {
+    group: CleanupGroup,
+    applied: Arc<AtomicI64>,
+}
+
+impl CleanupProgress {
+    fn register(layout: &ConsolidatorLayout) -> Self {
+        let group = (
+            layout.device_data_root.clone(),
+            layout.device_id.clone(),
+            layout.device_name.clone(),
+        );
+        let applied = Arc::new(AtomicI64::new(-1));
+        let registry = CLEANUP_PROGRESS.get_or_init(|| Mutex::new(HashMap::new()));
+        // A poisoned registry is fail-closed: no registered progress, no cleanup.
+        if let Ok(mut registry) = registry.lock() {
+            registry.retain(|_, peers| {
+                peers.retain(|_, workers| {
+                    workers.retain(|worker| worker.strong_count() > 0);
+                    !workers.is_empty()
+                });
+                !peers.is_empty()
+            });
+            registry.entry(group.clone()).or_default()
+                .entry(layout.dst_index).or_default().push(Arc::downgrade(&applied));
+        }
+        Self { group, applied }
+    }
+
+    fn record(&self, layout: &ConsolidatorLayout, path: &Path) {
+        if layout.destination_apply_enabled {
+            if let Some(seq) = parse_segment_seq(path).and_then(|seq| i64::try_from(seq).ok()) {
+                // Do not use max(): revisiting an older segment may conservatively
+                // lower the watermark, but must never hide a replay gap.
+                self.applied.store(seq, Ordering::SeqCst);
+            }
+        }
+    }
+}
 
 struct DeviceProcessingLock {
     // Holds a SQLite connection with an open `BEGIN IMMEDIATE` transaction.
@@ -1795,7 +1844,7 @@ impl Consolidator {
         let mut staged_paths = Vec::new();
         collect_stage_files_recursive(stage_dir, &mut staged_paths);
 
-        staged_paths.sort();
+        sort_stage_paths(&mut staged_paths);
         for path in staged_paths {
             if is_sqllog_txn_sidecar_path(&path) {
                 continue;
@@ -1815,14 +1864,11 @@ impl Consolidator {
         Ok(())
     }
 
-    fn shutdown(&self) {
-        // Signal the worker to abandon any pending destination I/O and
-        // exit. Offline-first: shutdown (hence initialize / close) must
-        // never block on an unreachable destination, so we only wait a
-        // short grace for a clean stop and then detach the worker. The
-        // detached worker exits on its own once its current blocking
-        // operation returns and observes the stop flag.
-        self.stopping.store(true, Ordering::SeqCst);
+    /// Explicitly stop this worker. Queued notifications are allowed to drain
+    /// in FIFO order for a short grace period. If destination I/O is blocked,
+    /// the stop flag is then raised and the joiner is detached so shutdown
+    /// never waits indefinitely on an unreachable destination.
+    pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
         let handle = match self.join.lock() {
             Ok(mut join) => join.take(),
@@ -1831,6 +1877,7 @@ impl Consolidator {
         let Some(handle) = handle else {
             return;
         };
+        let stopping = Arc::clone(&self.stopping);
         let (done_tx, done_rx) = mpsc::channel();
         let joiner = thread::Builder::new()
             .name("synclite-consolidator-join".into())
@@ -1846,6 +1893,8 @@ impl Consolidator {
                 // in a connect), detach so the caller is never stalled.
                 if done_rx.recv_timeout(Duration::from_secs(2)).is_ok() {
                     let _ = joiner.join();
+                } else {
+                    stopping.store(true, Ordering::SeqCst);
                 }
                 // On timeout: intentionally drop `joiner` (and thus the
                 // worker handle it owns) without joining — both threads
@@ -1884,6 +1933,14 @@ fn collect_stage_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+fn sort_stage_paths(paths: &mut Vec<PathBuf>) {
+    paths.retain(|path| is_apply_candidate_segment(path));
+    paths.sort_by(|a, b| {
+        parse_segment_seq(a).cmp(&parse_segment_seq(b)).then_with(|| a.cmp(b))
+    });
+    paths.dedup();
 }
 
 /// Locate a paired `<dbName>.synclite.backup` + `<dbName>.synclite.metadata`
@@ -1939,6 +1996,7 @@ fn migrate_legacy_state_db(layout: &ConsolidatorLayout) -> Result<()> {
 }
 
 fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Arc<AtomicBool>) {
+    let cleanup_progress = CleanupProgress::register(&layout);
     // Java parity: open per-device trace file under the consolidator's per-device
     // work directory (`<workDir>/synclite-<device>-<id>/synclite_device.trace`).
     // Default level is INFO matching Java `ConfLoader.getTraceLevel`. Tracing
@@ -2038,45 +2096,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
         return;
     }
     let mut pending_stage_paths: Vec<PathBuf> = Vec::new();
-    // Pause-buffer: while the pause sentinel exists we queue staged
-    // segments here instead of applying them. On resume we drain in
-    // arrival order through the normal apply path.
-    let mut paused_stage_paths: Vec<PathBuf> = Vec::new();
     let poll_interval = std::time::Duration::from_millis(layout.device_polling_interval_ms.max(1));
-
-    let drain_pending_stage_paths = |state_conn: &Connection,
-                                     stats_conn: &Connection,
-                                     consolidator_stats_conn: &Connection| {
-        if let Some(stage_dir) = layout.stage_dir.as_deref() {
-            if !stage_dir.is_dir() {
-                return;
-            }
-            let mut staged: Vec<PathBuf> = Vec::new();
-            collect_stage_files_recursive(stage_dir, &mut staged);
-            staged.sort();
-            for path in staged {
-                if is_sqllog_txn_sidecar_path(&path) {
-                    continue;
-                }
-                if !is_apply_candidate_segment(&path) {
-                    continue;
-                }
-                if let Err(e) = process_stage_path_ready(
-                    &layout,
-                    state_conn,
-                    stats_conn,
-                    consolidator_stats_conn,
-                    &path,
-                ) {
-                    tracing::error!(
-                        error = %e,
-                        path = %path.display(),
-                        "shutdown: failed to apply pending stage path"
-                    );
-                }
-            }
-        }
-    };
 
     loop {
         let mut msg: Option<Msg> = match rx.recv_timeout(poll_interval) {
@@ -2091,27 +2111,23 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
         // This keeps close()/initialize from racing past the replay step while
         // still avoiding a long block on an unreachable destination.
         if stopping.load(Ordering::SeqCst) || matches!(msg, Some(Msg::Shutdown)) {
-            drain_pending_stage_paths(&state_conn, &stats_conn, &consolidator_stats_conn);
+            if let Some(Msg::StagePathReady(path)) = msg {
+                // In a push-only layout this hint may be the only way to
+                // locate an unmirrored stage backlog during the final drain.
+                pending_stage_paths.push(path);
+            }
+            if bootstrap_initialized && !is_paused(&layout) {
+                if let Err(e) = flush_pending_stage_paths(
+                    &layout, &state_conn, &stats_conn, &consolidator_stats_conn,
+                    &cleanup_progress, &mut pending_stage_paths,
+                ) {
+                    tracing::error!(error = %e, "shutdown: failed to apply pending stage path");
+                }
+            }
             break;
         }
 
         let paused = is_paused(&layout);
-        if !paused && !paused_stage_paths.is_empty() && bootstrap_initialized {
-            // Resume: drain queued segments in order before processing
-            // the freshly received message.
-            let drained: Vec<PathBuf> = paused_stage_paths.drain(..).collect();
-            for path in drained {
-                if let Err(e) = process_stage_path_ready(
-                    &layout,
-                    &state_conn,
-                    &stats_conn,
-                    &consolidator_stats_conn,
-                    &path,
-                ) {
-                    tracing::error!(error = %e, path = %path.display(), "failed to apply paused-then-resumed stage path");
-                }
-            }
-        }
 
         if msg.is_none() {
             // Periodic scan: walk the per-device stage directory and
@@ -2148,32 +2164,14 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                                 });
                             }
                         }
-                        if msg.is_none() && bootstrap_initialized {
-                            let mut staged: Vec<PathBuf> = Vec::new();
-                            collect_stage_files_recursive(stage_dir, &mut staged);
-                            staged.sort();
-                            for path in staged {
-                                if is_sqllog_txn_sidecar_path(&path) {
-                                    continue;
-                                }
-                                if !is_apply_candidate_segment(&path) {
-                                    continue;
-                                }
-                                if let Err(e) = process_stage_path_ready(
-                                    &layout,
-                                    &state_conn,
-                                    &stats_conn,
-                                    &consolidator_stats_conn,
-                                    &path,
-                                ) {
-                                    tracing::error!(
-                                        error = %e,
-                                        path = %path.display(),
-                                        "periodic stage scan: failed to apply segment"
-                                    );
-                                }
-                            }
-                        }
+                    }
+                }
+                if msg.is_none() && bootstrap_initialized {
+                    if let Err(e) = flush_pending_stage_paths(
+                        &layout, &state_conn, &stats_conn, &consolidator_stats_conn,
+                        &cleanup_progress, &mut pending_stage_paths,
+                    ) {
+                        tracing::error!(error = %e, "periodic stage scan: failed to apply segment");
                     }
                 }
             }
@@ -2238,12 +2236,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                         .file_name()
                         .map(|n| n.to_owned())
                         .unwrap_or_default();
-                    let stage_container = bootstrap_backup_path
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| format!("synclite-{}-{}", layout.device_name, layout.device_id));
-                    let work_path = layout.work_dir.join(&stage_container).join(&file_name);
+                    let work_path = layout.device_work_dir.join(&file_name);
                     if work_path.exists() {
                         work_path
                     } else {
@@ -2329,6 +2322,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                                 &state_conn,
                                 &stats_conn,
                                 &consolidator_stats_conn,
+                                &cleanup_progress,
                                 &mut pending_stage_paths,
                             ) {
                                 tracing::error!(error = %e, "failed to flush pending stage paths");
@@ -2347,8 +2341,8 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                 }
             }
             Msg::StagePathReady(path) => {
+                pending_stage_paths.push(path.clone());
                 if !bootstrap_initialized {
-                    pending_stage_paths.push(path.clone());
                     if let Err(e) = record_event(&state_conn, "stage-path-deferred", &path) {
                         tracing::error!(error = %e, path = %path.display(), "failed to persist deferred stage event");
                     }
@@ -2365,19 +2359,19 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                     if let Err(e) = mirror_stage_artifact_to_work(&layout, &path) {
                         tracing::error!(error = %e, path = %path.display(), "failed to pre-mirror paused stage path");
                     }
-                    paused_stage_paths.push(path.clone());
                     if let Err(e) = record_event(&state_conn, "stage-path-paused", &path) {
                         tracing::error!(error = %e, path = %path.display(), "failed to persist paused stage event");
                     }
                     continue;
                 }
 
-                if let Err(e) = process_stage_path_ready(
+                if let Err(e) = flush_pending_stage_paths(
                     &layout,
                     &state_conn,
                     &stats_conn,
                     &consolidator_stats_conn,
-                    &path,
+                    &cleanup_progress,
+                    &mut pending_stage_paths,
                 ) {
                     tracing::error!(error = %e, path = %path.display(), "failed to persist consolidator stage event");
                     // Mirror to the device trace file so users without
@@ -2408,12 +2402,127 @@ fn flush_pending_stage_paths(
     state_conn: &Connection,
     stats_conn: &Connection,
     consolidator_stats_conn: &Connection,
+    cleanup_progress: &CleanupProgress,
     pending_stage_paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    for path in pending_stage_paths.drain(..) {
-        process_stage_path_ready(layout, state_conn, stats_conn, consolidator_stats_conn, &path)?;
+    if is_paused(layout) {
+        return Ok(());
     }
+    // Notifications are hints, not an ordering guarantee. Include retained
+    // work after restart, even when its original stage copy no longer exists.
+    // Discovery must finish before apply: an unreadable backlog cannot safely
+    // be treated as empty while a later notification advances the checkpoint.
+    discover_pending_stage_paths(layout, pending_stage_paths)?;
+    drain_ordered_stage_paths(pending_stage_paths, |path| {
+        process_stage_path_ready(
+            layout, state_conn, stats_conn, consolidator_stats_conn, cleanup_progress, path,
+        )
+    })
+}
+
+fn discover_pending_stage_paths(layout: &ConsolidatorLayout, pending: &mut Vec<PathBuf>) -> Result<()> {
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // Only this device's immediate log directory, never failed-log archives
+        // or another destination/device nested beneath the work root.
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && is_apply_candidate_segment(&entry.path()) {
+                out.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    let mut discovered = pending.clone();
+    if let Some(stage_dir) = layout.stage_dir.as_deref() {
+        collect(stage_dir, &mut discovered)?;
+    } else {
+        // The Rust logger also supports push-only layouts (stage_dir=None).
+        // The shipper notifies in numeric order only AFTER every archiver has
+        // accepted the segment. Discover older files, but never read ahead of
+        // that notification: later files may still be uploading (or NEW).
+        let mut notified: HashMap<PathBuf, u64> = HashMap::new();
+        for path in pending.iter() {
+            if let (Some(parent), Some(seq)) = (path.parent(), parse_segment_seq(path)) {
+                notified.entry(parent.to_path_buf())
+                    .and_modify(|last| *last = (*last).max(seq)).or_insert(seq);
+            }
+        }
+        for (parent, last) in notified {
+            let mut older = Vec::new();
+            collect(&parent, &mut older)?;
+            discovered.extend(older.into_iter().filter(|path| {
+                parse_segment_seq(path).is_some_and(|seq| seq <= last)
+            }));
+        }
+    }
+    collect(&layout.device_work_dir, &mut discovered)?;
+
+    // Represent stage/work duplicates by one logical source path. Even if the
+    // stage segment is gone, retain its configured path: mirroring falls back
+    // to work while still picking up late sidecars from the stage directory,
+    // and cleanup must not confuse the work directory with the stage directory.
+    let mut sources: HashMap<std::ffi::OsString, PathBuf> = HashMap::new();
+    for path in discovered.into_iter().filter(|path| is_apply_candidate_segment(path)) {
+        let name = path.file_name().expect("segment has a file name").to_owned();
+        let source = if path.parent() == Some(layout.device_work_dir.as_path()) {
+            layout.stage_dir.as_ref().map(|dir| dir.join(&name)).unwrap_or(path)
+        } else {
+            path
+        };
+        match sources.entry(name) {
+            HashMapEntry::Vacant(entry) => { entry.insert(source); }
+            HashMapEntry::Occupied(mut entry) => {
+                if entry.get().parent() == Some(layout.device_work_dir.as_path()) {
+                    entry.insert(source);
+                }
+            }
+        }
+    }
+    let command_sequences: HashSet<u64> = sources.values()
+        .filter(|path| is_sqllog_path(path)).filter_map(|path| parse_segment_seq(path)).collect();
+    let mut paths: Vec<PathBuf> = sources.into_values().filter(|path| {
+        // For SQL devices the work cdclog is a derivative, not another input.
+        // Retrying it separately could bypass undecided command-log fate or
+        // mark progress before the command segment has completed successfully.
+        !is_sql_device(layout) || is_sqllog_path(path)
+            || !parse_segment_seq(path).map(|seq| command_sequences.contains(&seq)).unwrap_or(false)
+    }).collect();
+    sort_stage_paths(&mut paths);
+    *pending = paths;
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StagePathOutcome {
+    Complete,
+    Deferred,
+}
+
+fn drain_ordered_stage_paths(
+    pending: &mut Vec<PathBuf>,
+    mut process: impl FnMut(&Path) -> Result<StagePathOutcome>,
+) -> Result<()> {
+    sort_stage_paths(pending);
+    let mut completed = 0;
+    let result = (|| {
+        for path in pending.iter() {
+            match process(path)? {
+                StagePathOutcome::Complete => completed += 1,
+                StagePathOutcome::Deferred => break,
+            }
+        }
+        Ok(())
+    })();
+    // Do not drain(..) while applying: dropping that iterator on error loses
+    // the failed head and the entire remainder, including push-only work.
+    pending.drain(..completed);
+    result
 }
 
 fn is_paused(layout: &ConsolidatorLayout) -> bool {
@@ -2429,11 +2538,12 @@ fn process_stage_path_ready(
     state_conn: &Connection,
     stats_conn: &Connection,
     consolidator_stats_conn: &Connection,
+    cleanup_progress: &CleanupProgress,
     stage_path: &Path,
-) -> Result<()> {
+) -> Result<StagePathOutcome> {
     if is_sqllog_txn_sidecar_path(stage_path) {
         cdc_debug_eprintln!("[stage-debug] skip txn-sidecar {}", stage_path.display());
-        return Ok(());
+        return Ok(StagePathOutcome::Complete);
     }
 
     cdc_debug_eprintln!("[stage-debug] process {}", stage_path.display());
@@ -2443,9 +2553,19 @@ fn process_stage_path_ready(
         None => {
             cdc_debug_eprintln!("[stage-debug] deferred device lock {}", stage_path.display());
             record_event(state_conn, "stage-path-deferred-device-locked", stage_path)?;
-            return Ok(());
+            return Ok(StagePathOutcome::Deferred);
         }
     };
+
+    // A delayed notification can outlive both stage and work cleanup. Only a
+    // persisted successful cleanup boundary authorizes dropping such a hint;
+    // a missing file by itself must remain a retryable failure.
+    if let Some(seq) = parse_segment_seq(stage_path).and_then(|seq| i64::try_from(seq).ok()) {
+        let authorized = get_state_i64(state_conn, CLEANUP_AUTHORIZED_SEGMENT_KEY, -1)?;
+        if seq <= authorized.max(read_device_metadata_i64(layout, LAST_CLEANED_SEGMENT_KEY, -1)) {
+            return Ok(StagePathOutcome::Complete);
+        }
+    }
 
     // Mirror to work dir first so subsequent inspections operate on a
     // stable copy that won't disappear if the shipper has already
@@ -2466,26 +2586,11 @@ fn process_stage_path_ready(
     if already_applied {
         cdc_debug_eprintln!("[stage-debug] already applied {}", work_path.display());
         record_event(state_conn, "stage-path-already-applied", stage_path)?;
-        cleanup_processed_sqllog(layout, state_conn, stage_path, &work_path)?;
-        return Ok(());
+        cleanup_progress.record(layout, &work_path);
+        cleanup_processed_sqllog(layout, state_conn, cleanup_progress, stage_path, &work_path)?;
+        return Ok(StagePathOutcome::Complete);
     }
 
-    if is_sqllog_path(&work_path) {
-        cdc_debug_eprintln!("[stage-debug] checking fate for {}", work_path.display());
-        let fate = match last_txn_fate_decided(&work_path) {
-            Ok(v) => v,
-            Err(err) => {
-                cdc_debug_eprintln!("[stage-debug] fate-check failed for {}: {err:?}", work_path.display());
-                return Err(err);
-            }
-        };
-        cdc_debug_eprintln!("[stage-debug] fate={} path={}", fate, work_path.display());
-        if !fate {
-            cdc_debug_eprintln!("[stage-debug] deferred undecided fate {}", work_path.display());
-            record_event(state_conn, "stage-path-deferred-undecided-fate", stage_path)?;
-            return Ok(());
-        }
-    }
     let segment_seq = parse_segment_seq(&work_path)
         .or_else(|| parse_segment_seq(stage_path))
         .map(|v| v as i64);
@@ -2501,9 +2606,18 @@ fn process_stage_path_ready(
         if should_skip_segment_by_destination_checkpoint(destination_resume, seq, &work_path)? {
             cdc_debug_eprintln!("[stage-debug] skipped recovered {}", work_path.display());
             record_event(state_conn, "stage-path-skipped-recovered", stage_path)?;
-            cleanup_processed_sqllog(layout, state_conn, stage_path, &work_path)?;
-            return Ok(());
+            cleanup_progress.record(layout, &work_path);
+            cleanup_processed_sqllog(layout, state_conn, cleanup_progress, stage_path, &work_path)?;
+            return Ok(StagePathOutcome::Complete);
         }
+    }
+
+    // A confirmed destination checkpoint can cover an old copy whose last
+    // transaction fate was not yet shipped. Otherwise undecided SQL must hold
+    // the queue head; it is not a successful (or explicitly skipped) segment.
+    if is_sqllog_path(&work_path) && !last_txn_fate_decided(&work_path)? {
+        record_event(state_conn, "stage-path-deferred-undecided-fate", stage_path)?;
+        return Ok(StagePathOutcome::Deferred);
     }
 
     cdc_debug_eprintln!("[stage-debug] before-apply branch sql_device={} store_or_streaming={} path={}", is_sql_device(layout), is_store_or_streaming_device(layout), work_path.display());
@@ -2514,45 +2628,43 @@ fn process_stage_path_ready(
     // mutating it here would race with the shipper and could result in a
     // partially-modified file being uploaded to remote stages.
     if is_store_or_streaming_device(layout) {
-        let res = record_stage_path(
+        record_stage_path(
             layout,
             state_conn,
             stats_conn,
             consolidator_stats_conn,
             &work_path,
             apply_staged_segment_with_retry,
-        );
+        )?;
         mark_segment_applied_best_effort(&work_path);
-        res?;
     } else if is_sql_device(layout) {
         let cdc_log_path = run_device_replicator(layout, &work_path)?;
-        let res = record_stage_path(
+        record_stage_path(
             layout,
             state_conn,
             stats_conn,
             consolidator_stats_conn,
             &cdc_log_path,
             apply_staged_segment_with_retry,
-        );
+        )?;
         mark_segment_applied_best_effort(&cdc_log_path);
         mark_segment_applied_best_effort(&work_path);
-        res?;
     } else {
-        let res = record_stage_path(
+        record_stage_path(
             layout,
             state_conn,
             stats_conn,
             consolidator_stats_conn,
             &work_path,
             apply_staged_segment_with_retry,
-        );
+        )?;
         mark_segment_applied_best_effort(&work_path);
-        res?;
     }
 
     // Cleaner runs after successful apply, matching Java sequencing.
-    cleanup_processed_sqllog(layout, state_conn, stage_path, &work_path)?;
-    Ok(())
+    cleanup_progress.record(layout, &work_path);
+    cleanup_processed_sqllog(layout, state_conn, cleanup_progress, stage_path, &work_path)?;
+    Ok(StagePathOutcome::Complete)
 }
 
 /// Java parity: `LogSegment.isApplied()` — read `metadata.status` from a
@@ -2574,7 +2686,7 @@ fn segment_metadata_status_is_applied(path: &Path) -> bool {
             return false;
         }
     };
-    conn.busy_timeout(Duration::from_millis(50));
+    let _ = conn.busy_timeout(Duration::from_millis(50));
     let row: rusqlite::Result<String> = conn.query_row(
         "SELECT value FROM metadata WHERE key = 'status'",
         [],
@@ -6007,24 +6119,31 @@ fn mirror_stage_artifact_to_work(layout: &ConsolidatorLayout, stage_path: &Path)
         .file_name()
         .ok_or_else(|| Error::Config(format!("consolidator: invalid staged path {}", stage_path.display())))?;
 
-    let stage_container = stage_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| format!("synclite-{}-{}", layout.device_name, layout.device_id));
-
-    let work_device_dir = layout.work_dir.join(stage_container);
+    // The layout, not the name of the stage container, owns work placement.
+    // Locking, replica replay, cleanup and restart discovery all use this dir.
+    let work_device_dir = &layout.device_work_dir;
     cdc_debug_eprintln!("[stage-debug] work-dir {}", work_device_dir.display());
     std::fs::create_dir_all(&work_device_dir)?;
 
     let work_path = work_device_dir.join(file_name);
     cdc_debug_eprintln!("[stage-debug] work-path {}", work_path.display());
+    // Work-only restart candidates must never copy(p, p): that can truncate
+    // the retained segment on Unix and fails on Windows. No mutation at all
+    // is needed for an already-local artifact.
+    if stage_path == work_path {
+        return Ok(work_path);
+    }
     // If the stage file has already been removed by the shipper cleaner
     // but a prior mirror produced the work copy, accept the work copy as
     // authoritative. This handles the pause/resume race where the shipper
     // wins the cleanup before the consolidator drains a paused segment.
     if !stage_path.exists() && work_path.exists() {
         cdc_debug_eprintln!("[stage-debug] using existing work copy {}", work_path.display());
+        // A final txn sidecar may arrive after the segment was removed from
+        // stage. It must still reach the retained work copy on the next retry.
+        if is_sqllog_path(stage_path) {
+            mirror_sqllog_txn_sidecars(stage_path, work_device_dir)?;
+        }
         return Ok(work_path);
     }
     // Idempotency: if the work copy already exists and has been marked
@@ -6044,7 +6163,7 @@ fn mirror_stage_artifact_to_work(layout: &ConsolidatorLayout, stage_path: &Path)
     // Java parity: if a sqllog segment is mirrored, mirror all matching
     // sqllog transaction sidecars (`<seq>.sqllog.*.txn`) as well.
     if is_sqllog_path(stage_path) {
-        mirror_sqllog_txn_sidecars(stage_path, &work_device_dir)?;
+        mirror_sqllog_txn_sidecars(stage_path, work_device_dir)?;
     }
 
     Ok(work_path)
@@ -6075,7 +6194,9 @@ fn mirror_sqllog_txn_sidecars(stage_sqllog_path: &Path, work_device_dir: &Path) 
             }
 
             let dst = work_device_dir.join(name);
-            std::fs::copy(&path, &dst)?;
+            if path != dst {
+                std::fs::copy(&path, &dst)?;
+            }
         }
     }
 
@@ -6108,10 +6229,11 @@ fn remove_sqllog_txn_sidecars_for_seq(dir: &Path, seq: u64) -> std::io::Result<(
 fn cleanup_processed_sqllog(
     layout: &ConsolidatorLayout,
     state_conn: &Connection,
+    cleanup_progress: &CleanupProgress,
     stage_path: &Path,
     work_path: &Path,
 ) -> Result<()> {
-    if !is_sqllog_path(stage_path) {
+    if !is_apply_candidate_segment(stage_path) {
         return Ok(());
     }
 
@@ -6133,12 +6255,22 @@ fn cleanup_processed_sqllog(
     // We gate workDir cleanup the same way: per-dst `applied_seq - 1` is
     // wrong when multiple destinations share the same device, because the
     // fast destination would delete work files the slow one still needs.
-    let min_target_seq = compute_min_applied_target(layout)?;
+    let min_target_seq = compute_min_applied_target(layout, cleanup_progress);
     if min_target_seq >= 0 {
+        // Persist authorization BEFORE deleting anything. The existing cleaner
+        // watermark is best-effort and may fail after deleting files; delayed
+        // notifications must still be recognized as completed on restart.
+        let authorized = get_state_i64(state_conn, CLEANUP_AUTHORIZED_SEGMENT_KEY, -1)?;
+        if min_target_seq > authorized {
+            put_state_i64(state_conn, CLEANUP_AUTHORIZED_SEGMENT_KEY, min_target_seq)?;
+        }
         cleanup_work_artifacts_up_to(layout, state_conn, stage_path, work_path, min_target_seq)?;
     }
 
-    if layout.cleanup_stage_files && min_target_seq >= 0 {
+    // A push-only restart may have only a work path, not a known stage path.
+    // Do not advance the stage watermark while accidentally cleaning work a
+    // second time; later real stage notifications must still clean stage.
+    if layout.cleanup_stage_files && min_target_seq >= 0 && stage_path != work_path {
         cleanup_stage_artifacts_up_to(layout, state_conn, stage_path, min_target_seq)?;
     }
     // `applied_seq` is intentionally not consulted for the target — it is
@@ -6148,30 +6280,32 @@ fn cleanup_processed_sqllog(
     Ok(())
 }
 
-/// Java parity: `Device.getLastConsolidatedLogSegmentSequenceNumber` — the
-/// MIN of `last_consolidated_cdc_log_segment_seq_num` across every
-/// configured destination. Returns `min - 1` (the highest seq safe to
-/// delete from both workDir and stageDir), or -1 when no destination has
-/// applied anything yet. Used as the cleanup target for both workDir
-/// (cdclog + cmdlog + sidecars) and stageDir, mirroring the per-device
-/// scope of `DeviceLogCleaner` on the Java side.
-fn compute_min_applied_target(layout: &ConsolidatorLayout) -> Result<i64> {
-    let mut min_seq: i64 = i64::MAX;
+/// Keep Java's MIN(all destinations) - 1 retention rule without calling any
+/// peer destination. A layout contains only its own connection settings, so
+/// querying it with a different dst_index does not even identify that peer's
+/// remote store. Only observations published by each live worker count.
+/// After restart/missing peers (including peers in another process), retain
+/// everything until all configured peers have confirmed successful progress.
+fn compute_min_applied_target(layout: &ConsolidatorLayout, progress: &CleanupProgress) -> i64 {
+    if layout.all_dst_indexes.is_empty() {
+        return -1;
+    }
+    let Some(registry) = CLEANUP_PROGRESS.get() else { return -1 };
+    let Ok(registry) = registry.lock() else { return -1 };
+    let Some(peers) = registry.get(&progress.group) else { return -1 };
+    let mut min_seq = progress.applied.load(Ordering::SeqCst);
     for dst in &layout.all_dst_indexes {
-        let v = consolidator_state::get_consolidator_property_long(
-            layout,
-            *dst,
-            "last_consolidated_cdc_log_segment_seq_num",
-        )?
-        .unwrap_or(-1);
-        if v < min_seq {
-            min_seq = v;
+        let Some(workers) = peers.get(dst) else { return -1 };
+        let mut found = false;
+        for worker in workers.iter().filter_map(Weak::upgrade) {
+            found = true;
+            min_seq = min_seq.min(worker.load(Ordering::SeqCst));
+        }
+        if !found || min_seq <= 0 {
+            return -1;
         }
     }
-    if min_seq == i64::MAX || min_seq <= 0 {
-        return Ok(-1);
-    }
-    Ok(min_seq - 1)
+    min_seq - 1
 }
 
 fn cleanup_work_artifacts_up_to(
@@ -6321,7 +6455,8 @@ fn cleanup_stage_artifacts_up_to(
 
 fn staged_segment_path_for_seq(reference_segment_path: &Path, seq: u64) -> PathBuf {
     let parent = reference_segment_path.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!("{seq}.sqllog"))
+    let extension = reference_segment_path.extension().and_then(|ext| ext.to_str()).unwrap_or("sqllog");
+    parent.join(format!("{seq}.{extension}"))
 }
 
 fn is_sqllog_path(path: &Path) -> bool {
@@ -6354,7 +6489,7 @@ fn is_apply_candidate_segment(path: &Path) -> bool {
 
 fn last_txn_fate_decided(segment_path: &Path) -> Result<bool> {
     let conn = Connection::open_with_flags(segment_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_sql_err)?;
-    conn.busy_timeout(Duration::from_millis(50));
+    conn.busy_timeout(Duration::from_millis(50)).map_err(map_sql_err)?;
     let latest_commit: Option<i64> = conn
         .query_row("SELECT MAX(commit_id) FROM commandlog", [], |row| row.get(0))
         .map_err(map_sql_err)?;
@@ -9368,6 +9503,636 @@ mod tests {
         layout
     }
 
+    struct RuntimeTestRoot(PathBuf);
+
+    impl RuntimeTestRoot {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "synclite-runtime-{label}-{}-{nonce}-{}",
+                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for RuntimeTestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RuntimeTestDestination {
+        layout: ConsolidatorLayout,
+        state: Connection,
+        stats: Connection,
+        global_stats: Connection,
+        progress: CleanupProgress,
+    }
+
+    impl RuntimeTestDestination {
+        fn new(root: &Path, dst: i32, device_type: &str) -> Self {
+            // Match the embedded factory: one device identity/home and shared
+            // stage, but <data-root>/<dst-alias> work roots. In particular do
+            // not hand-build device_work_dir/state/lock paths in this fixture.
+            let mut layout = ConsolidatorLayout::new(
+                root,
+                Some(root.join(format!("DB-{dst}"))),
+                "dev-id", "dev", device_type, "db", dst, true,
+                MetadataStore::Local, DstType::Sqlite, DestinationSyncMode::Replication,
+                root.join(format!("destination-{dst}")).join("dst.db").to_string_lossy().into_owned(),
+                1, 0, false, 11, 7, 5, true,
+            );
+            layout.stage_dir = Some(root.join("stage").join("synclite-dev-dev-id"));
+            Self::open(layout)
+        }
+
+        fn open(layout: ConsolidatorLayout) -> Self {
+            fs::create_dir_all(&layout.device_work_dir).unwrap();
+            if let Some(stage_dir) = &layout.stage_dir {
+                fs::create_dir_all(stage_dir).unwrap();
+            }
+            initialize_state_db(&layout.state_db_path).unwrap();
+            initialize_device_stats_db(&layout).unwrap();
+            initialize_consolidator_stats_db(&layout).unwrap();
+            let state = Connection::open(&layout.state_db_path).unwrap();
+            state.execute_batch(
+                "INSERT INTO synclite_checkpoint(commit_id, cdc_change_number,
+                 cdc_log_segment_sequence_number, txn_count)
+                 SELECT 0, -1, -1, 0 WHERE NOT EXISTS(SELECT 1 FROM synclite_checkpoint);"
+            ).unwrap();
+            let stats = Connection::open(&layout.stats_db_path).unwrap();
+            let global_stats = Connection::open(&layout.consolidator_stats_db_path).unwrap();
+            let progress = CleanupProgress::register(&layout);
+            Self { layout, state, stats, global_stats, progress }
+        }
+
+        fn recover(&self) {
+            let path = Path::new(&self.layout.dst_connection_string);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            Connection::open(path).unwrap().execute_batch(
+                "CREATE TABLE IF NOT EXISTS events(value INTEGER NOT NULL);"
+            ).unwrap();
+            if self.layout.metadata_store == MetadataStore::Destination {
+                consolidator_state::bootstrap_destination_metadata(&self.layout, self.layout.dst_index).unwrap();
+            }
+        }
+
+        fn stage(&self, seq: i64, extension: &str) -> PathBuf {
+            self.layout.stage_dir.as_ref().unwrap().join(format!("{seq}.{extension}"))
+        }
+
+        fn flush(&self, pending: &mut Vec<PathBuf>) -> Result<()> {
+            // Tests interleave workers on one thread; production has one schema
+            // replica per worker thread. Do not share a test peer's replica.
+            SCHEMA_REPLICA.with(|cell| cell.borrow_mut().take());
+            flush_pending_stage_paths(
+                &self.layout, &self.state, &self.stats, &self.global_stats,
+                &self.progress, pending,
+            )
+        }
+
+        fn rows(&self) -> Vec<i64> {
+            let conn = Connection::open(&self.layout.dst_connection_string).unwrap();
+            let mut stmt = conn.prepare("SELECT value FROM events ORDER BY rowid").unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<i64>>>().unwrap();
+            rows
+        }
+
+        fn checkpoint_seq(&self) -> i64 {
+            self.state.query_row(
+                "SELECT cdc_log_segment_sequence_number FROM synclite_checkpoint",
+                [], |row| row.get(0),
+            ).unwrap()
+        }
+    }
+
+    fn write_test_segment(path: &Path, seq: i64, cdc: bool, decided: bool) {
+        let conn = Connection::open(path).unwrap();
+        let table = if cdc { "cdclog" } else { "commandlog" };
+        conn.execute_batch(&format!(
+            "CREATE TABLE {table}(change_number INTEGER, commit_id INTEGER, sql TEXT,
+             arg_cnt INTEGER, arg1 INTEGER, table_name TEXT, op_type TEXT);
+             CREATE TABLE metadata(key TEXT, value TEXT);
+             INSERT INTO metadata VALUES('status', 'READY');"
+        )).unwrap();
+        conn.execute(&format!(
+            "INSERT INTO {table} VALUES(1, ?1, 'INSERT INTO events(value) VALUES(?)',
+             1, ?1, 'events', 'INSERT')"
+        ), [seq]).unwrap();
+        if decided {
+            conn.execute(&format!(
+                "INSERT INTO {table} VALUES(2, ?1, 'COMMIT', 0, NULL, NULL, NULL)"
+            ), [seq]).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_apply_never_marks_applied_and_recovers_in_all_device_branches() {
+        for (device_type, extension) in [
+            ("sqlite_store", "sqllog"), ("sqlite", "sqllog"), ("other", "cdclog"),
+        ] {
+            let root = RuntimeTestRoot::new(device_type);
+            let dst = RuntimeTestDestination::new(&root.0, 1, device_type);
+            let stage = dst.stage(2, extension);
+            write_test_segment(&stage, 2, extension == "cdclog", true);
+            let work = dst.layout.device_work_dir.join(stage.file_name().unwrap());
+            let cdc = dst.layout.device_work_dir.join("2.cdclog");
+            if device_type == "sqlite" {
+                // A previous successful replica replay emitted this CDC segment.
+                // Exercise retry reuse without loading the native CDC library.
+                write_test_segment(&cdc, 2, true, true);
+            }
+            let mut pending = vec![stage.clone()];
+            // Missing destination parent is a deterministic I/O failure.
+            assert!(dst.flush(&mut pending).is_err(), "{device_type}");
+            assert_eq!(pending, vec![stage.clone()]);
+            assert!(!segment_metadata_status_is_applied(&work));
+            assert!(!segment_metadata_status_is_applied(&cdc));
+            assert_eq!(dst.checkpoint_seq(), -1);
+            assert_eq!(compute_min_applied_target(&dst.layout, &dst.progress), -1);
+
+            dst.recover();
+            dst.flush(&mut pending).unwrap();
+            assert!(pending.is_empty());
+            assert!(segment_metadata_status_is_applied(&work), "{device_type}");
+            if device_type == "sqlite" {
+                assert!(segment_metadata_status_is_applied(&cdc));
+            }
+            assert!(!segment_metadata_status_is_applied(&stage));
+            assert_eq!(dst.rows(), vec![2]);
+            assert_eq!(dst.checkpoint_seq(), 2);
+            // Re-notification and periodic scan are idempotent.
+            pending.push(stage);
+            dst.flush(&mut pending).unwrap();
+            assert_eq!(dst.rows(), vec![2]);
+        }
+    }
+
+    #[test]
+    fn healthy_destination_progresses_while_failed_peer_retries_in_numeric_order() {
+        let root = RuntimeTestRoot::new("multi-destination");
+        let mut healthy = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        let mut failing = RuntimeTestDestination::new(&root.0, 2, "sqlite_store");
+        healthy.layout.all_dst_indexes = vec![1, 2];
+        failing.layout.all_dst_indexes = vec![1, 2];
+        healthy.recover();
+        for seq in [100, 10, 2] {
+            write_test_segment(&healthy.stage(seq, "sqllog"), seq, false, true);
+        }
+        let mut failed_pending = vec![failing.stage(10, "sqllog")];
+        assert!(failing.flush(&mut failed_pending).is_err());
+        assert_eq!(parse_segment_seq(&failed_pending[0]), Some(2));
+        // A later push must retry the failed head, never advance to seq 100.
+        failed_pending.push(failing.stage(100, "sqllog"));
+        assert!(failing.flush(&mut failed_pending).is_err());
+        assert_eq!(failed_pending.len(), 3);
+        assert_eq!(failing.checkpoint_seq(), -1);
+        assert!(!failing.layout.device_work_dir.join("10.sqllog").exists());
+
+        // These are the SAME device, using the production alias-based layout.
+        // The lock is per device_work_dir, not per device_data_root. A second
+        // worker/handover for the same work dir must defer; the other alias
+        // must progress without weakening that cross-language exclusion.
+        assert_eq!(healthy.layout.device_data_root, failing.layout.device_data_root);
+        assert_eq!(healthy.layout.device_id, failing.layout.device_id);
+        assert_eq!(healthy.layout.device_name, failing.layout.device_name);
+        assert_eq!(healthy.layout.stage_dir, failing.layout.stage_dir);
+        assert_ne!(healthy.layout.device_work_dir, failing.layout.device_work_dir);
+        let failed_lock = DeviceProcessingLock::try_lock(&failing.layout).unwrap().unwrap();
+        assert!(DeviceProcessingLock::try_lock(&failing.layout).unwrap().is_none());
+        failing.flush(&mut failed_pending).unwrap();
+        assert_eq!(failed_pending.len(), 3);
+        assert_eq!(failing.checkpoint_seq(), -1);
+        healthy.flush(&mut vec![healthy.stage(100, "sqllog")]).unwrap();
+        assert_eq!(healthy.rows(), vec![2, 10, 100]);
+        assert_eq!(healthy.checkpoint_seq(), 100);
+        assert_eq!(compute_min_applied_target(&healthy.layout, &healthy.progress), -1);
+        for seq in [2, 10, 100] {
+            assert!(healthy.stage(seq, "sqllog").exists());
+            assert!(healthy.layout.device_work_dir.join(format!("{seq}.sqllog")).exists());
+        }
+        drop(failed_lock);
+
+        failing.recover();
+        failing.flush(&mut failed_pending).unwrap();
+        assert_eq!(failing.rows(), vec![2, 10, 100]);
+        assert_eq!(failing.checkpoint_seq(), 100);
+        assert!(failed_pending.is_empty());
+        assert_eq!(compute_min_applied_target(&healthy.layout, &healthy.progress), 99);
+        healthy.flush(&mut Vec::new()).unwrap();
+        for seq in [2, 10] {
+            assert!(!healthy.stage(seq, "sqllog").exists());
+            assert!(!healthy.layout.device_work_dir.join(format!("{seq}.sqllog")).exists());
+            assert!(!failing.layout.device_work_dir.join(format!("{seq}.sqllog")).exists());
+        }
+        assert!(healthy.stage(100, "sqllog").exists());
+        // Old messages surviving cleanup cannot permanently block the queue.
+        healthy.flush(&mut vec![healthy.stage(2, "sqllog")]).unwrap();
+        assert_eq!(healthy.rows(), vec![2, 10, 100]);
+    }
+
+    #[test]
+    fn native_cdc_destination_checkpoints_do_not_skip_failed_segment() {
+        let root = RuntimeTestRoot::new("native-cdc");
+        let mut healthy = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        let mut failing = RuntimeTestDestination::new(&root.0, 2, "sqlite_store");
+        healthy.layout.all_dst_indexes = vec![1, 2];
+        failing.layout.all_dst_indexes = vec![1, 2];
+        healthy.layout.metadata_store = MetadataStore::Destination;
+        failing.layout.metadata_store = MetadataStore::Destination;
+        healthy.recover();
+        for seq in [10, 2] {
+            write_test_segment(&healthy.stage(seq, "cdclog"), seq, true, true);
+        }
+        let mut pending = vec![failing.stage(10, "cdclog")];
+        assert!(failing.flush(&mut pending).is_err());
+        assert_eq!(pending, vec![failing.stage(2, "cdclog"), failing.stage(10, "cdclog")]);
+        assert!(read_destination_resume_checkpoint(&failing.layout).unwrap().is_none());
+        healthy.flush(&mut Vec::new()).unwrap();
+        assert_eq!(healthy.rows(), vec![2, 10]);
+        assert_eq!(read_destination_resume_checkpoint(&healthy.layout).unwrap().unwrap()
+            .cdc_log_segment_sequence_number, 10);
+        assert!(healthy.stage(2, "cdclog").exists());
+        assert!(healthy.layout.device_work_dir.join("2.cdclog").exists());
+
+        failing.recover();
+        failing.flush(&mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(failing.rows(), vec![2, 10]);
+        assert_eq!(read_destination_resume_checkpoint(&failing.layout).unwrap().unwrap()
+            .cdc_log_segment_sequence_number, 10);
+        healthy.flush(&mut Vec::new()).unwrap();
+        assert!(!healthy.stage(2, "cdclog").exists());
+        assert!(!healthy.layout.device_work_dir.join("2.cdclog").exists());
+        assert!(!failing.layout.device_work_dir.join("2.cdclog").exists());
+        assert!(healthy.stage(10, "cdclog").exists());
+    }
+
+    #[test]
+    fn ordered_queue_retains_failed_and_deferred_heads_without_stage_scan() {
+        let mut pending = [100, 2, 10, 1].map(|seq| PathBuf::from(format!("{seq}.sqllog"))).to_vec();
+        let mut seen = Vec::new();
+        assert!(drain_ordered_stage_paths(&mut pending, |path| {
+            let seq = parse_segment_seq(path).unwrap();
+            seen.push(seq);
+            if seq == 2 { Err(Error::Internal("offline".into())) }
+            else { Ok(StagePathOutcome::Complete) }
+        }).is_err());
+        assert_eq!(seen, vec![1, 2]);
+        assert_eq!(pending.iter().map(|p| parse_segment_seq(p).unwrap()).collect::<Vec<_>>(), vec![2, 10, 100]);
+        seen.clear();
+        drain_ordered_stage_paths(&mut pending, |path| {
+            seen.push(parse_segment_seq(path).unwrap());
+            Ok(StagePathOutcome::Deferred)
+        }).unwrap();
+        assert_eq!(seen, vec![2]);
+        assert_eq!(pending.len(), 3);
+        seen.clear();
+        drain_ordered_stage_paths(&mut pending, |path| {
+            seen.push(parse_segment_seq(path).unwrap());
+            Ok(StagePathOutcome::Complete)
+        }).unwrap();
+        assert_eq!(seen, vec![2, 10, 100]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn undecided_fate_and_device_lock_defer_later_segments_until_retry() {
+        let root = RuntimeTestRoot::new("deferred");
+        let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        // Keep both segments for assertions instead of cleaning seq 2 after 10.
+        dst.layout.all_dst_indexes = vec![1, 2];
+        dst.recover();
+        write_test_segment(&dst.stage(2, "sqllog"), 2, false, false);
+        write_test_segment(&dst.stage(10, "sqllog"), 10, false, true);
+        let mut pending = vec![dst.stage(10, "sqllog")];
+        dst.flush(&mut pending).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(dst.rows().is_empty());
+        assert!(!dst.layout.device_work_dir.join("10.sqllog").exists());
+
+        Connection::open(dst.stage(2, "sqllog")).unwrap().execute_batch(
+            "INSERT INTO commandlog VALUES(2, 2, 'COMMIT', 0, NULL, NULL, NULL);"
+        ).unwrap();
+        let lock = DeviceProcessingLock::try_lock(&dst.layout).unwrap().unwrap();
+        dst.flush(&mut pending).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(dst.checkpoint_seq(), -1);
+        drop(lock);
+        dst.flush(&mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(dst.rows(), vec![2, 10]);
+    }
+
+    #[test]
+    fn pause_retains_ordered_backlog_and_recovery_uses_mirrored_copy() {
+        let root = RuntimeTestRoot::new("pause");
+        let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        dst.layout.all_dst_indexes = vec![1, 2];
+        dst.layout.pause_sentinel = Some(root.0.join("paused"));
+        dst.recover();
+        for seq in [10, 2] {
+            write_test_segment(&dst.stage(seq, "sqllog"), seq, false, true);
+            mirror_stage_artifact_to_work(&dst.layout, &dst.stage(seq, "sqllog")).unwrap();
+        }
+        fs::write(dst.layout.pause_sentinel.as_ref().unwrap(), b"").unwrap();
+        let mut pending = vec![dst.stage(10, "sqllog"), dst.stage(2, "sqllog")];
+        dst.flush(&mut pending).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(dst.rows().is_empty());
+        fs::remove_file(dst.stage(2, "sqllog")).unwrap();
+        fs::remove_file(dst.layout.pause_sentinel.as_ref().unwrap()).unwrap();
+        dst.flush(&mut pending).unwrap();
+        assert_eq!(dst.rows(), vec![2, 10]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn restart_discovers_failed_work_before_later_stage_in_all_device_branches() {
+        for (device_type, extension) in [
+            ("sqlite_store", "sqllog"), ("sqlite", "sqllog"), ("other", "cdclog"),
+        ] {
+            let root = RuntimeTestRoot::new("restart-work");
+            let dst = RuntimeTestDestination::new(&root.0, 1, device_type);
+            let head = dst.stage(2, extension);
+            let later = dst.stage(10, extension);
+            write_test_segment(&head, 2, extension == "cdclog", true);
+            if device_type == "sqlite" {
+                write_test_segment(&dst.layout.device_work_dir.join("2.cdclog"), 2, true, true);
+            }
+            assert!(dst.flush(&mut vec![head.clone()]).is_err());
+            fs::remove_file(&head).unwrap();
+            write_test_segment(&later, 10, extension == "cdclog", true);
+            let layout = dst.layout.clone();
+            drop(dst); // Lose the queue, connections and live cleanup progress.
+
+            let restarted = RuntimeTestDestination::open(layout);
+            let mut pending = vec![later.clone()];
+            assert!(restarted.flush(&mut pending).is_err(), "{device_type}");
+            assert_eq!(pending, vec![head.clone(), later.clone()], "{device_type}");
+            assert_eq!(restarted.checkpoint_seq(), -1);
+            assert_eq!(compute_min_applied_target(&restarted.layout, &restarted.progress), -1);
+            assert!(!segment_metadata_status_is_applied(
+                &restarted.layout.device_work_dir.join(head.file_name().unwrap())
+            ));
+            assert!(!restarted.layout.device_work_dir.join(later.file_name().unwrap()).exists());
+
+            if device_type == "sqlite" {
+                write_test_segment(&restarted.layout.device_work_dir.join("10.cdclog"), 10, true, true);
+            }
+            restarted.recover();
+            restarted.flush(&mut pending).unwrap();
+            assert!(pending.is_empty());
+            assert_eq!(restarted.rows(), vec![2, 10], "{device_type}");
+            assert_eq!(restarted.checkpoint_seq(), 10);
+            assert!(!segment_metadata_status_is_applied(&later));
+            // Work discovery must not enqueue the generated CDC a second time.
+            restarted.flush(&mut Vec::new()).unwrap();
+            assert_eq!(restarted.rows(), vec![2, 10], "{device_type}");
+        }
+    }
+
+    #[test]
+    fn push_only_discovery_never_applies_or_cleans_ahead_of_shipping() {
+        let root = RuntimeTestRoot::new("shipping-boundary");
+        let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        dst.recover();
+        let shipped = dst.stage(2, "sqllog");
+        let uploading = dst.stage(10, "sqllog");
+        let newest = dst.stage(100, "sqllog");
+        for (path, seq) in [(&shipped, 2), (&uploading, 10), (&newest, 100)] {
+            write_test_segment(path, seq, false, true);
+        }
+        dst.layout.stage_dir = None;
+        dst.flush(&mut vec![shipped.clone()]).unwrap();
+        // A finalized segment is not necessarily shipped to every archiver.
+        // Periodic discovery must not turn mere existence into permission.
+        dst.flush(&mut Vec::new()).unwrap();
+        assert_eq!(dst.rows(), vec![2]);
+        assert_eq!(dst.checkpoint_seq(), 2);
+        assert!(uploading.exists());
+        assert!(newest.exists());
+        assert!(!dst.layout.device_work_dir.join("10.sqllog").exists());
+        assert!(!dst.layout.device_work_dir.join("100.sqllog").exists());
+
+        dst.flush(&mut vec![uploading.clone()]).unwrap();
+        assert_eq!(dst.rows(), vec![2, 10]);
+        assert!(!shipped.exists());
+        assert!(uploading.exists());
+        assert!(newest.exists());
+        dst.flush(&mut vec![newest.clone()]).unwrap();
+        assert_eq!(dst.rows(), vec![2, 10, 100]);
+        assert!(!uploading.exists());
+        assert!(newest.exists());
+    }
+
+    #[test]
+    fn statistics_failure_does_not_replay_committed_data_or_stall_checkpoint() {
+        for global_failure in [false, true] {
+            let root = RuntimeTestRoot::new("statistics-failure");
+            let dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+            dst.recover();
+            let stage = dst.stage(2, "sqllog");
+            write_test_segment(&stage, 2, false, true);
+            let stats = if global_failure { &dst.global_stats } else { &dst.stats };
+            stats.execute_batch("PRAGMA query_only = ON").unwrap();
+            dst.flush(&mut vec![stage.clone()]).unwrap();
+            assert_eq!(dst.rows(), vec![2]);
+            assert_eq!(dst.checkpoint_seq(), 2);
+            assert!(segment_metadata_status_is_applied(
+                &dst.layout.device_work_dir.join("2.sqllog")
+            ));
+            stats.execute_batch("PRAGMA query_only = OFF").unwrap();
+            dst.flush(&mut vec![stage]).unwrap();
+            assert_eq!(dst.rows(), vec![2]);
+            assert_eq!(dst.state.query_row(
+                "SELECT txn_count FROM synclite_checkpoint", [], |row| row.get::<_, i64>(0),
+            ).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn push_only_restart_retries_work_without_self_copy_or_stage_watermark() {
+        let root = RuntimeTestRoot::new("push-only-restart");
+        let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        let head = dst.stage(2, "sqllog");
+        let later = dst.stage(10, "sqllog");
+        dst.layout.stage_dir = None; // The embedded Rust push-only layout.
+        write_test_segment(&head, 2, false, true);
+        write_test_segment(&later, 10, false, true);
+        // Even a notification for 10 must discover the older staged 2.
+        assert!(dst.flush(&mut vec![later.clone()]).is_err());
+        mirror_stage_artifact_to_work(&dst.layout, &later).unwrap();
+        fs::remove_file(&head).unwrap();
+        fs::remove_file(&later).unwrap();
+        let work_head = dst.layout.device_work_dir.join("2.sqllog");
+        let original = fs::read(&work_head).unwrap();
+        let layout = dst.layout.clone();
+        drop(dst);
+
+        let restarted = RuntimeTestDestination::open(layout);
+        let mut pending = Vec::new(); // Periodic/shutdown scan, no new hint.
+        assert!(restarted.flush(&mut pending).is_err());
+        assert_eq!(pending.first(), Some(&work_head));
+        assert_eq!(fs::read(&work_head).unwrap(), original);
+        restarted.recover();
+        restarted.flush(&mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(restarted.rows(), vec![2, 10]);
+        assert_eq!(restarted.checkpoint_seq(), 10);
+        assert_eq!(get_state_i64(&restarted.state, LAST_STAGE_CLEANED_SEGMENT_KEY, -1).unwrap(), -1);
+        assert!(!work_head.exists());
+    }
+
+    #[test]
+    fn sql_work_derivative_cannot_bypass_undecided_command_after_restart() {
+        let root = RuntimeTestRoot::new("restart-undecided");
+        let dst = RuntimeTestDestination::new(&root.0, 1, "sqlite");
+        dst.recover();
+        let head = dst.stage(2, "sqllog");
+        write_test_segment(&head, 2, false, false);
+        let work = mirror_stage_artifact_to_work(&dst.layout, &head).unwrap();
+        write_test_segment(&dst.layout.device_work_dir.join("2.cdclog"), 2, true, true);
+        write_test_segment(&dst.stage(10, "sqllog"), 10, false, true);
+        fs::remove_file(&head).unwrap();
+        let layout = dst.layout.clone();
+        drop(dst);
+
+        let restarted = RuntimeTestDestination::open(layout);
+        let mut pending = Vec::new();
+        restarted.flush(&mut pending).unwrap();
+        assert_eq!(pending, vec![head, restarted.stage(10, "sqllog")]);
+        assert!(restarted.rows().is_empty());
+        assert_eq!(restarted.checkpoint_seq(), -1);
+        assert!(!segment_metadata_status_is_applied(&work));
+        assert_eq!(compute_min_applied_target(&restarted.layout, &restarted.progress), -1);
+    }
+
+    #[test]
+    fn mirror_uses_layout_work_dir_and_recovers_late_sidecar_without_stage_segment() {
+        let root = RuntimeTestRoot::new("mirror-sidecar");
+        let dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        // Stage container spelling is not required to match the device name.
+        let stage_dir = root.0.join("different-stage-container");
+        fs::create_dir_all(&stage_dir).unwrap();
+        let stage = stage_dir.join("2.sqllog");
+        write_test_segment(&stage, 2, false, false);
+        Connection::open(&stage).unwrap().execute_batch(
+            "UPDATE commandlog SET sql = 'REPLAY_TXN', arg_cnt = 0;"
+        ).unwrap();
+        let work = mirror_stage_artifact_to_work(&dst.layout, &stage).unwrap();
+        assert_eq!(work, dst.layout.device_work_dir.join("2.sqllog"));
+        assert!(!last_txn_fate_decided(&work).unwrap());
+        fs::remove_file(&stage).unwrap();
+        let sidecar = replay_txn_sidecar_path(&stage, 2, 2);
+        fs::write(&sidecar, b"late txn payload").unwrap();
+        let original = fs::read(&work).unwrap();
+        mirror_stage_artifact_to_work(&dst.layout, &stage).unwrap();
+        assert!(last_txn_fate_decided(&work).unwrap());
+        let work_sidecar = replay_txn_sidecar_path(&work, 2, 2);
+        assert_eq!(fs::read(&work_sidecar).unwrap(), b"late txn payload");
+        assert_eq!(mirror_stage_artifact_to_work(&dst.layout, &work).unwrap(), work);
+        assert_eq!(fs::read(&work).unwrap(), original);
+        assert_eq!(fs::read(&work_sidecar).unwrap(), b"late txn payload");
+    }
+
+    #[test]
+    fn backlog_discovery_failure_does_not_advance_a_later_notification() {
+        let root = RuntimeTestRoot::new("discovery-error");
+        let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        dst.recover();
+        let later = dst.stage(10, "sqllog");
+        write_test_segment(&later, 10, false, true);
+        let not_a_directory = root.0.join("invalid-stage");
+        fs::write(&not_a_directory, b"not a directory").unwrap();
+        dst.layout.stage_dir = Some(not_a_directory);
+        let mut pending = vec![later.clone()];
+        assert!(dst.flush(&mut pending).is_err());
+        assert_eq!(pending, vec![later]);
+        assert_eq!(dst.checkpoint_seq(), -1);
+        assert!(dst.rows().is_empty());
+    }
+
+    #[test]
+    fn work_discovery_deduplicates_inputs_and_ignores_failed_log_archives() {
+        let root = RuntimeTestRoot::new("discovery-scope");
+        let dst = RuntimeTestDestination::new(&root.0, 1, "sqlite");
+        let stage = dst.stage(10, "sqllog");
+        write_test_segment(&stage, 10, false, true);
+        let work = mirror_stage_artifact_to_work(&dst.layout, &stage).unwrap();
+        let derivative = dst.layout.device_work_dir.join("10.cdclog");
+        write_test_segment(&derivative, 10, true, true);
+        let archive = dst.layout.device_work_dir.join("failed_logs_for_dst_1");
+        fs::create_dir_all(&archive).unwrap();
+        write_test_segment(&archive.join("2.sqllog"), 2, false, true);
+        fs::write(dst.layout.device_work_dir.join("10.sqllog.10.txn"), b"sidecar").unwrap();
+        let mut pending = vec![stage.clone(), work, derivative, stage.clone()];
+        discover_pending_stage_paths(&dst.layout, &mut pending).unwrap();
+        assert_eq!(pending, vec![stage.clone()]);
+        // Repeated scans have the same logical queue, not stage/work duplicates.
+        discover_pending_stage_paths(&dst.layout, &mut pending).unwrap();
+        assert_eq!(pending, vec![stage]);
+    }
+
+    #[test]
+    fn delayed_notification_after_cleanup_survives_missing_best_effort_watermark() {
+        let root = RuntimeTestRoot::new("cleanup-authorization");
+        let dst = RuntimeTestDestination::new(&root.0, 1, "sqlite_store");
+        dst.recover();
+        for seq in [2, 10] {
+            write_test_segment(&dst.stage(seq, "sqllog"), seq, false, true);
+        }
+        dst.flush(&mut Vec::new()).unwrap();
+        assert!(!dst.stage(2, "sqllog").exists());
+        // Simulate a lost best-effort cleaner watermark; authorization was
+        // already durable before any file removal and survives worker restart.
+        Connection::open(device_metadata_path(&dst.layout)).unwrap().execute(
+            "DELETE FROM metadata WHERE key = ?1", [LAST_CLEANED_SEGMENT_KEY],
+        ).unwrap();
+        let restarted = CleanupProgress::register(&dst.layout);
+        assert_eq!(process_stage_path_ready(
+            &dst.layout, &dst.state, &dst.stats, &dst.global_stats,
+            &restarted, &dst.stage(2, "sqllog"),
+        ).unwrap(), StagePathOutcome::Complete);
+        assert_eq!(dst.rows(), vec![2, 10]);
+    }
+
+    #[test]
+    fn cleanup_requires_all_live_peers_and_restarts_fail_closed() {
+        let root = RuntimeTestRoot::new("cleanup-peers");
+        let mut layout = layout_for_batch_tests();
+        layout.device_data_root = root.0.clone();
+        layout.all_dst_indexes = vec![1, 2];
+        // Deliberately unusable remote settings: cleanup must never consult them.
+        layout.dst_type = DstType::Postgres;
+        layout.dst_connection_string = "invalid remote connection".into();
+        let first = CleanupProgress::register(&layout);
+        first.record(&layout, Path::new("100.sqllog"));
+        assert_eq!(compute_min_applied_target(&layout, &first), -1);
+        let mut peer = layout.clone();
+        peer.dst_index = 2;
+        let second = CleanupProgress::register(&peer);
+        assert_eq!(compute_min_applied_target(&layout, &first), -1);
+        second.record(&peer, Path::new("2.sqllog"));
+        assert_eq!(compute_min_applied_target(&layout, &first), 1);
+        second.record(&peer, Path::new("10.sqllog"));
+        assert_eq!(compute_min_applied_target(&layout, &first), 9);
+        drop(second);
+        assert_eq!(compute_min_applied_target(&layout, &first), -1);
+        let restarted = CleanupProgress::register(&peer);
+        assert_eq!(compute_min_applied_target(&layout, &first), -1);
+        restarted.record(&peer, Path::new("100.sqllog"));
+        assert_eq!(compute_min_applied_target(&layout, &first), 99);
+        let duplicate = CleanupProgress::register(&peer);
+        assert_eq!(compute_min_applied_target(&layout, &first), -1);
+        drop(duplicate);
+        assert_eq!(compute_min_applied_target(&layout, &first), 99);
+    }
+
     #[test]
     fn classify_sql_kind_detects_dml_prefixes() {
         assert_eq!(classify_sql_kind("INSERT INTO t VALUES (?)"), DmlKind::Insert);
@@ -9465,13 +10230,13 @@ mod tests {
         layout.metadata_store = MetadataStore::Local;
         layout.device_work_dir = root.clone();
         layout.all_dst_indexes = vec![layout.dst_index];
-        // Java parity: production wires `record_consolidated_cdc_seq` after a
-        // successful apply, before cleanup runs. Without it, stage cleanup is
-        // gated to -1 (no destination has applied anything).
-        consolidator_state::record_consolidated_cdc_seq(&layout, layout.dst_index, 2).unwrap();
+        layout.device_data_root = root.clone();
+        let progress = CleanupProgress::register(&layout);
+        progress.record(&layout, &work_dir.join("2.sqllog"));
         cleanup_processed_sqllog(
             &layout,
             &state_conn,
+            &progress,
             &stage_dir.join("2.sqllog"),
             &work_dir.join("2.sqllog"),
         )

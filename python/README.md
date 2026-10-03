@@ -76,6 +76,21 @@ sl.await_sync("myapp.db", 30.0)
 conn.close()
 ```
 
+For multiple destinations, use the same `initialize(...)` API with a non-empty
+`destinations` sequence:
+
+```python
+sl.initialize(
+    device_type="SQLITE",
+    device_name="sampledevice",
+    db_path="myapp.db",
+    destinations=[destination_1, destination_2],
+)
+```
+
+Sequence order defines stable one-based destination indexes. The complete
+sequence is validated first, then destinations are initialized sequentially.
+
 For DuckDB, swap `Connection` for `DuckDBConnection` and
 `device_type="DUCKDB"`. For STORE / STREAMING devices, write a config
 file with `device-type=SQLITE_STORE` or `STREAMING` and open with
@@ -102,7 +117,7 @@ parameterless statements.
 
 ## API surface
 
-- `initialize(device_type, device_name, db_path, destination=None, config_path=None)`
+- `initialize(device_type, device_name, db_path, destination=None, config_path=None, *, destinations=None)`
 - `await_sync(db_path, timeout_seconds)`
 - `DestinationOptions(dst_type, dst_connection_string, dst_database=None, dst_schema=None, dst_sync_mode="CONSOLIDATION")`
 - `Connection.open(path)` / `open_with_config(path)` /

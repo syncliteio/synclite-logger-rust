@@ -4,18 +4,8 @@
 //! while this module keeps the public API stable for logger callers.
 
 pub use consolidator_core::{
-	parse_triggers_file,
-	ConsolidatorLayout,
-	DestinationSyncMode as DstSyncMode,
-	DstDataTypeMapping,
-	DstDeviceSchemaNamePolicy,
-	DstIdempotentDataIngestionMethod,
-	DstObjectInitMode,
-	DstType,
-	FilterMapperRules,
-	MetadataStore,
-	ValueMapperRules,
+    parse_triggers_file, ConsolidatorLayout, DestinationSyncMode as DstSyncMode,
+    DstDataTypeMapping, DstDeviceSchemaNamePolicy, DstIdempotentDataIngestionMethod,
+    DstObjectInitMode, DstType, FilterMapperRules, MetadataStore, ValueMapperRules,
 };
 pub use consolidator_runtime::Consolidator;
-
-

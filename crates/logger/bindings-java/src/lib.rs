@@ -19,15 +19,17 @@
 //! - `nativeIsSyncPaused(dbPath)          -> boolean`
 //! - `nativeReinitialize(dbPath, clean)   -> void`
 //!
-//! Handles are `Box::into_raw(Box::new(Arc<Consolidator>)) as jlong`.
+//! Handles are boxed Rust values containing an `Arc<Consolidator>`.
 //! All exports trap panics + map errors to `SyncLiteException`.
 
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use jni::objects::{JClass, JString};
-use jni::sys::jlong;
+use jni::objects::{JClass, JObject, JString};
+use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 
 use consolidator_core::{
@@ -37,7 +39,7 @@ use consolidator_runtime::Consolidator;
 
 // ---------- error / panic helpers --------------------------------------------
 
-const EXCEPTION_CLASS: &str = "io/synclite/consolidator/SyncLiteException";
+const EXCEPTION_CLASS: &str = "io/synclite/SyncLiteException";
 
 fn throw(env: &mut JNIEnv<'_>, msg: &str) {
     if env.exception_check().unwrap_or(false) {
@@ -85,16 +87,21 @@ fn jstring_to_string(env: &mut JNIEnv<'_>, s: &JString<'_>) -> Result<String, St
         .map_err(|e| format!("invalid Java string: {e}"))
 }
 
-fn jstring_to_opt_string(
-    env: &mut JNIEnv<'_>,
-    s: &JString<'_>,
-) -> Result<Option<String>, String> {
+fn jstring_to_opt_string(env: &mut JNIEnv<'_>, s: &JString<'_>) -> Result<Option<String>, String> {
     if s.is_null() {
         return Ok(None);
     }
     env.get_string(s)
         .map(|js| Some(String::from(js)))
         .map_err(|e| format!("invalid Java string: {e}"))
+}
+
+fn java_thread_is_interrupted(env: &mut JNIEnv<'_>, thread: &JObject<'_>) -> bool {
+    env.call_method(thread, "isInterrupted", "()Z", &[])
+        .and_then(|value| value.z())
+        // Treat a failed interruption check as cancellation. If Java left an
+        // exception pending, guard() preserves it rather than replacing it.
+        .unwrap_or(true)
 }
 
 fn parse_dst_type(s: &str) -> Result<DstType, String> {
@@ -120,7 +127,174 @@ fn parse_sync_mode(s: &str) -> Result<DstSyncMode, String> {
 
 // ---------- handle marshalling -----------------------------------------------
 
-type Handle = Arc<Consolidator>;
+struct Handle {
+    consolidator: Arc<Consolidator>,
+    db_path: PathBuf,
+    registration: RegistrationToken,
+}
+
+#[derive(Clone)]
+struct RegisteredDestination {
+    token: u64,
+    layout: ConsolidatorLayout,
+}
+
+struct DestinationGeneration {
+    generation: u64,
+    expected_count: i32,
+    destinations: HashMap<i32, RegisteredDestination>,
+}
+
+#[derive(Default)]
+struct DestinationLayoutRegistry {
+    active: HashMap<PathBuf, DestinationGeneration>,
+    pending: HashMap<PathBuf, DestinationGeneration>,
+}
+
+#[derive(Clone, Copy)]
+struct RegistrationToken {
+    generation: u64,
+    destination_index: i32,
+    token: u64,
+}
+
+static DESTINATION_LAYOUTS: OnceLock<Mutex<DestinationLayoutRegistry>> = OnceLock::new();
+static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn destination_layouts() -> &'static Mutex<DestinationLayoutRegistry> {
+    DESTINATION_LAYOUTS.get_or_init(|| Mutex::new(DestinationLayoutRegistry::default()))
+}
+
+fn destination_registry_key(db_path: &PathBuf) -> PathBuf {
+    std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.clone())
+}
+
+fn register_destination_layout(
+    db_path: &PathBuf,
+    layout: ConsolidatorLayout,
+    destination_count: i32,
+) -> Result<RegistrationToken, String> {
+    let key = destination_registry_key(db_path);
+    let destination_index = layout.dst_index;
+    let mut registry = destination_layouts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if destination_index == 1 {
+        registry.pending.insert(
+            key.clone(),
+            DestinationGeneration {
+                generation: NEXT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed),
+                expected_count: destination_count,
+                destinations: HashMap::new(),
+            },
+        );
+    }
+
+    let pending = registry.pending.get_mut(&key).ok_or_else(|| {
+        format!(
+            "destination {destination_index} was registered before destination 1 for {}",
+            key.display()
+        )
+    })?;
+    if pending.expected_count != destination_count {
+        return Err(format!(
+            "destination count changed during registration for {}: expected {}, got {}",
+            key.display(),
+            pending.expected_count,
+            destination_count
+        ));
+    }
+    if pending.destinations.contains_key(&destination_index) {
+        return Err(format!(
+            "destination {destination_index} was registered more than once for {}",
+            key.display()
+        ));
+    }
+
+    let token = NEXT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed);
+    let generation = pending.generation;
+    pending
+        .destinations
+        .insert(destination_index, RegisteredDestination { token, layout });
+
+    let complete = pending.destinations.len() == destination_count as usize
+        && (1..=destination_count).all(|index| pending.destinations.contains_key(&index));
+    if complete {
+        let complete_generation = registry
+            .pending
+            .remove(&key)
+            .expect("completed destination generation must still be pending");
+        // Publish the complete generation in one map update. Callers can see
+        // either the previous complete set or this one, never a partial set.
+        registry.active.insert(key, complete_generation);
+    }
+
+    Ok(RegistrationToken {
+        generation,
+        destination_index,
+        token,
+    })
+}
+
+fn generation_contains_token(
+    generation: &DestinationGeneration,
+    registration: RegistrationToken,
+) -> bool {
+    generation.generation == registration.generation
+        && generation
+            .destinations
+            .get(&registration.destination_index)
+            .is_some_and(|destination| destination.token == registration.token)
+}
+
+fn unregister_destination_layout(db_path: &PathBuf, registration: RegistrationToken) {
+    let mut registry = destination_layouts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registry
+        .pending
+        .get(db_path)
+        .is_some_and(|generation| generation_contains_token(generation, registration))
+    {
+        // A stopped worker invalidates the complete generation being built.
+        registry.pending.remove(db_path);
+    }
+    if registry
+        .active
+        .get(db_path)
+        .is_some_and(|generation| generation_contains_token(generation, registration))
+    {
+        // Never expose the remaining workers as a complete destination set.
+        registry.active.remove(db_path);
+    }
+}
+
+fn registered_destination_layouts(db_path: &PathBuf) -> Result<Vec<ConsolidatorLayout>, String> {
+    let key = destination_registry_key(db_path);
+    let registry = destination_layouts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pending) = registry.pending.get(&key) {
+        return Err(format!(
+            "destination registration is incomplete for {}: registered {} of {}",
+            key.display(),
+            pending.destinations.len(),
+            pending.expected_count
+        ));
+    }
+    let generation = registry
+        .active
+        .get(&key)
+        .ok_or_else(|| format!("no live destinations are registered for {}", key.display()))?;
+    let mut layouts = generation
+        .destinations
+        .values()
+        .map(|destination| destination.layout.clone())
+        .collect::<Vec<_>>();
+    layouts.sort_by_key(|layout| layout.dst_index);
+    Ok(layouts)
+}
 
 fn box_handle(h: Handle) -> jlong {
     Box::into_raw(Box::new(h)) as jlong
@@ -153,6 +327,7 @@ unsafe fn take_handle_box(handle: jlong) -> Option<Box<Handle>> {
 pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidator<'local>(
     mut env: JNIEnv<'local>,
     _cls: JClass<'local>,
+    db_path: JString<'local>,
     work_dir: JString<'local>,
     device_data_root: JString<'local>,
     device_id: JString<'local>,
@@ -166,6 +341,8 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidat
     dst_schema: JString<'local>,
     metadata_store_str: JString<'local>,
     stage_dir: JString<'local>,
+    dst_index: jint,
+    destination_count: jint,
     device_polling_interval_ms: jlong,
 ) -> jlong {
     guard(&mut env, 0, |env| {
@@ -177,6 +354,7 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidat
         // to the compat path and writes empty `.cdclog` segments.
         synclite::cdc_native::ensure_extracted();
 
+        let db_path = PathBuf::from(jstring_to_string(env, &db_path)?);
         let work_dir = PathBuf::from(jstring_to_string(env, &work_dir)?);
         let device_data_root = PathBuf::from(jstring_to_string(env, &device_data_root)?);
         let device_id = jstring_to_string(env, &device_id)?;
@@ -190,6 +368,15 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidat
         let dst_schema_opt = jstring_to_opt_string(env, &dst_schema)?;
         let metadata_store_s = jstring_to_string(env, &metadata_store_str)?;
         let stage_dir_opt = jstring_to_opt_string(env, &stage_dir)?;
+
+        if destination_count <= 0 {
+            return Err("destination_count must be greater than zero".to_string());
+        }
+        if dst_index <= 0 || dst_index > destination_count {
+            return Err(format!(
+                "dst_index must be in the range 1..={destination_count}, got {dst_index}"
+            ));
+        }
 
         let dst_type = parse_dst_type(&dst_type_s)?;
         let dst_sync_mode = parse_sync_mode(&dst_sync_mode_s)?;
@@ -213,7 +400,7 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidat
             device_name,
             device_type_s,
             database_name,
-            /* dst_index = */ 1,
+            dst_index,
             /* destination_apply_enabled = */ true,
             metadata_store,
             dst_type,
@@ -227,6 +414,7 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidat
             /* dst_delete_batch_size = */ 1000,
             /* cleanup_stage_files = */ true,
         );
+        layout.all_dst_indexes = (1..=destination_count).collect();
         layout.dst_database = dst_database_opt;
         layout.dst_schema = dst_schema_opt;
         if let Some(stage_dir_str) = stage_dir_opt {
@@ -239,8 +427,21 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidat
             layout.device_polling_interval_ms = device_polling_interval_ms as u64;
         }
 
+        let await_layout = layout.clone();
         let consolidator = Consolidator::spawn(layout).map_err(|e| e.to_string())?;
-        Ok(box_handle(consolidator))
+        let registration =
+            match register_destination_layout(&db_path, await_layout, destination_count) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    consolidator.shutdown();
+                    return Err(error);
+                }
+            };
+        Ok(box_handle(Handle {
+            consolidator,
+            db_path: destination_registry_key(&db_path),
+            registration,
+        }))
     })
 }
 
@@ -257,9 +458,10 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeNotifyStagePath
 ) {
     guard(&mut env, (), |env| {
         let path = PathBuf::from(jstring_to_string(env, &stage_path)?);
-        let consolidator = unsafe { handle_ref(handle) }
+        let handle = unsafe { handle_ref(handle) }
             .ok_or_else(|| "consolidator handle is null or closed".to_string())?;
-        consolidator
+        handle
+            .consolidator
             .notify_stage_path(path)
             .map_err(|e| e.to_string())
     })
@@ -278,9 +480,10 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeCatchUpStageDir
 ) {
     guard(&mut env, (), |env| {
         let dir = PathBuf::from(jstring_to_string(env, &stage_dir)?);
-        let consolidator = unsafe { handle_ref(handle) }
+        let handle = unsafe { handle_ref(handle) }
             .ok_or_else(|| "consolidator handle is null or closed".to_string())?;
-        consolidator
+        handle
+            .consolidator
             .catch_up_stage_dir(&dir)
             .map_err(|e| e.to_string())
     })
@@ -303,9 +506,10 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeNotifyBootstrap
     guard(&mut env, (), |env| {
         let backup = PathBuf::from(jstring_to_string(env, &backup_path)?);
         let metadata = PathBuf::from(jstring_to_string(env, &metadata_path)?);
-        let consolidator = unsafe { handle_ref(handle) }
+        let handle = unsafe { handle_ref(handle) }
             .ok_or_else(|| "consolidator handle is null or closed".to_string())?;
-        consolidator
+        handle
+            .consolidator
             .notify_bootstrap_ready(backup, metadata)
             .map_err(|e| e.to_string())
     })
@@ -323,6 +527,8 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeStopConsolidato
 ) {
     guard(&mut env, (), |_env| {
         if let Some(boxed) = unsafe { take_handle_box(handle) } {
+            unregister_destination_layout(&boxed.db_path, boxed.registration);
+            boxed.consolidator.shutdown();
             drop(boxed);
         }
         Ok(())
@@ -399,7 +605,7 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeReinitialize<'l
     })
 }
 
-/// Block until the in-process consolidator has applied every commit
+/// Block until every configured destination has applied every commit
 /// the device has produced, or `timeout_ms` elapses. 0 = no wait.
 #[no_mangle]
 pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeAwaitSync<'local>(
@@ -415,11 +621,12 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeAwaitSync<'loca
     })
 }
 
-/// Block until the consolidator's applied commit-id reaches
-/// `target_commit_id`. Caller (the Java logger) supplies the target
-/// because the Rust runtime cannot read `synclite_txn` from JDBC
-/// backends like Derby / H2 / HyperSQL where the table lives inside
-/// the backend's own DB file. 0 / negative target = no wait.
+/// Block until the minimum applied commit-id across all configured
+/// destinations reaches `target_commit_id`. Caller (the Java logger)
+/// supplies the target because the Rust runtime cannot read
+/// `synclite_txn` from JDBC backends like Derby / H2 / HyperSQL where
+/// the table lives inside the backend's own DB file. A non-positive
+/// target is already complete; a non-positive timeout means no deadline.
 #[no_mangle]
 pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeAwaitAppliedCommit<'local>(
     mut env: JNIEnv<'local>,
@@ -430,9 +637,24 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeAwaitAppliedCom
 ) {
     guard(&mut env, (), |env| {
         let path = jstring_to_string(env, &db_path)?;
-        let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
-        synclite::await_applied_commit(&path, target_commit_id, timeout)
-            .map_err(|e| e.to_string())
+        let timeout = (timeout_ms > 0).then(|| std::time::Duration::from_millis(timeout_ms as u64));
+        let layouts = registered_destination_layouts(&PathBuf::from(&path))?;
+        let current_thread = env
+            .call_static_method(
+                "java/lang/Thread",
+                "currentThread",
+                "()Ljava/lang/Thread;",
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| format!("failed to inspect the current Java thread: {error}"))?;
+        synclite::await_applied_commit_for_destinations_with_control(
+            &layouts,
+            target_commit_id,
+            timeout,
+            || java_thread_is_interrupted(env, &current_thread),
+        )
+        .map_err(|e| e.to_string())
     })
 }
 
@@ -463,7 +685,11 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSyncStatus<'loc
             .map_err(|e| format!("new_object_array: {e}"))?;
 
         let state_obj = env
-            .new_object("java/lang/Integer", "(I)V", &[jni::objects::JValue::Int(state_ord)])
+            .new_object(
+                "java/lang/Integer",
+                "(I)V",
+                &[jni::objects::JValue::Int(state_ord)],
+            )
             .map_err(|e| format!("new Integer: {e}"))?;
         env.set_object_array_element(&arr, 0, &state_obj)
             .map_err(|e| format!("set [0]: {e}"))?;
@@ -547,4 +773,86 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSyncLatency<'lo
             .map_err(|e| format!("set_long_array_region: {e}"))?;
         Ok(arr.into_raw())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_db_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("synclite-jni-registry-{label}-{nonce}.db"))
+    }
+
+    fn layout(db_path: &PathBuf, destination_index: i32, marker: &str) -> ConsolidatorLayout {
+        ConsolidatorLayout::new(
+            &db_path.with_extension("device"),
+            Some(db_path.with_extension(format!("work-{destination_index}"))),
+            "device-id",
+            "device-name",
+            "SQLITE",
+            "source.db",
+            destination_index,
+            true,
+            MetadataStore::Destination,
+            DstType::Sqlite,
+            DstSyncMode::Consolidation,
+            marker.to_string(),
+            1,
+            1,
+            false,
+            1,
+            1,
+            1,
+            true,
+        )
+    }
+
+    #[test]
+    fn registry_publishes_only_complete_destination_generations() {
+        let db_path = unique_db_path("complete");
+        let first = register_destination_layout(&db_path, layout(&db_path, 1, "first"), 2).unwrap();
+        assert!(registered_destination_layouts(&db_path)
+            .unwrap_err()
+            .contains("registered 1 of 2"));
+
+        let second =
+            register_destination_layout(&db_path, layout(&db_path, 2, "second"), 2).unwrap();
+        let layouts = registered_destination_layouts(&db_path).unwrap();
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].dst_index, 1);
+        assert_eq!(layouts[1].dst_index, 2);
+
+        unregister_destination_layout(&db_path, first);
+        assert!(registered_destination_layouts(&db_path).is_err());
+        unregister_destination_layout(&db_path, second);
+    }
+
+    #[test]
+    fn stale_handles_cannot_unregister_a_replacement_generation() {
+        let db_path = unique_db_path("replacement");
+        let old_first =
+            register_destination_layout(&db_path, layout(&db_path, 1, "old-1"), 2).unwrap();
+        let old_second =
+            register_destination_layout(&db_path, layout(&db_path, 2, "old-2"), 2).unwrap();
+
+        let new_first =
+            register_destination_layout(&db_path, layout(&db_path, 1, "new-1"), 2).unwrap();
+        let new_second =
+            register_destination_layout(&db_path, layout(&db_path, 2, "new-2"), 2).unwrap();
+
+        unregister_destination_layout(&db_path, old_first);
+        unregister_destination_layout(&db_path, old_second);
+        let layouts = registered_destination_layouts(&db_path).unwrap();
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].dst_connection_string, "new-1");
+        assert_eq!(layouts[1].dst_connection_string, "new-2");
+
+        unregister_destination_layout(&db_path, new_first);
+        unregister_destination_layout(&db_path, new_second);
+    }
 }

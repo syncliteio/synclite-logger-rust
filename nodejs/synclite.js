@@ -21,7 +21,8 @@ function toParamsJson(params) {
 }
 
 /**
- * Register a device + destination ahead of any `open(...)` call.
+ * Register a device with zero, one, or multiple destinations ahead of any
+ * `open(...)` call.
  *
  * Mirrors the Python `initialize(...)` keyword arguments. Accepts an options
  * object (preferred) or a pre-serialized JSON string.

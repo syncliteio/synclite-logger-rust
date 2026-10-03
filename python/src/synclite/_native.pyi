@@ -34,6 +34,8 @@ def initialize(
     db_path: str,
     destination: Optional[DestinationOptions] = None,
     config_path: Optional[str] = None,
+    *,
+    destinations: Optional[Sequence[DestinationOptions]] = None,
 ) -> None: ...
 
 

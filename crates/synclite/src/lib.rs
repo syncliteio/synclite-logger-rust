@@ -58,12 +58,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use logger_archiver::{Archiver, FsArchiver};
-use logger_db_duckdb::{
-    DuckDbDevice, DuckDbDeviceConfig,
-};
-use logger_db_sqlite::{
-    SqliteDevice, SqliteDeviceConfig,
-};
+use logger_db_duckdb::{DuckDbDevice, DuckDbDeviceConfig};
+use logger_db_sqlite::{SqliteDevice, SqliteDeviceConfig};
 use logger_db_traits::DbDevice;
 
 // Convenience re-exports so downstream apps only need `synclite` in
@@ -72,44 +68,46 @@ pub use logger_core::{Backend, DeviceType, Error, Result};
 pub use logger_db_traits::{Row, Value};
 use logger_shipper::{LogCleaner, LogShipper, ShipperConfig};
 
-#[path = "logger/backup.rs"]
-mod backup;
 #[path = "logger/app_lock.rs"]
 mod app_lock;
+#[path = "logger/backup.rs"]
+mod backup;
+/// Embedded `synclitecdc` native helper. Public so non-facade entry
+/// points (e.g. the Java JNI binding) can extract it before spawning a
+/// consolidator directly.
+pub mod cdc_native;
+mod consolidator;
 #[path = "logger/layout.rs"]
 mod layout;
 #[path = "logger/metadata.rs"]
 mod metadata;
 #[path = "logger/mover.rs"]
 mod mover;
-#[path = "logger/sql_split.rs"]
-mod sql_split;
-mod consolidator;
-/// Embedded `synclitecdc` native helper. Public so non-facade entry
-/// points (e.g. the Java JNI binding) can extract it before spawning a
-/// consolidator directly.
-pub mod cdc_native;
 /// Pause / resume sync API. Halts shipping + consolidation while the
 /// in-process logger keeps appending segments locally.
 pub mod pause;
 mod reinitialize;
+#[path = "logger/sql_split.rs"]
+mod sql_split;
 /// Sync status / latency / statistics inspection helpers.
 pub mod status;
 
 pub use pause::{is_sync_paused, pause_sync, resume_sync};
 pub use reinitialize::reinitialize;
-pub use status::{sync_latency, sync_statistics, sync_status, SyncLatency, SyncState, SyncStatistics, SyncStatus};
+pub use status::{
+    sync_latency, sync_statistics, sync_status, SyncLatency, SyncState, SyncStatistics, SyncStatus,
+};
 
 use app_lock::AppLock;
 use consolidator::{
-    Consolidator, ConsolidatorLayout, DstDataTypeMapping,
-    DstDeviceSchemaNamePolicy, DstIdempotentDataIngestionMethod,
-    DstObjectInitMode, FilterMapperRules, MetadataStore, ValueMapperRules,
+    Consolidator, ConsolidatorLayout, DstDataTypeMapping, DstDeviceSchemaNamePolicy,
+    DstIdempotentDataIngestionMethod, DstObjectInitMode, FilterMapperRules, MetadataStore,
+    ValueMapperRules,
 };
 use layout::{ArchiveLayout, DeviceLayout};
 use metadata::Metadata;
 
-pub use consolidator::{DstType, DstSyncMode};
+pub use consolidator::{DstSyncMode, DstType};
 pub use logger_config::SyncLiteConfig;
 
 /// SyncLite-wrapped `duckdb`-style connection and statement APIs.
@@ -138,10 +136,7 @@ pub const MAX_DEVICE_NAME_LEN: usize = 64;
 /// stripping any non-alphanumeric characters. Falls back to `"device"`
 /// when the stem is empty or yields no alphanumeric characters.
 pub fn derive_device_name(db_path: &Path) -> String {
-    let stem = db_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let stem = db_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let cleaned: String = stem.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     if cleaned.is_empty() {
         "device".to_string()
@@ -225,6 +220,34 @@ impl Default for DestinationOptions {
             dst_schema: None,
             dst_sync_mode: DstSyncMode::Consolidation,
         }
+    }
+}
+
+/// Single- or multi-destination input accepted by [`initialize`].
+///
+/// Existing calls that pass `Option<DestinationOptions>` remain valid. Pass a
+/// `Vec<DestinationOptions>` to initialize an ordered destination list.
+#[doc(hidden)]
+pub enum Destinations {
+    Single(Option<DestinationOptions>),
+    Multiple(Vec<DestinationOptions>),
+}
+
+impl From<Option<DestinationOptions>> for Destinations {
+    fn from(destination: Option<DestinationOptions>) -> Self {
+        Self::Single(destination)
+    }
+}
+
+impl From<DestinationOptions> for Destinations {
+    fn from(destination: DestinationOptions) -> Self {
+        Self::Single(Some(destination))
+    }
+}
+
+impl From<Vec<DestinationOptions>> for Destinations {
+    fn from(destinations: Vec<DestinationOptions>) -> Self {
+        Self::Multiple(destinations)
     }
 }
 
@@ -312,6 +335,42 @@ pub struct Logger {
     _tracer: Arc<synclite_observability::Tracer>,
 }
 
+/// Owns destination workers only while `Logger::open_with` is starting them.
+/// If any later destination fails to start, dropping this guard explicitly
+/// shuts down every earlier worker. On success `finish` transfers ownership to
+/// the logger and disarms rollback by emptying the guard.
+struct ConsolidatorStartupGuard {
+    workers: Vec<Arc<Consolidator>>,
+}
+
+impl ConsolidatorStartupGuard {
+    fn new() -> Self {
+        Self {
+            workers: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, worker: Arc<Consolidator>) {
+        self.workers.push(worker);
+    }
+
+    fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn finish(mut self) -> Vec<Arc<Consolidator>> {
+        std::mem::take(&mut self.workers)
+    }
+}
+
+impl Drop for ConsolidatorStartupGuard {
+    fn drop(&mut self) {
+        for worker in self.workers.iter().rev() {
+            worker.shutdown();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestinationKind {
     Fs,
@@ -346,8 +405,7 @@ const DEFAULT_BATCH_CAPACITY: usize = 4096;
 static LIVE_COMMIT_TRACKERS: OnceLock<Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicI64>>>> =
     OnceLock::new();
 
-fn live_commit_trackers(
-) -> &'static Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicI64>>> {
+fn live_commit_trackers() -> &'static Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicI64>>> {
     LIVE_COMMIT_TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -429,17 +487,41 @@ impl std::fmt::Debug for Logger {
 }
 
 /// Initialize a SyncLite device using required `device_type`,
-/// `device_name`, and `db_path`, plus optional overrides carried in
-/// [`SyncLiteOptions`].
+/// `device_name`, and `db_path`, a single optional destination or an ordered
+/// destination vector, plus optional overrides carried in [`SyncLiteOptions`].
+///
+/// Existing callers can pass `None` or `Some(destination)`. For fan-out, pass
+/// `vec![first_destination, second_destination]`; list validation and worker
+/// startup are sequential and preserve the supplied one-based order.
 ///
 /// Idempotent within the current process for the same database path.
 /// This is the top-level entry point; it is not specific to the logger
 /// subsystem (also brings up the shipper and consolidator pipelines).
-pub fn initialize<P: AsRef<Path>>(
+pub fn initialize<P, D>(
     device_type: DeviceType,
     device_name: &str,
     db_path: P,
-    destination: Option<DestinationOptions>,
+    destinations: D,
+    options: SyncLiteOptions,
+) -> Result<()>
+where
+    P: AsRef<Path>,
+    D: Into<Destinations>,
+{
+    initialize_internal(
+        device_type,
+        device_name,
+        db_path.as_ref(),
+        destinations.into(),
+        options,
+    )
+}
+
+fn initialize_internal(
+    device_type: DeviceType,
+    device_name: &str,
+    db_path: &Path,
+    destinations: Destinations,
     options: SyncLiteOptions,
 ) -> Result<()> {
     cdc_native::ensure_extracted();
@@ -464,9 +546,16 @@ pub fn initialize<P: AsRef<Path>>(
     cfg.device_name = Some(device_name.to_string());
     let _ = options.device_name;
 
-    apply_destination_initialize_options(&mut cfg, destination)?;
+    match destinations {
+        Destinations::Single(destination) => {
+            apply_destination_initialize_options(&mut cfg, destination)?;
+        }
+        Destinations::Multiple(destinations) => {
+            apply_destinations_initialize_options(&mut cfg, destinations)?;
+        }
+    }
 
-    let normalized_db_path = normalize_db_path(db_path.as_ref())?;
+    let normalized_db_path = normalize_db_path(db_path)?;
     let backend = device_type.backend();
     cfg.backend = Some(backend);
     cfg.device_type = Some(device_type);
@@ -486,9 +575,9 @@ pub fn initialize<P: AsRef<Path>>(
     // file is removed.
     pause::maybe_run_trigger(&normalized_db_path, device_name)?;
 
-    // Merge keys persisted by a prior `synclite::initialize` into
-    // cfg.extra (e.g. metadata-store / filter-mapper / retry policy);
-    // explicit caller-supplied keys win.
+    // Reuse persisted destinations only when none were explicitly supplied.
+    // An explicit destination configuration is a replacement snapshot, not
+    // an overlay that can revive removed destinations or old layout options.
     hydrate_initialize_config_from_metadata(&normalized_db_path, &mut cfg);
 
     // Consume the one-shot reinit sentinel: if a prior
@@ -539,10 +628,11 @@ pub fn initialize<P: AsRef<Path>>(
 /// Completion is decided by comparing two persisted commit ids:
 ///   * `source` = `MAX(commit_id)` from the device's `synclite_txn`
 ///     table (advanced by every successful user commit).
-///   * `applied` = `commit_id` recorded in the consolidator's
-///     `synclite_checkpoint` (advanced after every applied segment),
-///     with `device_status.last_consolidated_commit_id` as fallback.
-/// Returns `Ok` once `applied >= source`.
+///   * `applied` = the minimum `commit_id` across every configured
+///     destination's `synclite_checkpoint`, read from its configured
+///     LOCAL or DESTINATION metadata store (which may contact the DB).
+/// Returns `Ok` once every destination has `applied >= source`.
+/// Missing or unreachable checkpoints never count as completion.
 ///
 /// Two short-circuit cases return `Ok` immediately:
 ///   1. **No user commits yet** — `source == 0` (only `initialize`
@@ -573,15 +663,13 @@ pub fn await_sync<P: AsRef<Path>>(db_path: P, timeout: std::time::Duration) -> R
     // Edge case: this device was initialized without any destination
     // configured. There is no consolidator that could ever advance
     // the applied commit id, so sync is trivially "done".
-    let md = Metadata::open_or_create(&layout.metadata_path)?;
-    let sync_configured = md.get_i64("sync_configured")?.unwrap_or(0) != 0;
-    drop(md);
+    let sync_configured = status::sync_configured(&layout)?;
     if !sync_configured {
         return Ok(());
     }
 
     let poll = std::time::Duration::from_millis(100);
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now().checked_add(timeout);
 
     loop {
         // Prefer the in-memory tracker advanced by Logger::commit. It
@@ -598,27 +686,37 @@ pub fn await_sync<P: AsRef<Path>>(db_path: P, timeout: std::time::Duration) -> R
         if source == 0 {
             return Ok(());
         }
-        let applied = status::read_applied_commit_id(&layout).unwrap_or(0);
-        if applied >= source {
+        // read_applied_commit_id returns the minimum persisted checkpoint
+        // across every configured destination. Unknown progress for even one
+        // destination is reported as None and therefore cannot complete the wait.
+        let minimum_applied = status::read_applied_commit_id_before(&layout, deadline).unwrap_or(0);
+        if minimum_applied >= source {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
             return Err(Error::Config(format!(
-                "await_sync: timed out after {:?} (source_commit_id={}, applied_commit_id={})",
-                timeout, source, applied
+                "await_sync: timed out after {:?} (source_commit_id={}, minimum_applied_commit_id={})",
+                timeout, source, minimum_applied
             )));
         }
-        std::thread::sleep(poll);
+        let sleep_for = deadline
+            .map(|value| {
+                value
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(poll)
+            })
+            .unwrap_or(poll);
+        std::thread::sleep(sleep_for);
     }
 }
 
 /// Like [`await_sync`] but the caller supplies the `target_commit_id`
-/// to wait for. The Rust runtime does not need to crack open the
-/// source DB — useful when the source backend is a non-SQLite store
-/// (Derby / H2 / HyperSQL) where `synclite_txn` lives inside the
-/// backend's own DB file and is unreachable via rusqlite. The Java
-/// logger reads it from its own in-memory commit-id tracker and
-/// passes the value through the JNI surface.
+/// to wait for. Completion still requires the minimum checkpoint across
+/// every configured destination to reach that target. The Rust runtime
+/// does not need to crack open the source DB — useful when the source
+/// backend is a non-SQLite store (Derby / H2 / HyperSQL) where
+/// `synclite_txn` lives inside the backend's own DB file and is unreachable
+/// via rusqlite. The Java logger reads it and passes the value through JNI.
 pub fn await_applied_commit<P: AsRef<Path>>(
     db_path: P,
     target_commit_id: i64,
@@ -634,9 +732,7 @@ pub fn await_applied_commit<P: AsRef<Path>>(
         )));
     }
 
-    let md = Metadata::open_or_create(&layout.metadata_path)?;
-    let sync_configured = md.get_i64("sync_configured")?.unwrap_or(0) != 0;
-    drop(md);
+    let sync_configured = status::sync_configured(&layout)?;
     if !sync_configured {
         return Ok(());
     }
@@ -646,20 +742,133 @@ pub fn await_applied_commit<P: AsRef<Path>>(
     }
 
     let poll = std::time::Duration::from_millis(100);
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now().checked_add(timeout);
 
     loop {
-        let applied = status::read_applied_commit_id(&layout).unwrap_or(0);
-        if applied >= target_commit_id {
+        // One lagging, missing, or unreachable destination keeps this minimum
+        // below the requested target, so success always means all destinations.
+        let minimum_applied = status::read_applied_commit_id_before(&layout, deadline).unwrap_or(0);
+        if minimum_applied >= target_commit_id {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
             return Err(Error::Config(format!(
-                "await_applied_commit: timed out after {:?} (target_commit_id={}, applied_commit_id={})",
-                timeout, target_commit_id, applied
+                "await_applied_commit: timed out after {:?} (target_commit_id={}, minimum_applied_commit_id={})",
+                timeout, target_commit_id, minimum_applied
             )));
         }
-        std::thread::sleep(poll);
+        let sleep_for = deadline
+            .map(|value| {
+                value
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(poll)
+            })
+            .unwrap_or(poll);
+        std::thread::sleep(sleep_for);
+    }
+}
+
+/// Wait until every supplied embedded destination layout reaches a target.
+///
+/// This is the Rust-owned wait path used by the Java JNI bridge. Each poll
+/// reads every destination's persisted checkpoint and success is returned only
+/// when all of them are at or beyond `target_commit_id`. Missing, unreadable,
+/// and unseeded checkpoints remain pending. One deadline is shared by the
+/// complete destination collection.
+#[doc(hidden)]
+pub fn await_applied_commit_for_destinations(
+    destinations: &[ConsolidatorLayout],
+    target_commit_id: i64,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    await_applied_commit_for_destinations_with_control(
+        destinations,
+        target_commit_id,
+        Some(timeout),
+        || false,
+    )
+}
+
+/// Controlled form of [`await_applied_commit_for_destinations`] used by JNI.
+/// `None` preserves Java's historical unbounded-wait behavior, and
+/// `is_cancelled` lets the native loop observe Java thread interruption.
+#[doc(hidden)]
+pub fn await_applied_commit_for_destinations_with_control<F>(
+    destinations: &[ConsolidatorLayout],
+    target_commit_id: i64,
+    timeout: Option<std::time::Duration>,
+    mut is_cancelled: F,
+) -> Result<()>
+where
+    F: FnMut() -> bool,
+{
+    if target_commit_id <= 0 {
+        return Ok(());
+    }
+    if destinations.is_empty() {
+        return Err(Error::Config(
+            "await_applied_commit: no destinations were supplied".to_string(),
+        ));
+    }
+
+    let poll = std::time::Duration::from_millis(100);
+    let deadline = timeout.and_then(|value| std::time::Instant::now().checked_add(value));
+
+    loop {
+        if is_cancelled() {
+            return Err(Error::Config(
+                "await_applied_commit: interrupted while waiting".to_string(),
+            ));
+        }
+
+        let mut checkpoints = Vec::with_capacity(destinations.len());
+        for layout in destinations {
+            if is_cancelled() {
+                return Err(Error::Config(
+                    "await_applied_commit: interrupted while waiting".to_string(),
+                ));
+            }
+            let remaining =
+                deadline.map(|value| value.saturating_duration_since(std::time::Instant::now()));
+            checkpoints.push((
+                layout.dst_index,
+                status::read_applied_commit_id_for_layout_with_timeout(layout, remaining),
+            ));
+        }
+
+        if checkpoints
+            .iter()
+            .all(|(_, applied)| applied.is_some_and(|value| value >= target_commit_id))
+        {
+            return Ok(());
+        }
+
+        if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
+            let progress = checkpoints
+                .iter()
+                .map(|(index, applied)| match applied {
+                    Some(value) => format!("{index}={value}"),
+                    None => format!("{index}=unknown"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Config(format!(
+                "await_applied_commit: timed out after {:?} waiting for all destinations \
+                 (target_commit_id={}, destination_checkpoints=[{}])",
+                timeout.unwrap_or_default(),
+                target_commit_id,
+                progress
+            )));
+        }
+
+        let sleep_for = deadline
+            .map(|value| {
+                value
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(poll)
+            })
+            .unwrap_or(poll);
+        std::thread::sleep(sleep_for);
     }
 }
 
@@ -804,18 +1013,20 @@ impl Logger {
             // Persist a marker so path-only callers (e.g. await_sync)
             // can tell a "device with no destination configured" apart
             // from a "device whose consolidator hasn't applied yet".
+            // Direct Logger::open_with callers also need the full destination
+            // configuration available to path-only status/await helpers.
+            persist_initialize_config_to_metadata(&db_path, &cfg)?;
             Metadata::open_or_create(&layout.metadata_path)?.put_i64("sync_configured", 1)?;
             let dst_indices = parse_cfg_destination_indices(&cfg);
             let multi_destination = dst_indices.len() > 1;
             let all_dst_indexes: Vec<i32> = dst_indices.iter().map(|i| *i as i32).collect();
-            let destination_sync_mode = parse_cfg_destination_sync_mode(&cfg);
             let device_data_root = cfg
                 .extra
                 .get(DEVICE_DATA_ROOT_KEY)
                 .map(PathBuf::from)
                 .unwrap_or_else(default_device_data_root);
             std::fs::create_dir_all(&device_data_root)?;
-            let mut workers = Vec::new();
+            let mut startup = ConsolidatorStartupGuard::new();
 
             // Java parity: PrometheusDumper startup
             // (ConfLoader.enablePrometheusStatisticsPublisher /
@@ -862,14 +1073,13 @@ impl Logger {
                                 .to_string(),
                         ));
                     }
-                    consolidator_runtime::monitor::start_prometheus_publisher(
-                        url,
-                        interval as u64,
-                    );
+                    consolidator_runtime::monitor::start_prometheus_publisher(url, interval as u64);
                 }
             }
 
             for dst_index in dst_indices {
+                let destination_sync_mode =
+                    parse_cfg_destination_sync_mode_for_index(&cfg, dst_index);
                 let metadata_store = parse_cfg_string_for_index(
                     &cfg,
                     &["metadata-store", "dst-metadata-store"],
@@ -887,52 +1097,31 @@ impl Logger {
                 let dst_type = parse_cfg_destination_backend_for_index(&cfg, dst_index);
                 let dst_alias = parse_cfg_string_for_index(&cfg, &["dst-alias"], dst_index)
                     .unwrap_or_else(|| format!("DB-{dst_index}"));
-                let dst_connection_string =
-                    parse_cfg_destination_connection_for_index(
-                        &cfg,
-                        dst_index,
-                        dst_type,
-                        device_data_root
-                            .join(&dst_alias)
-                            .join(format!("synclite_destination_apply_{dst_index}.db")),
-                    );
+                let dst_connection_string = parse_cfg_destination_connection_for_index(
+                    &cfg,
+                    dst_index,
+                    dst_type,
+                    device_data_root
+                        .join(&dst_alias)
+                        .join(format!("synclite_destination_apply_{dst_index}.db")),
+                );
 
-                let dst_oper_retry_count = parse_cfg_u32_for_index(
-                    &cfg,
-                    &["dst-oper-retry-count"],
-                    dst_index,
-                    3,
-                );
-                let dst_oper_retry_interval_ms = parse_cfg_u64_for_index(
-                    &cfg,
-                    &["dst-oper-retry-interval-ms"],
-                    dst_index,
-                    1000,
-                );
+                let dst_oper_retry_count =
+                    parse_cfg_u32_for_index(&cfg, &["dst-oper-retry-count"], dst_index, 3);
+                let dst_oper_retry_interval_ms =
+                    parse_cfg_u64_for_index(&cfg, &["dst-oper-retry-interval-ms"], dst_index, 1000);
                 let dst_idempotent_data_ingestion = parse_cfg_bool_for_index(
                     &cfg,
                     &["dst-idempotent-data-ingestion"],
                     dst_index,
                     destination_sync_mode == DstSyncMode::Replication,
                 );
-                let dst_insert_batch_size = parse_cfg_u32_for_index(
-                    &cfg,
-                    &["dst-insert-batch-size"],
-                    dst_index,
-                    1000,
-                );
-                let dst_update_batch_size = parse_cfg_u32_for_index(
-                    &cfg,
-                    &["dst-update-batch-size"],
-                    dst_index,
-                    1000,
-                );
-                let dst_delete_batch_size = parse_cfg_u32_for_index(
-                    &cfg,
-                    &["dst-delete-batch-size"],
-                    dst_index,
-                    1000,
-                );
+                let dst_insert_batch_size =
+                    parse_cfg_u32_for_index(&cfg, &["dst-insert-batch-size"], dst_index, 1000);
+                let dst_update_batch_size =
+                    parse_cfg_u32_for_index(&cfg, &["dst-update-batch-size"], dst_index, 1000);
+                let dst_delete_batch_size =
+                    parse_cfg_u32_for_index(&cfg, &["dst-delete-batch-size"], dst_index, 1000);
 
                 // Java parity: per-destination work dir is
                 // <device-data-root>/<dst-alias> when there are multiple
@@ -1020,12 +1209,8 @@ impl Logger {
                 }
                 // Java parity: per-destination value-mapper rules
                 // (`dst-enable-value-mapper-N`, `dst-value-mappings-file-N`).
-                let enable_value_mapper = parse_cfg_bool_for_index(
-                    &cfg,
-                    &["dst-enable-value-mapper"],
-                    dst_index,
-                    false,
-                );
+                let enable_value_mapper =
+                    parse_cfg_bool_for_index(&cfg, &["dst-enable-value-mapper"], dst_index, false);
                 if enable_value_mapper {
                     let mappings_file = parse_cfg_string_for_index(
                         &cfg,
@@ -1106,11 +1291,9 @@ impl Logger {
                 }
 
                 // Java parity: Tier B — `dst-device-schema-name-policy-N`.
-                if let Some(raw) = parse_cfg_string_for_index(
-                    &cfg,
-                    &["dst-device-schema-name-policy"],
-                    dst_index,
-                ) {
+                if let Some(raw) =
+                    parse_cfg_string_for_index(&cfg, &["dst-device-schema-name-policy"], dst_index)
+                {
                     consolidator_layout.dst_device_schema_name_policy =
                         DstDeviceSchemaNamePolicy::parse(raw.trim()).ok_or_else(|| {
                             Error::Config(format!(
@@ -1120,12 +1303,8 @@ impl Logger {
                 }
 
                 // Java parity: Tier B — small scalar knobs.
-                consolidator_layout.dst_connection_timeout_s = parse_cfg_u32_for_index(
-                    &cfg,
-                    &["dst-connection-timeout-s"],
-                    dst_index,
-                    30,
-                );
+                consolidator_layout.dst_connection_timeout_s =
+                    parse_cfg_u32_for_index(&cfg, &["dst-connection-timeout-s"], dst_index, 30);
                 consolidator_layout.dst_skip_failed_log_files = parse_cfg_bool_for_index(
                     &cfg,
                     &["dst-skip-failed-log-files"],
@@ -1138,18 +1317,10 @@ impl Logger {
                     dst_index,
                     false,
                 );
-                consolidator_layout.dst_quote_object_names = parse_cfg_bool_for_index(
-                    &cfg,
-                    &["dst-quote-object-names"],
-                    dst_index,
-                    false,
-                );
-                consolidator_layout.dst_quote_column_names = parse_cfg_bool_for_index(
-                    &cfg,
-                    &["dst-quote-column-names"],
-                    dst_index,
-                    false,
-                );
+                consolidator_layout.dst_quote_object_names =
+                    parse_cfg_bool_for_index(&cfg, &["dst-quote-object-names"], dst_index, false);
+                consolidator_layout.dst_quote_column_names =
+                    parse_cfg_bool_for_index(&cfg, &["dst-quote-column-names"], dst_index, false);
                 consolidator_layout.dst_use_catalog_scope_resolution = parse_cfg_bool_for_index(
                     &cfg,
                     &["dst-use-catalog-scope-resolution"],
@@ -1188,12 +1359,8 @@ impl Logger {
                         .unwrap_or_default();
 
                 // Java parity: Tier B — `dst-enable-triggers-N` + `dst-triggers-file-N`.
-                consolidator_layout.dst_enable_triggers = parse_cfg_bool_for_index(
-                    &cfg,
-                    &["dst-enable-triggers"],
-                    dst_index,
-                    false,
-                );
+                consolidator_layout.dst_enable_triggers =
+                    parse_cfg_bool_for_index(&cfg, &["dst-enable-triggers"], dst_index, false);
                 if consolidator_layout.dst_enable_triggers {
                     let triggers_file = parse_cfg_string_for_index(
                         &cfg,
@@ -1211,18 +1378,18 @@ impl Logger {
                     consolidator_layout.dst_triggers_file = Some(trig_path);
                 }
 
-                workers.push(Consolidator::spawn(consolidator_layout)?);
+                startup.push(Consolidator::spawn(consolidator_layout)?);
             }
 
             // Java parity: each spawned per-destination consolidator
             // counts as one initialized + registered device for
             // Monitor.PrometheusDumper.
             let m = consolidator_runtime::monitor::monitor();
-            m.incr_registered_device_cnt(workers.len() as i64);
-            m.incr_initialized_device_cnt(workers.len() as i64);
-            m.incr_initialization_cnt(workers.len() as i64);
+            m.incr_registered_device_cnt(startup.len() as i64);
+            m.incr_initialized_device_cnt(startup.len() as i64);
+            m.incr_initialization_cnt(startup.len() as i64);
 
-            workers
+            startup.finish()
         } else {
             Vec::new()
         };
@@ -1277,8 +1444,7 @@ impl Logger {
 
         let device: Box<dyn DbDevice> = match backend {
             Backend::Sqlite => {
-                let mut dcfg =
-                    SqliteDeviceConfig::new(db_path.clone(), layout.device_home.clone());
+                let mut dcfg = SqliteDeviceConfig::new(db_path.clone(), layout.device_home.clone());
                 dcfg.resume_dir = Some(archive.stage_subdir.clone());
                 dcfg.on_segment_ready = Some(cb);
                 dcfg.log_segment_page_size = log_segment_page_size;
@@ -1295,8 +1461,7 @@ impl Logger {
                 Box::new(SqliteDevice::open(dcfg)?)
             }
             Backend::DuckDb => {
-                let mut dcfg =
-                    DuckDbDeviceConfig::new(db_path.clone(), layout.device_home.clone());
+                let mut dcfg = DuckDbDeviceConfig::new(db_path.clone(), layout.device_home.clone());
                 dcfg.resume_dir = Some(archive.stage_subdir.clone());
                 dcfg.on_segment_ready = Some(cb);
                 dcfg.log_segment_page_size = log_segment_page_size;
@@ -1415,7 +1580,11 @@ impl Logger {
     }
 
     /// Execute a prepared batch directly against the wrapped device.
-    pub fn execute_prepared_batch(&mut self, sql: &str, batch_params: &[Vec<Value>]) -> Result<Vec<u64>> {
+    pub fn execute_prepared_batch(
+        &mut self,
+        sql: &str,
+        batch_params: &[Vec<Value>],
+    ) -> Result<Vec<u64>> {
         let backend = self.backend();
         if backend == Backend::DuckDb || backend == Backend::Sqlite {
             self.pre_user_execute_batch(sql, batch_params)?;
@@ -1532,17 +1701,18 @@ fn should_enable_event_consolidator(device_type: DeviceType) -> bool {
 /// `initialize` was given a `DestinationOptions`.
 fn has_any_destination_config(cfg: &SyncLiteConfig) -> bool {
     if !should_enable_event_consolidator(
-        cfg.device_type
-            .unwrap_or_else(|| DeviceType::default_for_backend(cfg.backend.unwrap_or(Backend::Sqlite))),
+        cfg.device_type.unwrap_or_else(|| {
+            DeviceType::default_for_backend(cfg.backend.unwrap_or(Backend::Sqlite))
+        }),
     ) {
         return false;
     }
     if cfg.extra.contains_key("dst-type") || cfg.extra.contains_key("dst-connection-string") {
         return true;
     }
-    cfg.extra.keys().any(|k| {
-        k.starts_with("dst-type-") || k.starts_with("dst-connection-string-")
-    })
+    cfg.extra
+        .keys()
+        .any(|k| k.starts_with("dst-type-") || k.starts_with("dst-connection-string-"))
 }
 
 fn parse_destination_specs(extra: &HashMap<String, String>) -> Result<Vec<DestinationSpec>> {
@@ -1650,7 +1820,11 @@ fn parse_cfg_bool(cfg: &SyncLiteConfig, keys: &[&str], default: bool) -> bool {
     default
 }
 
-fn parse_cfg_string_for_index(cfg: &SyncLiteConfig, keys: &[&str], dst_index: usize) -> Option<String> {
+fn parse_cfg_string_for_index(
+    cfg: &SyncLiteConfig,
+    keys: &[&str],
+    dst_index: usize,
+) -> Option<String> {
     for key in keys {
         let indexed = format!("{key}-{dst_index}");
         if let Some(v) = cfg.extra.get(&indexed) {
@@ -1895,74 +2069,110 @@ fn apply_destination_initialize_options(
     destination: Option<DestinationOptions>,
 ) -> Result<()> {
     if let Some(destination) = destination {
-        let DestinationOptions {
-            dst_type,
-            dst_connection_string,
-            dst_database,
-            dst_schema,
-            dst_sync_mode,
-        } = destination;
+        apply_destination_initialize_option(cfg, destination, None)?;
+    }
+    Ok(())
+}
 
-        // Java parity: catalog/schema concepts vary per destination engine.
-        // SQLite is a single-file engine and has no catalog/schema concepts —
-        // reject them so callers do not silently lose state.
-        let db = dst_database
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let sch = dst_schema
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+fn apply_destinations_initialize_options(
+    cfg: &mut SyncLiteConfig,
+    destinations: Vec<DestinationOptions>,
+) -> Result<()> {
+    if destinations.is_empty() {
+        return Err(Error::Config(
+            "destinations must contain at least one destination".to_string(),
+        ));
+    }
+    let mut staged = cfg.clone();
+    for (offset, destination) in destinations.into_iter().enumerate() {
+        apply_destination_initialize_option(&mut staged, destination, Some(offset + 1))?;
+    }
+    *cfg = staged;
+    Ok(())
+}
 
-        match dst_type {
-            DstType::Sqlite => {
-                if db.is_some() || sch.is_some() {
-                    return Err(Error::Config(
-                        "dst-database / dst-schema are not supported for dst-type=SQLITE".to_string(),
-                    ));
-                }
-            }
-            DstType::Postgres => {
-                if db.is_none() {
-                    return Err(Error::Config(
-                        "dst-database is required for dst-type=POSTGRES".to_string(),
-                    ));
-                }
-                if sch.is_none() {
-                    return Err(Error::Config(
-                        "dst-schema is required for dst-type=POSTGRES".to_string(),
-                    ));
-                }
-            }
-            DstType::DuckDb => {
-                if db.is_none() {
-                    return Err(Error::Config(
-                        "dst-database is required for dst-type=DUCKDB".to_string(),
-                    ));
-                }
-                // schema optional for DuckDB (defaults to `main`).
+fn apply_destination_initialize_option(
+    cfg: &mut SyncLiteConfig,
+    destination: DestinationOptions,
+    dst_index: Option<usize>,
+) -> Result<()> {
+    let DestinationOptions {
+        dst_type,
+        dst_connection_string,
+        dst_database,
+        dst_schema,
+        dst_sync_mode,
+    } = destination;
+
+    let db = dst_database
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let sch = dst_schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let context = dst_index
+        .map(|index| format!("destination {index}: "))
+        .unwrap_or_default();
+    let connection_string = dst_connection_string.trim();
+    if connection_string.is_empty() {
+        return Err(Error::Config(format!(
+            "{context}dst-connection-string must not be empty"
+        )));
+    }
+
+    match dst_type {
+        DstType::Sqlite => {
+            if db.is_some() || sch.is_some() {
+                return Err(Error::Config(format!(
+                    "{context}dst-database / dst-schema are not supported for dst-type=SQLITE"
+                )));
             }
         }
+        DstType::Postgres => {
+            if db.is_none() {
+                return Err(Error::Config(format!(
+                    "{context}dst-database is required for dst-type=POSTGRES"
+                )));
+            }
+            if sch.is_none() {
+                return Err(Error::Config(format!(
+                    "{context}dst-schema is required for dst-type=POSTGRES"
+                )));
+            }
+        }
+        DstType::DuckDb => {
+            if db.is_none() {
+                return Err(Error::Config(format!(
+                    "{context}dst-database is required for dst-type=DUCKDB"
+                )));
+            }
+        }
+    }
 
-        cfg.extra.insert(
-            "dst-type".to_string(),
-            destination_backend_to_cfg_value(dst_type),
-        );
-        cfg.extra
-            .insert("dst-connection-string".to_string(), dst_connection_string);
-        cfg.extra.insert(
-            "dst-sync-mode".to_string(),
-            destination_sync_mode_to_cfg_value(dst_sync_mode),
-        );
-        if let Some(d) = db {
-            cfg.extra.insert("dst-database".to_string(), d);
-        }
-        if let Some(s) = sch {
-            cfg.extra.insert("dst-schema".to_string(), s);
-        }
+    let suffix = dst_index
+        .map(|index| format!("-{index}"))
+        .unwrap_or_default();
+    cfg.extra.insert(
+        format!("dst-type{suffix}"),
+        destination_backend_to_cfg_value(dst_type),
+    );
+    cfg.extra.insert(
+        format!("dst-connection-string{suffix}"),
+        connection_string.to_string(),
+    );
+    cfg.extra.insert(
+        format!("dst-sync-mode{suffix}"),
+        destination_sync_mode_to_cfg_value(dst_sync_mode),
+    );
+    if let Some(database) = db {
+        cfg.extra.insert(format!("dst-database{suffix}"), database);
+    }
+    if let Some(schema) = sch {
+        cfg.extra.insert(format!("dst-schema{suffix}"), schema);
     }
     Ok(())
 }
@@ -1982,18 +2192,16 @@ fn destination_sync_mode_to_cfg_value(mode: DstSyncMode) -> String {
     }
 }
 
-fn parse_cfg_destination_sync_mode(cfg: &SyncLiteConfig) -> DstSyncMode {
-    for key in ["dst-sync-mode"] {
-        if let Some(v) = cfg.extra.get(key) {
-            let normalized = v.trim().to_ascii_uppercase();
-            return match normalized.as_str() {
-                "REPLICARION" => DstSyncMode::Replication,
-                "REPLICATION" => DstSyncMode::Replication,
-                _ => DstSyncMode::Consolidation,
-            };
-        }
-    }
-    DstSyncMode::Consolidation
+fn parse_cfg_destination_sync_mode_for_index(
+    cfg: &SyncLiteConfig,
+    dst_index: usize,
+) -> DstSyncMode {
+    parse_cfg_string_for_index(cfg, &["dst-sync-mode"], dst_index)
+        .map(|value| match value.trim().to_ascii_uppercase().as_str() {
+            "REPLICARION" | "REPLICATION" => DstSyncMode::Replication,
+            _ => DstSyncMode::Consolidation,
+        })
+        .unwrap_or(DstSyncMode::Consolidation)
 }
 
 pub(crate) fn default_config_for_backend(db_path: PathBuf, dst_type: Backend) -> SyncLiteConfig {
@@ -2002,8 +2210,8 @@ pub(crate) fn default_config_for_backend(db_path: PathBuf, dst_type: Backend) ->
     // that `Connection::open(db_path)` reuses the existing stage subdir.
     // Fall back to deriving from the db file name when no metadata
     // exists yet.
-    let device_name = persisted_device_name(&db_path)
-        .unwrap_or_else(|| derive_device_name(&db_path));
+    let device_name =
+        persisted_device_name(&db_path).unwrap_or_else(|| derive_device_name(&db_path));
     let stage_dir = default_local_stage_dir();
 
     let mut cfg = SyncLiteConfig::default();
@@ -2041,19 +2249,15 @@ fn persisted_device_name(db_path: &Path) -> Option<String> {
     md.get("device_name").ok().flatten()
 }
 
-/// Keys that `synclite::initialize(..)` mirrors from `cfg.extra` into
-/// the device metadata file so a later `Connection::open(db_path)`
-/// reconstructs an identical destination/consolidator config. Mirrors
-/// `apply_destination_initialize_options` plus any per-destination
-/// suffix variants we need to round-trip.
-///
-/// Notably absent: `dst-idempotent-data-ingestion-1`. That flag is
-/// transient — flipped on for a single post-reinit re-seed via the
-/// `.reinit_idempotent` sentinel file (see [`reinitialize`] module) —
-/// so we deliberately keep it out of user-visible device metadata.
+/// Base keys mirrored from `cfg.extra` into device metadata, including
+/// every numeric destination suffix (not just destination 1). These cover
+/// destination discovery, checkpoint locations and the existing reload options.
+/// The transient `dst-object-init-mode-1` reinit override remains excluded.
 const PERSISTED_INIT_EXTRA_KEYS: &[&str] = &[
+    DEVICE_DATA_ROOT_KEY,
     "dst-type",
     "dst-connection-string",
+    "dst-alias",
     "dst-sync-mode",
     "dst-database",
     "dst-schema",
@@ -2062,56 +2266,122 @@ const PERSISTED_INIT_EXTRA_KEYS: &[&str] = &[
     // rules the original `initialize(..)` used. (Reinit itself no
     // longer needs the filter-mapper config — it reads pre-mapped
     // destination names from `synclite_consolidator_table_metadata`.)
-    "metadata-store-1",
-    "dst-metadata-store-1",
-    "dst-enable-filter-mapper-rules-1",
-    "dst-filter-mapper-rules-file-1",
-    "dst-allow-unspecified-tables-1",
-    "dst-allow-unspecified-columns-1",
+    "metadata-store",
+    "dst-metadata-store",
+    "dst-enable-filter-mapper-rules",
+    "dst-filter-mapper-rules-file",
+    "dst-allow-unspecified-tables",
+    "dst-allow-unspecified-columns",
     // Persisted so the device-side `reinitialize` honors the same
     // retry policy the consolidator uses for destination operations.
-    "dst-oper-retry-count-1",
-    "dst-oper-retry-interval-ms-1",
+    "dst-oper-retry-count",
+    "dst-oper-retry-interval-ms",
+    "dst-idempotent-data-ingestion",
+    "dst-insert-batch-size",
+    "dst-update-batch-size",
+    "dst-delete-batch-size",
 ];
+
+fn is_persisted_init_extra_key(key: &str) -> bool {
+    PERSISTED_INIT_EXTRA_KEYS.contains(&key)
+        || key.rsplit_once('-').is_some_and(|(base, index)| {
+            index.parse::<usize>().is_ok() && PERSISTED_INIT_EXTRA_KEYS.contains(&base)
+        })
+}
+
+fn read_persisted_initialize_extra(db_path: &Path) -> Result<HashMap<String, String>> {
+    let layout = DeviceLayout::new(db_path.to_path_buf());
+    let conn = ::rusqlite::Connection::open_with_flags(
+        &layout.metadata_path,
+        ::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| Error::Config(format!("read initialize metadata: {e}")))?;
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM metadata")
+        .map_err(|e| Error::Config(format!("read initialize metadata: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| Error::Config(format!("read initialize metadata: {e}")))?;
+    let mut extra = HashMap::new();
+    for row in rows {
+        let (key, value) =
+            row.map_err(|e| Error::Config(format!("read initialize metadata: {e}")))?;
+        if is_persisted_init_extra_key(&key) {
+            extra.insert(key, value);
+        }
+    }
+    Ok(extra)
+}
 
 /// Per-`initialize` snapshot persisted into the device metadata file.
 /// Read back by `hydrate_initialize_config_from_metadata` when a
 /// subsequent `Connection::open(db_path)` builds a new Logger.
-fn persist_initialize_config_to_metadata(db_path: &Path, cfg: &SyncLiteConfig) -> Result<()> {    let layout = DeviceLayout::new(db_path.to_path_buf());
+fn persist_initialize_config_to_metadata(db_path: &Path, cfg: &SyncLiteConfig) -> Result<()> {
+    let layout = DeviceLayout::new(db_path.to_path_buf());
     if let Some(parent) = layout.metadata_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let md = Metadata::open_or_create(&layout.metadata_path)?;
-    for key in PERSISTED_INIT_EXTRA_KEYS {
-        match cfg.extra.get(*key) {
-            Some(value) => {
-                md.put(key, value)?;
-            }
-            None => {
-                // Leave any pre-existing value alone: a re-init with
-                // None destination must not erase a previously
-                // configured destination silently.
+    // Ensure the logger metadata schema exists before starting the snapshot
+    // transaction. Identity, backup flags and unrelated metadata stay intact.
+    drop(Metadata::open_or_create(&layout.metadata_path)?);
+    let map_err = |e| Error::Config(format!("persist initialize metadata: {e}"));
+    let mut conn = ::rusqlite::Connection::open(&layout.metadata_path).map_err(map_err)?;
+    let tx = conn
+        .transaction_with_behavior(::rusqlite::TransactionBehavior::Immediate)
+        .map_err(map_err)?;
+    let explicit_destination = has_any_destination_config(cfg);
+    if explicit_destination {
+        // Delete the previous snapshot, including omitted mode, alias and root
+        // keys. Otherwise status/hydration may discover ghost destinations or
+        // read stale checkpoints from the old work layout.
+        let keys = {
+            let mut stmt = tx.prepare("SELECT key FROM metadata").map_err(map_err)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_err)?;
+            rows.collect::<::rusqlite::Result<Vec<_>>>()
+                .map_err(map_err)?
+        };
+        for key in keys {
+            if is_persisted_init_extra_key(&key) {
+                tx.execute("DELETE FROM metadata WHERE key = ?1", [&key])
+                    .map_err(map_err)?;
             }
         }
     }
-    Ok(())
+    // With no destination, preserve the old merge behavior and sync marker.
+    for (key, value) in &cfg.extra {
+        if is_persisted_init_extra_key(key) {
+            tx.execute(
+                "INSERT INTO metadata(key, value) VALUES(?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ::rusqlite::params![key, value],
+            )
+            .map_err(map_err)?;
+        }
+    }
+    if explicit_destination {
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES('sync_configured', '1') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(map_err)?;
+    }
+    tx.commit().map_err(map_err)
 }
 
 fn hydrate_initialize_config_from_metadata(db_path: &Path, cfg: &mut SyncLiteConfig) {
-    let layout = DeviceLayout::new(db_path.to_path_buf());
-    if !layout.metadata_path.exists() {
+    if has_any_destination_config(cfg) {
         return;
     }
-    let Ok(md) = Metadata::open_or_create(&layout.metadata_path) else {
+    let Ok(extra) = read_persisted_initialize_extra(db_path) else {
         return;
     };
-    for key in PERSISTED_INIT_EXTRA_KEYS {
-        if cfg.extra.contains_key(*key) {
-            continue;
-        }
-        if let Ok(Some(value)) = md.get(key) {
-            cfg.extra.insert((*key).to_string(), value);
-        }
+    for (key, value) in extra {
+        cfg.extra.entry(key).or_insert(value);
     }
 }
 
@@ -2126,14 +2396,14 @@ fn hydrate_initialize_config_from_metadata(db_path: &Path, cfg: &mut SyncLiteCon
 /// absent.
 fn consume_reinit_sentinel(db_path: &Path, cfg: &mut SyncLiteConfig) {
     let layout = DeviceLayout::new(db_path.to_path_buf());
-    let sentinel = layout
-        .device_home
-        .join(reinitialize::REINIT_SENTINEL);
+    let sentinel = layout.device_home.join(reinitialize::REINIT_SENTINEL);
     if !sentinel.exists() {
         return;
     }
-    cfg.extra
-        .insert("dst-object-init-mode-1".to_string(), "OVERWRITE_OBJECT".to_string());
+    cfg.extra.insert(
+        "dst-object-init-mode-1".to_string(),
+        "OVERWRITE_OBJECT".to_string(),
+    );
     if let Err(e) = std::fs::remove_file(&sentinel) {
         tracing::warn!(
             sentinel = %sentinel.display(),
@@ -2219,13 +2489,14 @@ fn build_shipper(
             DestinationKind::S3 => {
                 #[cfg(feature = "s3")]
                 {
-                    let arch = build_s3_archiver_for_suffix(cfg, &spec.suffix, "s3")?
-                        .ok_or_else(|| {
+                    let arch = build_s3_archiver_for_suffix(cfg, &spec.suffix, "s3")?.ok_or_else(
+                        || {
                             Error::Config(format!(
                                 "{}=S3 but S3 destination settings are incomplete",
                                 spec.key_name
                             ))
-                        })?;
+                        },
+                    )?;
                     archivers.push(arch);
                 }
                 #[cfg(not(feature = "s3"))]
@@ -2259,8 +2530,8 @@ fn build_shipper(
             DestinationKind::Sftp => {
                 #[cfg(feature = "sftp")]
                 {
-                    let arch = build_sftp_archiver_for_suffix(cfg, &spec.suffix)?
-                        .ok_or_else(|| {
+                    let arch =
+                        build_sftp_archiver_for_suffix(cfg, &spec.suffix)?.ok_or_else(|| {
                             Error::Config(format!(
                                 "{}=SFTP but SFTP destination settings are incomplete",
                                 spec.key_name
@@ -2403,21 +2674,26 @@ fn build_sftp_archiver_for_suffix(
     let Some(host) = cfg.extra.get(&k_host) else {
         return Ok(None);
     };
-    let username = cfg.extra.get(&k_user).ok_or_else(|| {
-        Error::Config(format!("{k_user} is required when {k_host} is set"))
-    })?;
-    let remote_dir = cfg.extra.get(&k_remote_dir).ok_or_else(|| {
-        Error::Config(format!("{k_remote_dir} is required when {k_host} is set"))
-    })?;
-    let password = cfg.extra.get(&k_password).ok_or_else(|| {
-        Error::Config(format!("{k_password} is required when {k_host} is set"))
-    })?;
-    let auth = SftpAuth::Password { password: password.clone() };
+    let username = cfg
+        .extra
+        .get(&k_user)
+        .ok_or_else(|| Error::Config(format!("{k_user} is required when {k_host} is set")))?;
+    let remote_dir = cfg
+        .extra
+        .get(&k_remote_dir)
+        .ok_or_else(|| Error::Config(format!("{k_remote_dir} is required when {k_host} is set")))?;
+    let password = cfg
+        .extra
+        .get(&k_password)
+        .ok_or_else(|| Error::Config(format!("{k_password} is required when {k_host} is set")))?;
+    let auth = SftpAuth::Password {
+        password: password.clone(),
+    };
     let mut s = SftpConfig::new(host.clone(), username.clone(), auth, remote_dir.clone());
     if let Some(p) = cfg.extra.get(&k_port) {
-        let port: u16 = p.parse().map_err(|e| {
-            Error::Config(format!("{k_port}={p}: {e}"))
-        })?;
+        let port: u16 = p
+            .parse()
+            .map_err(|e| Error::Config(format!("{k_port}={p}: {e}")))?;
         s = s.with_port(port);
     }
     Ok(Some(Arc::new(SftpArchiver::new(s)?)))
@@ -2426,10 +2702,134 @@ fn build_sftp_archiver_for_suffix(
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_destination_initialize_options, apply_destinations_initialize_options,
+        parse_cfg_destination_indices, parse_cfg_destination_sync_mode_for_index,
         parse_duckdb_path_from_connection, parse_sqlite_path_from_connection,
-        translate_postgres_connection_string, validate_device_name, MAX_DEVICE_NAME_LEN,
+        translate_postgres_connection_string, validate_device_name, DestinationOptions,
+        DstSyncMode, DstType, MAX_DEVICE_NAME_LEN,
     };
+    use logger_config::SyncLiteConfig;
     use std::path::PathBuf;
+
+    fn sqlite_destination(path: &str) -> DestinationOptions {
+        DestinationOptions {
+            dst_type: DstType::Sqlite,
+            dst_connection_string: path.to_string(),
+            dst_database: None,
+            dst_schema: None,
+            dst_sync_mode: DstSyncMode::Consolidation,
+        }
+    }
+
+    #[test]
+    fn single_destination_initialize_keeps_legacy_unsuffixed_keys() {
+        let mut cfg = SyncLiteConfig::default();
+        apply_destination_initialize_options(
+            &mut cfg,
+            Some(sqlite_destination("legacy-destination.db")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.extra.get("dst-type").map(String::as_str),
+            Some("SQLITE")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-connection-string").map(String::as_str),
+            Some("legacy-destination.db")
+        );
+        assert!(!cfg.extra.contains_key("dst-type-1"));
+    }
+
+    #[test]
+    fn multi_destination_initialize_assigns_ordered_indexed_keys() {
+        let mut cfg = SyncLiteConfig::default();
+        apply_destinations_initialize_options(
+            &mut cfg,
+            vec![
+                sqlite_destination("first.db"),
+                DestinationOptions {
+                    dst_type: DstType::Postgres,
+                    dst_connection_string: "postgresql://localhost/synclite".to_string(),
+                    dst_database: Some("synclite".to_string()),
+                    dst_schema: Some("public".to_string()),
+                    dst_sync_mode: DstSyncMode::Replication,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(parse_cfg_destination_indices(&cfg), vec![1, 2]);
+        assert_eq!(
+            cfg.extra.get("dst-type-1").map(String::as_str),
+            Some("SQLITE")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-connection-string-1").map(String::as_str),
+            Some("first.db")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-sync-mode-1").map(String::as_str),
+            Some("CONSOLIDATION")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-type-2").map(String::as_str),
+            Some("POSTGRES")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-connection-string-2").map(String::as_str),
+            Some("postgresql://localhost/synclite")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-database-2").map(String::as_str),
+            Some("synclite")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-schema-2").map(String::as_str),
+            Some("public")
+        );
+        assert_eq!(
+            cfg.extra.get("dst-sync-mode-2").map(String::as_str),
+            Some("REPLICATION")
+        );
+        assert_eq!(
+            parse_cfg_destination_sync_mode_for_index(&cfg, 1),
+            DstSyncMode::Consolidation
+        );
+        assert_eq!(
+            parse_cfg_destination_sync_mode_for_index(&cfg, 2),
+            DstSyncMode::Replication
+        );
+        assert!(!cfg.extra.contains_key("dst-type"));
+    }
+
+    #[test]
+    fn multi_destination_initialize_rejects_empty_or_invalid_entries() {
+        let mut cfg = SyncLiteConfig::default();
+        assert!(apply_destinations_initialize_options(&mut cfg, Vec::new()).is_err());
+
+        let err = apply_destinations_initialize_options(
+            &mut cfg,
+            vec![
+                sqlite_destination("first.db"),
+                DestinationOptions {
+                    dst_type: DstType::Postgres,
+                    dst_connection_string: "postgresql://localhost/synclite".to_string(),
+                    dst_database: None,
+                    dst_schema: Some("public".to_string()),
+                    dst_sync_mode: DstSyncMode::Consolidation,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("destination 2"));
+        assert!(cfg.extra.is_empty());
+
+        let err = apply_destinations_initialize_options(&mut cfg, vec![sqlite_destination("   ")])
+            .unwrap_err();
+        assert!(err.to_string().contains("destination 1"));
+        assert!(err.to_string().contains("must not be empty"));
+    }
 
     #[test]
     fn device_name_validation_accepts_java_compatible_names() {
@@ -2501,9 +2901,3 @@ mod tests {
         assert_eq!(translate_postgres_connection_string(kv), Some(kv));
     }
 }
-
-
-
-
-
-

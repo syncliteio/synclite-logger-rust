@@ -397,6 +397,27 @@ same change stream can also be picked up by the centralized
 [SyncLite Consolidator](https://github.com/syncliteio/SyncLite/tree/main/synclite-consolidator)
 service, which fans out from many edge devices into a shared destination.
 
+### Multiple Destinations
+
+Use the same `initialize(...)` API for one or many destinations. Keep passing
+`Some(destination)` for one destination, or pass a vector to fan out:
+
+```rust
+synclite::initialize(
+  DeviceType::SQLITE,
+  DEVICE_NAME,
+  DB_PATH,
+  vec![destination_1, destination_2],
+  SyncLiteOptions::default(),
+)?;
+```
+
+The vector must be non-empty. Its order defines stable one-based destination
+indexes (`destination_1` is Destination 1 above). SyncLite validates the
+complete vector first and starts destinations sequentially; a later startup
+failure rolls back workers already created by that call. Runtime processing is
+independent after initialization.
+
 ### Config-File Variant
 
 For richer setups (multiple destinations, mappers, Prometheus, tuned
@@ -417,14 +438,18 @@ synclite::initialize(
 
 ```properties
 # synclite.conf
-destination-count=1
 dst-type-1=POSTGRESQL
 dst-connection-string-1=postgresql://user:password@localhost:5432/analytics
+dst-database-1=analytics
+dst-schema-1=public
 dst-sync-mode-1=CONSOLIDATION
 dst-data-type-mapping-1=BEST_EFFORT
 dst-enable-filter-mapper-rules-1=true
 dst-filter-mapper-rules-file-1=./filter_rules.conf
 ```
+
+The runtime discovers destinations from the positive one-based suffixes on the
+numbered `dst-*` keys; no separate destination-count key is required.
 
 ## Feature Highlights
 
@@ -496,10 +521,17 @@ Fan a single source out to many destinations — each with its own mappers,
 sync mode, data-type mode:
 
 ```properties
-destination-count=3
 dst-type-1=SQLITE
+dst-connection-string-1=./orders-destination-1.sqlite
+
 dst-type-2=DUCKDB
+dst-connection-string-2=./orders-destination-2.duckdb
+dst-database-2=main
+
 dst-type-3=POSTGRESQL
+dst-connection-string-3=postgresql://user:password@localhost:5432/analytics
+dst-database-3=analytics
+dst-schema-3=public
 ```
 
 ### Crash Recovery & Restart Semantics
@@ -620,12 +652,14 @@ Local-only essentials:
 | `max-inlined-log-args` | Args inlined before promotion to blob storage. |
 | `skip-restart-recovery` | Skip recovery on cold start (testing only). |
 
-Per-destination (index `N` from `1` to `destination-count`):
+Per-destination (positive one-based index `N`; all present indexes are discovered automatically):
 
 | Key pattern | Purpose |
 |---|---|
 | `dst-type-N` | `SQLITE`, `DUCKDB`, `POSTGRESQL`. |
-| `dst-connection-string-N` | JDBC-style connection string. |
+| `dst-connection-string-N` | JDBC-style or native connection string / local path. |
+| `dst-database-N` | Required for DuckDB and PostgreSQL; rejected for SQLite. |
+| `dst-schema-N` | Required for PostgreSQL, optional for DuckDB, and rejected for SQLite. |
 | `dst-sync-mode-N` | `CONSOLIDATION` or `REPLICATION`. |
 | `dst-data-type-mapping-N` | `ALL_TEXT` / `BEST_EFFORT` / `CUSTOMIZED` / `EXACT`. |
 | `dst-enable-filter-mapper-rules-N` | Toggle filter mapper. |

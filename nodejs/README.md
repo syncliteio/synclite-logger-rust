@@ -18,6 +18,41 @@ npm install synclite@1.1.0
 
 No Rust toolchain or native rebuild is required on a supported platform.
 
+## Initialization
+
+Use `initialize(options)` for both single and multiple destinations. Supply
+`destination` for one target or a non-empty ordered `destinations` array for
+fan-out; the two properties are mutually exclusive:
+
+```js
+const synclite = require('synclite');
+
+synclite.initialize({
+	device_type: 'SQLITE',
+	device_name: 'ordersdevice',
+	db_path: 'orders.db',
+	destinations: [
+		// Destination 1
+		{
+			dst_type: 'POSTGRES',
+			dst_connection_string: 'postgresql://user:pw@localhost:5432/syncdb',
+			dst_database: 'syncdb',
+			dst_schema: 'public',
+		},
+		// Destination 2
+		{
+			dst_type: 'SQLITE',
+			dst_connection_string: 'orders-destination-2.db',
+		},
+	],
+});
+```
+
+Array order defines stable one-based destination indexes. SyncLite validates
+the whole array first and initializes destinations sequentially. If a later
+destination cannot start, workers already started by that call are stopped
+before the initialization error is returned.
+
 For an extracted SyncLite platform/runtime release, run the platform-detecting
 installer from `sample-apps/nodejs/` instead:
 
