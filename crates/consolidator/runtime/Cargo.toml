@@ -12,6 +12,11 @@ description = "Consolidator worker runtime and destination apply engine."
 [lib]
 name = "consolidator_runtime"
 
+[features]
+default = []
+# Kept as a compatibility alias; DuckDB is always compiled in.
+duckdb = ["consolidator-state/duckdb"]
+
 [dependencies]
 consolidator-core.workspace = true
 consolidator-state.workspace = true

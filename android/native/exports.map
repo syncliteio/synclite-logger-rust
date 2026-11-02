@@ -1,0 +1,7 @@
+{
+    global:
+        synclite_rs_*;
+        Java_com_synclite_consolidator_nativedb_DB_*;
+    local:
+        *;
+};

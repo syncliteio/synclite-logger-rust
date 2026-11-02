@@ -1,7 +1,7 @@
+use logger_core::DeviceType;
 use logger_core::Result;
 use logger_db_traits::Value;
 use synclite::rusqlite::Connection;
-use logger_core::DeviceType;
 
 fn main() -> Result<()> {
     const DB_PATH: &str = "sample_rusqlite_sqlite.db";
@@ -14,19 +14,19 @@ fn main() -> Result<()> {
     // synclite::initialize(DeviceType::SQLITE, DEVICE_NAME, DB_PATH, None, synclite::SyncLiteOptions::default())?;
 
     // PostgreSQL destination example:
-     synclite::initialize(
-         DeviceType::SQLITE,
-         DEVICE_NAME,
-         DB_PATH,
-         Some(synclite::DestinationOptions {
-             dst_type: synclite::DstType::Postgres,
-             dst_connection_string: "postgresql://postgres:postgres@localhost:5432/syncdb".into(),
-             dst_database: Some("syncdb".into()),
-             dst_schema: Some("syncschema".into()),
-             dst_sync_mode: synclite::DstSyncMode::Consolidation,
-         }),
-         synclite::SyncLiteOptions::default(),
-     )?;
+    synclite::initialize(
+        DeviceType::SQLITE,
+        DEVICE_NAME,
+        DB_PATH,
+        Some(synclite::DestinationOptions {
+            dst_type: synclite::DstType::Postgres,
+            dst_connection_string: "postgresql://postgres:postgres@localhost:5432/syncdb".into(),
+            dst_database: Some("syncdb".into()),
+            dst_schema: Some("syncschema".into()),
+            dst_sync_mode: synclite::DstSyncMode::Consolidation,
+        }),
+        synclite::SyncLiteOptions::default(),
+    )?;
 
     // SQLite destination example:
     // synclite::initialize(
@@ -70,8 +70,16 @@ fn main() -> Result<()> {
 
     {
         let mut stmt = conn.prepare("INSERT INTO users(id, name, score) VALUES(?, ?, ?)")?;
-        stmt.execute(&[Value::Int(1), Value::Text("Alice".to_string()), Value::Int(100)])?;
-        stmt.execute(&[Value::Int(2), Value::Text("Bob".to_string()), Value::Int(200)])?;
+        stmt.execute(&[
+            Value::Int(1),
+            Value::Text("Alice".to_string()),
+            Value::Int(100),
+        ])?;
+        stmt.execute(&[
+            Value::Int(2),
+            Value::Text("Bob".to_string()),
+            Value::Int(200),
+        ])?;
     }
 
     conn.execute(
@@ -82,8 +90,16 @@ fn main() -> Result<()> {
 
     {
         let mut stmt = conn.prepare("INSERT INTO users(id, name, score) VALUES(?, ?, ?)")?;
-        stmt.add_batch(&[Value::Int(3), Value::Text("Carol".to_string()), Value::Int(300)]);
-        stmt.add_batch(&[Value::Int(4), Value::Text("Dave".to_string()), Value::Int(400)]);
+        stmt.add_batch(&[
+            Value::Int(3),
+            Value::Text("Carol".to_string()),
+            Value::Int(300),
+        ]);
+        stmt.add_batch(&[
+            Value::Int(4),
+            Value::Text("Dave".to_string()),
+            Value::Int(400),
+        ]);
         stmt.execute_batch()?;
     }
     conn.commit()?;
@@ -103,8 +119,3 @@ fn main() -> Result<()> {
     conn.close()?;
     Ok(())
 }
-
-
-
-
-

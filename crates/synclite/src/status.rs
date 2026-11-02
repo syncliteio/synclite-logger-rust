@@ -25,7 +25,6 @@ use duckdb::{
     Connection as DuckConnection,
 };
 use logger_core::{Error, Result};
-use postgres::{Config as PgConfig, NoTls};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::layout::DeviceLayout;
@@ -477,33 +476,9 @@ fn read_applied_commit_id_from_destination_values(
             row.get::<_, Option<i64>>(0).ok().flatten()
         }
         DstType::Postgres => {
-            // Do not let one unreachable destination consume more than the
-            // shared await budget. The startup option bounds server-side query
-            // execution; connect_timeout bounds socket establishment.
-            let mut config = dst_conn.parse::<PgConfig>().ok()?;
-            if let Some(timeout) = timeout {
-                if timeout.is_zero() {
-                    return None;
-                }
-                config.connect_timeout(timeout);
-                let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128);
-                let statement_timeout = format!("-c statement_timeout={timeout_ms}");
-                let options = match config.get_options().map(str::trim) {
-                    Some(existing) if !existing.is_empty() => {
-                        format!("{existing} {statement_timeout}")
-                    }
-                    _ => statement_timeout,
-                };
-                config.options(&options);
-            }
-            let mut client = config.connect(NoTls).ok()?;
-            let sql = format!(
-                "SELECT MAX(commit_id)
-                 FROM {dst_table}
-                 WHERE synclite_device_id = $1 AND synclite_device_name = $2"
-            );
-            let row = client.query_one(&sql, &[&device_id, &device_name]).ok()?;
-            row.try_get::<_, Option<i64>>(0).ok().flatten()
+            consolidator_state::read_postgres_checkpoint(
+                &dst_conn, &dst_table, &device_id, &device_name, timeout,
+            )
         }
     }
 }
@@ -592,8 +567,51 @@ mod tests {
     use consolidator_core::{ConsolidatorLayout, DestinationSyncMode, MetadataStore};
     use std::time::Duration;
 
-    // No workers, sleeps, network, environment mutation, or shared work roots.
     // Checkpoint fixtures use the same device identity and layout as runtime.
+    #[test]
+    fn await_sync_times_out_when_postgres_does_not_answer() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                        let _ = socket.read_to_end(&mut Vec::new());
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+        });
+        let mut fixture = Fixture::new();
+        fixture.set("dst-type", "POSTGRES");
+        fixture.set("dst-metadata-store", "DESTINATION");
+        fixture.set(
+            "dst-connection-string",
+            &format!("host=127.0.0.1 port={port} user=test sslmode=disable"),
+        );
+        fixture.persist();
+        let started = Instant::now();
+        let result = crate::await_sync(&fixture.layout.db_path, Duration::from_millis(150));
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("await_sync: timed out"));
+        assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
     struct Fixture {
         _dir: tempfile::TempDir,
         layout: DeviceLayout,

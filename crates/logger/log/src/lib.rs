@@ -20,15 +20,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod recovery;
 mod scan;
 mod segment;
 mod status;
 
 pub use scan::{scan_segment_dir, ResumeState};
 pub use segment::{
-	LogSegmentWriter,
-	DEFAULT_LOG_SEGMENT_FLUSH_BATCH_SIZE,
-	DEFAULT_LOG_SEGMENT_PAGE_SIZE,
+    LogSegmentWriter, DEFAULT_LOG_SEGMENT_FLUSH_BATCH_SIZE, DEFAULT_LOG_SEGMENT_PAGE_SIZE,
 };
 pub use status::LogSegmentStatus;
-

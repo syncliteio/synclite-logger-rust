@@ -1,8 +1,9 @@
 """Python mirror of `synclite_rusqlite.rs`.
 
-Drives the SyncLite Rust runtime via the `synclite` Python package —
-no JVM, no JAR, no DB-API adapter. The `Connection` / `Statement`
-objects below match the Rust and C++ samples one-for-one.
+Drives the SyncLite Rust runtime via the direct `synclite` Python API —
+no JVM and no JAR. This sample intentionally uses `Connection` /
+`Statement` instead of the optional `synclite.dbapi2` facade so it matches
+the Rust and C++ samples one-for-one.
 
 See ../README.md for the package install / setup.
 """

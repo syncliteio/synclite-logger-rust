@@ -50,17 +50,14 @@ fn segment_count(segment_dir: &Path) -> usize {
     std::fs::read_dir(segment_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|x| x.to_str()) == Some("sqllog")
-        })
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("sqllog"))
         .count()
 }
 
 #[test]
 fn count_threshold_rotates_on_commit_boundary() {
     let dir = tempdir().unwrap();
-    let mut cfg =
-        SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
+    let mut cfg = SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
     // Rotate aggressively on record count; disable time-based switching so
     // the test is deterministic.
     cfg.log_segment_switch_log_count_threshold = Some(4);
@@ -104,8 +101,7 @@ fn count_threshold_rotates_on_commit_boundary() {
 #[test]
 fn duration_threshold_rotates_on_commit_boundary() {
     let dir = tempdir().unwrap();
-    let mut cfg =
-        SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
+    let mut cfg = SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
     // Rotate on age; disable count-based switching.
     cfg.log_segment_switch_log_count_threshold = None;
     cfg.log_segment_switch_duration_threshold_ms = Some(1);
@@ -140,13 +136,14 @@ fn duration_threshold_rotates_on_commit_boundary() {
 #[test]
 fn idle_rolls_committed_segment_but_never_open_transaction() {
     let dir = tempdir().unwrap();
-    let mut cfg =
-        SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
+    let mut cfg = SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
     cfg.log_segment_switch_log_count_threshold = None;
     cfg.log_segment_switch_duration_threshold_ms = Some(1);
 
     let mut device = SqliteDevice::open(cfg.clone()).unwrap();
-    device.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    device
+        .execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
     device.commit().unwrap();
 
     // The age threshold passes with no subsequent writer activity. This is
@@ -181,8 +178,7 @@ fn idle_rolls_committed_segment_but_never_open_transaction() {
 #[test]
 fn disabled_thresholds_keep_single_segment() {
     let dir = tempdir().unwrap();
-    let mut cfg =
-        SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
+    let mut cfg = SqliteDeviceConfig::new(dir.path().join("user.db"), dir.path().join("stage"));
     // Both switches off: no auto-rotation regardless of workload.
     cfg.log_segment_switch_log_count_threshold = None;
     cfg.log_segment_switch_duration_threshold_ms = None;
@@ -209,4 +205,43 @@ fn disabled_thresholds_keep_single_segment() {
         1,
         "no rotation expected when both thresholds are disabled"
     );
+}
+
+#[test]
+fn metadata_active_sequence_wins_over_stale_stage_segments() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("user.db");
+    let segment_dir = dir.path().join("device-home");
+    let stage_dir = dir.path().join("stage");
+    let mut cfg = SqliteDeviceConfig::new(&db_path, &segment_dir);
+    cfg.resume_dir = Some(stage_dir.clone());
+    cfg.log_segment_flush_batch_size = 1;
+
+    let active_path = {
+        let mut device = SqliteDevice::open(cfg.clone()).unwrap();
+        device
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)", &[])
+            .unwrap();
+        device.commit().unwrap();
+        let path = device.current_segment_path().to_path_buf();
+        drop(device);
+        let renamed = segment_dir.join("7.sqllog");
+        std::fs::rename(path, &renamed).unwrap();
+        renamed
+    };
+
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    std::fs::copy(&active_path, stage_dir.join("1.sqllog")).unwrap();
+    cfg.resume_segment_sequence = Some(7);
+
+    let mut reopened = SqliteDevice::open(cfg).unwrap();
+    assert_eq!(reopened.current_segment_path(), active_path.as_path());
+    reopened
+        .execute(
+            "INSERT INTO t(id, value) VALUES (?, ?)",
+            &[ArgValue::Int(1), ArgValue::Text("after-restart".into())],
+        )
+        .unwrap();
+    reopened.commit().unwrap();
+    assert_eq!(reopened.current_segment_sequence().0, 7);
 }

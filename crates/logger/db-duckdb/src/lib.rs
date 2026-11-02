@@ -13,25 +13,29 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use duckdb::{appender_params_from_iter, params_from_iter, types::Value as DuckValue, Connection};
-use rusqlite::Connection as SqliteConnection;
 use logger_core::{
     record::{ArgValue, CommandLogRecord},
-    sql_policy::{is_ddl, parse_insert_shape, validate_sql_policy, InsertShape, SqlPolicyMode, SqlShape},
+    sql_policy::{
+        classify_sql_statement, has_top_level_keyword, is_ddl, parse_insert_shape,
+        validate_sql_policy, InsertShape, SqlPolicyMode, SqlShape, SqlStatementKind,
+    },
     Backend, CommitId, DeviceType, Error, OperationId, Result, SegmentSequence,
 };
-use logger_db_traits::{DbDevice, Row, TxnLogRuntime, Value};
+use logger_db_traits::{ColumnInfo, DbDevice, ExecutionResult, Row, TxnLogRuntime, Value};
 use logger_log::{
-    scan_segment_dir,
-    LogSegmentWriter,
-    DEFAULT_LOG_SEGMENT_FLUSH_BATCH_SIZE,
+    recovery, scan_segment_dir, LogSegmentWriter, DEFAULT_LOG_SEGMENT_FLUSH_BATCH_SIZE,
     DEFAULT_LOG_SEGMENT_PAGE_SIZE,
 };
+use rusqlite::Connection as SqliteConnection;
 
 /// Callback invoked with the path of every finalized log segment.
 ///
 /// Kept structurally identical to the SQLite device so a shipper can be
 /// wired into either backend with the same code.
 pub type SegmentReadyCallback = Arc<dyn Fn(&Path) + Send + Sync>;
+
+/// Callback invoked after the active segment sequence changes.
+pub type ActiveSegmentCallback = Arc<dyn Fn(SegmentSequence) + Send + Sync>;
 
 /// Configuration for opening a [`DuckDbDevice`].
 #[derive(Clone)]
@@ -41,12 +45,16 @@ pub struct DuckDbDeviceConfig {
     /// Directory in which log segments are written. Created on first use.
     /// Segment files are named `<seq>.sqllog` inside this directory.
     pub segment_dir: PathBuf,
-    /// Optional directory to scan for resume state. When `None`, scans
-    /// `segment_dir`. Useful when finalized segments are moved out of
-    /// `segment_dir` into a stage subdirectory.
+    /// Directory used by the shipper/consolidator for staged segments. It is
+    /// never scanned for logger restart recovery.
     pub resume_dir: Option<PathBuf>,
+    /// Metadata sequence identifying the active segment on restart. When it
+    /// is absent, the active device home is scanned as a legacy fallback.
+    pub resume_segment_sequence: Option<u64>,
     /// Optional hook called every time a segment is finalized.
     pub on_segment_ready: Option<SegmentReadyCallback>,
+    /// Optional hook called after the active segment sequence is established.
+    pub on_active_segment_changed: Option<ActiveSegmentCallback>,
     /// SQLite page size for generated log-segment files.
     pub log_segment_page_size: u32,
     /// Number of log rows to buffer in segment transaction before COMMIT.
@@ -75,7 +83,9 @@ impl DuckDbDeviceConfig {
             db_path: db_path.into(),
             segment_dir: segment_dir.into(),
             resume_dir: None,
+            resume_segment_sequence: None,
             on_segment_ready: None,
+            on_active_segment_changed: None,
             log_segment_page_size: DEFAULT_LOG_SEGMENT_PAGE_SIZE,
             log_segment_flush_batch_size: DEFAULT_LOG_SEGMENT_FLUSH_BATCH_SIZE,
             device_type: DeviceType::DUCKDB,
@@ -93,9 +103,17 @@ impl std::fmt::Debug for DuckDbDeviceConfig {
             .field("db_path", &self.db_path)
             .field("segment_dir", &self.segment_dir)
             .field("resume_dir", &self.resume_dir)
+            .field("resume_segment_sequence", &self.resume_segment_sequence)
             .field("on_segment_ready", &self.on_segment_ready.is_some())
+            .field(
+                "on_active_segment_changed",
+                &self.on_active_segment_changed.is_some(),
+            )
             .field("log_segment_page_size", &self.log_segment_page_size)
-            .field("log_segment_flush_batch_size", &self.log_segment_flush_batch_size)
+            .field(
+                "log_segment_flush_batch_size",
+                &self.log_segment_flush_batch_size,
+            )
             .field("device_type", &self.device_type)
             .finish()
     }
@@ -239,43 +257,69 @@ impl DuckDbDevice {
         Ok(Some(vec![0; batch_params.len()]))
     }
 
-    /// Open (or create) the user database and start a fresh segment.
+    /// Open (or create) the user database and its active log segment.
     ///
-    /// Resumes segment numbering and `commit_id` from any prior segments
-    /// already present in `segment_dir`. See [`SqliteDevice::open`] for
-    /// details.
+    /// Identical restart-recovery algorithm to
+    /// [`SqliteDevice::open`](../logger_db_sqlite/struct.SqliteDevice.html):
+    /// the persisted segment sequence names the active segment in the device
+    /// home, which is reopened; staged segments are never used for recovery.
     pub fn open(cfg: DuckDbDeviceConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.segment_dir)?;
         let conn = Connection::open(&cfg.db_path).map_err(db_err)?;
         let shadow_path = shadow_schema_path(&cfg);
         rebuild_shadow_schema(&conn, &shadow_path)?;
         let shadow_conn = SqliteConnection::open(&shadow_path).map_err(sqlite_err)?;
-        let resume_dir = cfg.resume_dir.as_deref().unwrap_or(cfg.segment_dir.as_path());
-        let resume = scan_segment_dir(resume_dir)?;
-        let restart_state = Self::scan_last_segment_txn_state(resume_dir)?;
-        let log = if cfg.max_inlined_log_args == 16 {
+        let active =
+            recovery::resolve_active_segment(&cfg.segment_dir, cfg.resume_segment_sequence)?;
+        let active_resume = scan_segment_dir(&cfg.segment_dir)?;
+        let next_seq = if active.is_none() {
+            // Occupied slots are shipped below by the finalized sweep.
+            let seq =
+                recovery::next_segment_sequence(&cfg.segment_dir, cfg.resume_segment_sequence)?;
+            recovery::claim_segment_slot(&cfg.segment_dir, seq)?.0
+        } else {
+            SegmentSequence(0)
+        };
+        let restart_state = if let Some((_, path)) = &active {
+            Self::segment_last_txn_state(path)?.map(|(commit, fate)| (path.clone(), commit, fate))
+        } else {
+            None
+        };
+        let log = if let Some((_, path)) = active.as_ref() {
+            LogSegmentWriter::open_existing_with_page_size_and_arg_columns_and_flush_batch(
+                path,
+                cfg.log_segment_page_size,
+                cfg.max_inlined_log_args,
+                cfg.log_segment_flush_batch_size,
+            )?
+        } else if cfg.max_inlined_log_args == 16 {
             LogSegmentWriter::create_with_page_size_and_flush_batch(
-                segment_path(&cfg, resume.next_seq),
+                segment_path(&cfg, next_seq),
                 cfg.log_segment_page_size,
                 cfg.log_segment_flush_batch_size,
             )?
         } else {
             LogSegmentWriter::create_with_page_size_and_arg_columns_and_flush_batch(
-                segment_path(&cfg, resume.next_seq),
+                segment_path(&cfg, next_seq),
                 cfg.log_segment_page_size,
                 cfg.max_inlined_log_args,
                 cfg.log_segment_flush_batch_size,
             )?
         };
-        let initial_commit = next_monotonic_commit_id(resume.max_commit_id);
+        let initial_commit = next_monotonic_commit_id(active_resume.max_commit_id);
+        let next_change_number = active
+            .as_ref()
+            .map(|(_, path)| Self::next_change_number(path))
+            .transpose()?
+            .unwrap_or(0);
         let mut dev = Self {
             cfg,
             conn,
             shadow_conn,
             user_txn_open: false,
             log,
-            current_segment_seq: resume.next_seq,
-            next_change_number: 0,
+            current_segment_seq: active.map_or(next_seq, |(seq, _)| seq),
+            next_change_number,
             next_commit_id: initial_commit,
             last_committed_commit_id: 0,
             next_operation_id: 0,
@@ -287,8 +331,25 @@ impl DuckDbDevice {
             restart_txn_fate: restart_state.as_ref().map(|s| s.2),
         };
         dev.ensure_synclite_txn_table()?;
+        // Java `SQLStager.removeOrphanCmdFiles`: per-transaction stage files
+        // of transactions that never committed are discarded on restart.
+        remove_orphan_txn_stage_files(&dev.cfg.segment_dir);
         if !dev.cfg.skip_restart_recovery {
             dev.resolve_in_doubt_txn_on_open()?;
+        }
+        // Java `restartMasterCommitID`: the last commit recorded in the user DB.
+        dev.last_committed_commit_id = dev.synclite_txn_commit_id()?;
+        if let Some(cb) = &dev.cfg.on_active_segment_changed {
+            cb(dev.current_segment_seq);
+        }
+        // Java `LogMover` parity: ship segments finalized just before a
+        // crash, in sequence order, so stage stays gap-free.
+        if let Some(cb) = &dev.cfg.on_segment_ready {
+            for path in
+                recovery::finalized_segments_below(&dev.cfg.segment_dir, dev.current_segment_seq)?
+            {
+                cb(&path);
+            }
         }
         Ok(dev)
     }
@@ -307,38 +368,39 @@ impl DuckDbDevice {
     /// and open the next segment.
     pub fn roll_segment(&mut self) -> Result<()> {
         self.flush_txn_records(false, false)?;
-        // Same swap-then-drop ordering as the SQLite backend: drop the
-        // finalized segment's file handle before notifying the shipper.
+        // Java parity: switch only when the active segment holds records
+        // and sits at a commit boundary, so sequence numbers never skip.
+        if self.log.is_empty()?
+            || (self.logs_txn_markers() && !self.log.last_commit_fate_decided()?)
+        {
+            return Ok(());
+        }
+        // Java `doSwitchLogSegment`: finish current, create `seq + 1`,
+        // then persist the new sequence (same order as the SQLite device).
         let next_seq = SegmentSequence(self.current_segment_seq.0 + 1);
+        let (next_seq, skipped) = recovery::claim_segment_slot(&self.cfg.segment_dir, next_seq)?;
+        self.log.finalize()?;
         let new_log = LogSegmentWriter::create_with_page_size_and_flush_batch(
             segment_path(&self.cfg, next_seq),
             self.cfg.log_segment_page_size,
             self.cfg.log_segment_flush_batch_size,
         )?;
+        // Drop the finalized writer before notifying the shipper.
         let old_log = std::mem::replace(&mut self.log, new_log);
         let finalized_path = old_log.path().to_path_buf();
-        let should_ship = !old_log.is_empty()? && old_log.last_commit_fate_decided()?;
-        if should_ship {
-            old_log.finalize()?;
-        }
         drop(old_log);
-        if should_ship {
-            if let Some(cb) = &self.cfg.on_segment_ready {
-                cb(&finalized_path);
-            }
-        } else if !finalized_path.exists() {
-            // Nothing to do.
-        } else if rusqlite::Connection::open(&finalized_path)
-            .ok()
-            .and_then(|c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM commandlog", [], |r| r.get(0)).ok())
-            .unwrap_or(1)
-            == 0
-        {
-            std::fs::remove_file(&finalized_path).ok();
-        }
         self.current_segment_seq = next_seq;
         self.next_change_number = 0;
         self.current_segment_created_at = Instant::now();
+        if let Some(cb) = &self.cfg.on_active_segment_changed {
+            cb(self.current_segment_seq);
+        }
+        if let Some(cb) = &self.cfg.on_segment_ready {
+            cb(&finalized_path);
+            for path in &skipped {
+                cb(path);
+            }
+        }
         Ok(())
     }
 
@@ -434,6 +496,10 @@ impl DuckDbDevice {
         if include_replay_txn {
             self.append_record(Some("REPLAY_TXN"), &[])?;
         }
+        // Java `MultiWriterDBConnection.commit`: log REPLAY_TXN, flush the
+        // log, then publish the txn file. A published txn file is therefore
+        // always backed by a durable REPLAY_TXN in the master segment.
+        self.log.flush()?;
         let _published = stage.publish(&self.cfg.segment_dir, self.current_segment_seq)?;
         Ok(())
     }
@@ -445,9 +511,7 @@ impl DuckDbDevice {
         }
         // Txn body rows are written into per-transaction files, so they
         // should not consume the master segment's change-number sequence.
-        self.next_change_number = self
-            .next_change_number
-            .saturating_sub(records.len() as u64);
+        self.next_change_number = self.next_change_number.saturating_sub(records.len() as u64);
         let commit_id = records[0].commit_id.0;
         if self.txn_stage.is_none() {
             self.txn_stage = Some(TxnStage::create(
@@ -642,58 +706,42 @@ impl DuckDbDevice {
         Ok(Some((commit_id, fate)))
     }
 
-    fn scan_last_segment_txn_state(dir: &Path) -> Result<Option<(PathBuf, u64, TxnFate)>> {
-        if !dir.exists() {
-            return Ok(None);
-        }
-        let mut best: Option<(u64, PathBuf)> = None;
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(num) = name.strip_suffix(".sqllog") else {
-                continue;
-            };
-            let Ok(n) = num.parse::<u64>() else {
-                continue;
-            };
-            if best.as_ref().map_or(true, |(b, _)| n > *b) {
-                best = Some((n, entry.path()));
-            }
-        }
-        let Some((_, path)) = best else {
-            return Ok(None);
-        };
-        let Some((commit_id, fate)) = Self::segment_last_txn_state(&path)? else {
-            return Ok(None);
-        };
-        Ok(Some((path, commit_id, fate)))
-    }
-
-    fn append_recovery_fate(path: &Path, commit_id: u64, fate_sql: &'static str) -> Result<()> {
+    fn next_change_number(path: &Path) -> Result<u64> {
         let c = SqliteConnection::open(path).map_err(sqlite_err)?;
-        let next_change: i64 = c
+        let next: i64 = c
             .query_row(
                 "SELECT COALESCE(MAX(change_number), -1) + 1 FROM commandlog",
                 [],
                 |r| r.get(0),
             )
             .map_err(sqlite_err)?;
-        c.execute(
-            "INSERT INTO commandlog(change_number, commit_id, sql, arg_cnt) VALUES(?1, ?2, ?3, 0)",
-            rusqlite::params![next_change, commit_id as i64, fate_sql],
-        )
-        .map_err(sqlite_err)?;
+        if next < 0 {
+            return Err(Error::Db(format!(
+                "invalid change number in segment {}",
+                path.display()
+            )));
+        }
+        Ok(next as u64)
+    }
+
+    fn append_recovery_fate(&mut self, commit_id: u64, fate_sql: &'static str) -> Result<()> {
+        // Reuse the active writer (it holds the exclusive segment lock), as
+        // the SQLite device does.
+        let record = CommandLogRecord {
+            change_number: self.next_change_number,
+            commit_id: CommitId(commit_id),
+            operation_id: OperationId(self.next_operation_id),
+            sql: Some(fate_sql.to_string()),
+            arg_count: 0,
+            args: Vec::new(),
+        };
+        self.log.append(&record)?;
+        self.next_change_number += 1;
         Ok(())
     }
 
-    fn remove_recovery_commit(path: &Path, commit_id: u64) -> Result<()> {
-        let c = SqliteConnection::open(path).map_err(sqlite_err)?;
-        c.execute(
-            "DELETE FROM commandlog WHERE commit_id = ?1",
-            rusqlite::params![commit_id as i64],
-        )
-        .map_err(sqlite_err)?;
-        Ok(())
+    fn remove_recovery_commit(&mut self, commit_id: u64) -> Result<()> {
+        self.log.delete_commit_rows(commit_id)
     }
 
     fn resolve_in_doubt_txn_on_open(&mut self) -> Result<()> {
@@ -728,10 +776,19 @@ impl DuckDbDevice {
                     )));
                 }
                 TxnFate::Unknown => {
-                    if let Some(path) = &self.restart_segment_path {
-                        // Java SyncTxnLogger rollback recovery removes the
-                        // in-doubt commit rows instead of appending ROLLBACK.
-                        Self::remove_recovery_commit(path, slave_commit)?;
+                    if self.restart_segment_path.is_some() {
+                        // Java `TxnLogger.resolveInDoubtTxn`: drop the txn file
+                        // published for the in-doubt commit, then discard it
+                        // from the master segment (SyncTxnLogger removes the
+                        // in-doubt commit rows instead of appending ROLLBACK).
+                        let txn_file = txn_published_path(
+                            &self.cfg.segment_dir,
+                            self.current_segment_seq,
+                            slave_commit,
+                        );
+                        let _ = std::fs::remove_file(&txn_file);
+                        self.remove_recovery_commit(slave_commit)?;
+                        self.log.flush()?;
                     }
                 }
                 TxnFate::Rollback => {}
@@ -745,8 +802,9 @@ impl DuckDbDevice {
                 slave_commit
             ))),
             TxnFate::Unknown => {
-                if let Some(path) = &self.restart_segment_path {
-                    Self::append_recovery_fate(path, slave_commit, "COMMIT")
+                if self.restart_segment_path.is_some() {
+                    self.append_recovery_fate(slave_commit, "COMMIT")?;
+                    self.log.flush()
                 } else {
                     Ok(())
                 }
@@ -777,11 +835,27 @@ fn make_record(
 }
 
 fn segment_path(cfg: &DuckDbDeviceConfig, seq: SegmentSequence) -> PathBuf {
-    cfg.segment_dir.join(format!("{}.sqllog", seq.0))
+    recovery::segment_file_path(&cfg.segment_dir, seq)
 }
 
 fn txn_published_path(dir: &Path, seq: SegmentSequence, commit_id: u64) -> PathBuf {
     dir.join(format!("{}.sqllog.{}.txn", seq.0, commit_id))
+}
+
+/// Remove unpublished per-transaction stage files (`txn-<commit>-<nanos>.sqllog`)
+/// and their journals; their transactions never committed.
+fn remove_orphan_txn_stage_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("txn-")
+            && (name.ends_with(".sqllog") || name.ends_with(".sqllog-journal"))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn shadow_schema_path(cfg: &DuckDbDeviceConfig) -> PathBuf {
@@ -789,7 +863,8 @@ fn shadow_schema_path(cfg: &DuckDbDeviceConfig) -> PathBuf {
         .db_path
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("device.duckdb"));
-    cfg.segment_dir.join(format!("{}.sqlite", file_name.to_string_lossy()))
+    cfg.segment_dir
+        .join(format!("{}.sqlite", file_name.to_string_lossy()))
 }
 
 fn quote_ident(ident: &str) -> String {
@@ -849,8 +924,13 @@ fn read_duckdb_table_info(conn: &Connection, table_name: &str) -> Result<Vec<Duc
         .query_map([], |row| {
             Ok(DuckColumn {
                 name: row.get(1)?,
-                declared_type: row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "TEXT".into()),
-                nullable: row.get::<_, bool>(3).map(|not_null| !not_null).unwrap_or(true),
+                declared_type: row
+                    .get::<_, Option<String>>(2)?
+                    .unwrap_or_else(|| "TEXT".into()),
+                nullable: row
+                    .get::<_, bool>(3)
+                    .map(|not_null| !not_null)
+                    .unwrap_or(true),
                 default_value: row.get(4)?,
                 primary_key_ordinal: row.get::<_, i64>(5).unwrap_or(0),
             })
@@ -924,6 +1004,10 @@ impl DbDevice for DuckDbDevice {
         Backend::DuckDb
     }
 
+    fn last_committed_commit_id(&self) -> i64 {
+        self.last_committed_commit_id as i64
+    }
+
     fn pre_user_execute(&mut self, sql: &str, params: &[Value]) -> Result<()> {
         self.enforce_sql_policy(sql)?;
         if !is_ddl(sql) {
@@ -970,9 +1054,7 @@ impl DbDevice for DuckDbDevice {
         let bound: Vec<DuckValue> = params.iter().map(arg_to_duckvalue).collect();
         {
             let mut stmt = self.conn.prepare(sql).map_err(db_err)?;
-            let mut rows = stmt
-                .query(params_from_iter(bound.iter()))
-                .map_err(db_err)?;
+            let mut rows = stmt.query(params_from_iter(bound.iter())).map_err(db_err)?;
             while rows.next().map_err(db_err)?.is_some() {
                 // drain — DuckDB requires the result to be consumed.
             }
@@ -982,15 +1064,76 @@ impl DbDevice for DuckDbDevice {
         Ok(0)
     }
 
+    fn execute_with_result(&mut self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
+        let kind = classify_sql_statement(sql);
+        let is_readonly = kind == SqlStatementKind::ReadOnly;
+        if !is_readonly {
+            self.pre_user_execute(sql, params)?;
+            self.ensure_txn_open_for_user_sql()?;
+        }
+
+        let explicit_result = is_readonly
+            || has_top_level_keyword(sql, "RETURNING")
+            || has_top_level_keyword(sql, "EXPLAIN");
+        let bound: Vec<DuckValue> = params.iter().map(arg_to_duckvalue).collect();
+        let (columns, collected, collect_rows) = {
+            let mut stmt = self.conn.prepare(sql).map_err(db_err)?;
+            let mut rows = stmt.query(params_from_iter(bound.iter())).map_err(db_err)?;
+
+            let executed = rows.as_ref().ok_or_else(|| {
+                Error::Db("DuckDB did not expose executed statement metadata".to_string())
+            })?;
+            let col_count = executed.column_count();
+            let collect_rows =
+                explicit_result || (kind == SqlStatementKind::Unknown && col_count > 0);
+            let columns = if collect_rows {
+                let names = executed.column_names();
+                names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| ColumnInfo {
+                        name,
+                        type_name: Some(format!("{:?}", executed.column_logical_type(index))),
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            let mut collected = Vec::new();
+            while let Some(row) = rows.next().map_err(db_err)? {
+                if collect_rows {
+                    let mut out = Vec::with_capacity(col_count);
+                    for index in 0..col_count {
+                        let value: DuckValue = row.get(index).map_err(db_err)?;
+                        out.push(duckvalue_to_arg(value));
+                    }
+                    collected.push(out);
+                }
+            }
+            (columns, collected, collect_rows)
+        };
+
+        if !is_readonly {
+            self.post_user_execute(sql)?;
+            self.log_record(Some(sql), params)?;
+        }
+        Ok(ExecutionResult {
+            rows: collect_rows.then_some(collected),
+            columns,
+            row_count: None,
+            last_insert_rowid: None,
+            is_mutating: !is_readonly,
+        })
+    }
+
     fn execute_unlogged(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         self.pre_user_execute(sql, params)?;
         self.ensure_txn_open_for_user_sql()?;
         let bound: Vec<DuckValue> = params.iter().map(arg_to_duckvalue).collect();
         {
             let mut stmt = self.conn.prepare(sql).map_err(db_err)?;
-            let mut rows = stmt
-                .query(params_from_iter(bound.iter()))
-                .map_err(db_err)?;
+            let mut rows = stmt.query(params_from_iter(bound.iter())).map_err(db_err)?;
             while rows.next().map_err(db_err)?.is_some() {
                 // drain — DuckDB requires the result to be consumed.
             }
@@ -1032,7 +1175,11 @@ impl DbDevice for DuckDbDevice {
         Ok(collected)
     }
 
-    fn execute_prepared_batch(&mut self, sql: &str, batch_params: &[Vec<Value>]) -> Result<Vec<u64>> {
+    fn execute_prepared_batch(
+        &mut self,
+        sql: &str,
+        batch_params: &[Vec<Value>],
+    ) -> Result<Vec<u64>> {
         self.pre_user_execute_batch(sql, batch_params)?;
         if let Some(out) = self.try_execute_prepared_batch_with_appender(sql, batch_params)? {
             return Ok(out);
@@ -1078,6 +1225,8 @@ impl DbDevice for DuckDbDevice {
                 self.append_record(Some("COMMIT"), &[])?;
             }
         }
+        // Java `logCommitAndFlush`.
+        self.log.flush()?;
         self.flush_user_db_state()?;
         self.last_committed_commit_id = committed_id;
         self.next_commit_id = next_monotonic_commit_id(self.next_commit_id);
@@ -1142,6 +1291,8 @@ impl DbDevice for DuckDbDevice {
                 self.append_record(Some("ROLLBACK"), &[])?;
             }
         }
+        // Java `logRollbackAndFlush`.
+        self.log.flush()?;
         self.next_commit_id = next_monotonic_commit_id(self.next_commit_id);
         self.next_operation_id = 0;
         Ok(())
@@ -1154,7 +1305,8 @@ impl DbDevice for DuckDbDevice {
         // is still open here.
         let mut me = *self;
         let dangling_commit_id = me.next_commit_id;
-        let has_dangling_txn = me.next_operation_id > 0 || me.txn_runtime.is_open() || me.txn_stage.is_some();
+        let has_dangling_txn =
+            me.next_operation_id > 0 || me.txn_runtime.is_open() || me.txn_stage.is_some();
         if me.uses_staged_txn_scheme() && me.txn_runtime.is_open() {
             me.txn_runtime.close_with_tail(None);
             me.flush_txn_records(false, false)?;
@@ -1172,10 +1324,7 @@ impl DbDevice for DuckDbDevice {
         me.flush_txn_records(false, false)?;
         let logs_markers = me.logs_txn_markers();
         let DuckDbDevice {
-            cfg,
-            conn: _,
-            log,
-            ..
+            cfg, conn: _, log, ..
         } = me;
         let path = log.path().to_path_buf();
         // When the device doesn't log txn markers, segments don't carry
@@ -1185,17 +1334,12 @@ impl DbDevice for DuckDbDevice {
             log.finalize()?;
         }
         drop(log);
+        // An empty (or in-doubt) active segment stays in the device home and
+        // is reopened on restart under the same sequence: no gaps.
         if should_ship {
             if let Some(cb) = &cfg.on_segment_ready {
                 cb(&path);
             }
-        } else if rusqlite::Connection::open(&path)
-            .ok()
-            .and_then(|c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM commandlog", [], |r| r.get(0)).ok())
-            .unwrap_or(1)
-            == 0
-        {
-            std::fs::remove_file(&path).ok();
         }
         Ok(())
     }
@@ -1240,5 +1384,3 @@ fn db_err(e: duckdb::Error) -> Error {
 fn sqlite_err(e: rusqlite::Error) -> Error {
     Error::Db(e.to_string())
 }
-
-

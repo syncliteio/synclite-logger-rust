@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 pub mod datatype_mapper;
 pub use datatype_mapper::{DataTypeMapper, DstDataTypeMapping};
@@ -125,7 +125,7 @@ impl Default for DstDeviceSchemaNamePolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsolidatorLayout {
     pub work_dir: PathBuf,
     pub device_data_root: PathBuf,
@@ -371,10 +371,15 @@ impl ConsolidatorLayout {
         let device_id = device_id.into();
         let device_work_dir = work_dir.join(format!("synclite-{}-{}", device_name, device_id));
         let state_db_path = match metadata_store {
-            MetadataStore::Local => device_work_dir.join(format!("synclite_consolidator_metadata_{}.db", dst_index)),
+            MetadataStore::Local => {
+                device_work_dir.join(format!("synclite_consolidator_metadata_{}.db", dst_index))
+            }
             MetadataStore::Destination => std::env::temp_dir()
                 .join("synclite-consolidator-metadata")
-                .join(format!("synclite_consolidator_metadata_{}_{}.db", dst_index, device_id)),
+                .join(format!(
+                    "synclite_consolidator_metadata_{}_{}.db",
+                    dst_index, device_id
+                )),
         };
         let stats_db_path = device_work_dir.join("synclite_device_statistics.db");
         let consolidator_stats_db_path = work_dir.join("synclite_consolidator_statistics.db");
@@ -539,7 +544,7 @@ pub struct ApplyProgress {
 /// * Unspecified tables/columns inherit `allow_unspecified_tables` /
 ///   `allow_unspecified_columns`.
 /// * Keys are stored upper-case (parser uppercases them).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterMapperRules {
     pub enabled: bool,
     pub allow_unspecified_tables: bool,
@@ -572,22 +577,36 @@ impl FilterMapperRules {
         allow_unspecified_tables: bool,
         allow_unspecified_columns: bool,
     ) -> Result<Self, String> {
-        let f = File::open(path)
-            .map_err(|e| format!("Failed to load configuration file : {} : {}", path.display(), e))?;
+        let f = File::open(path).map_err(|e| {
+            format!(
+                "Failed to load configuration file : {} : {}",
+                path.display(),
+                e
+            )
+        })?;
         let reader = BufReader::new(f);
         let mut table_rules: HashMap<String, String> = HashMap::new();
         let mut column_rules: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut dst_to_src_table_map: HashMap<String, String> = HashMap::new();
 
         for line_res in reader.lines() {
-            let line = line_res
-                .map_err(|e| format!("Failed to read configuration file : {} : {}", path.display(), e))?;
+            let line = line_res.map_err(|e| {
+                format!(
+                    "Failed to read configuration file : {} : {}",
+                    path.display(),
+                    e
+                )
+            })?;
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             let eq_pos = trimmed.find('=').ok_or_else(|| {
-                format!("Invalid line in config file {} : {}", path.display(), trimmed)
+                format!(
+                    "Invalid line in config file {} : {}",
+                    path.display(),
+                    trimmed
+                )
             })?;
             let key = trimmed[..eq_pos].trim().to_ascii_uppercase();
             let val = trimmed[eq_pos + 1..].trim().to_string();
@@ -735,7 +754,7 @@ impl FilterMapperRules {
 /// `Map<TABLE_UPPER, Map<COLUMN_UPPER, Map<srcValueString, dstValueString>>>`.
 /// `null` source values are stored under the literal key `"null"` (Java
 /// converts via `String.valueOf(null) == "null"`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueMapperRules {
     pub enabled: bool,
     pub mappings: HashMap<String, HashMap<String, HashMap<String, String>>>,
@@ -754,10 +773,18 @@ impl ValueMapperRules {
     /// when the filter-mapper rejects the table or column.
     pub fn parse_mappings_file(path: &Path, filter: &FilterMapperRules) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| {
-            format!("Failed to parse value mappings JSON file: {} : {}", path.display(), e)
+            format!(
+                "Failed to parse value mappings JSON file: {} : {}",
+                path.display(),
+                e
+            )
         })?;
         let root: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            format!("Failed to parse value mappings JSON file: {} : {}", path.display(), e)
+            format!(
+                "Failed to parse value mappings JSON file: {} : {}",
+                path.display(),
+                e
+            )
         })?;
         let obj = root.as_object().ok_or_else(|| {
             format!(
@@ -766,7 +793,8 @@ impl ValueMapperRules {
             )
         })?;
 
-        let mut mappings: HashMap<String, HashMap<String, HashMap<String, String>>> = HashMap::new();
+        let mut mappings: HashMap<String, HashMap<String, HashMap<String, String>>> =
+            HashMap::new();
         for (table_col_key, sub) in obj {
             let parts: Vec<&str> = table_col_key.splitn(2, '.').collect();
             if parts.len() != 2 {
@@ -847,10 +875,18 @@ impl ValueMapperRules {
 /// statement strings. Returns a map keyed by ASCII-uppercased table name.
 pub fn parse_triggers_file(path: &Path) -> Result<HashMap<String, Vec<String>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| {
-        format!("Failed to parse triggers JSON file: {} : {}", path.display(), e)
+        format!(
+            "Failed to parse triggers JSON file: {} : {}",
+            path.display(),
+            e
+        )
     })?;
     let root: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        format!("Failed to parse triggers JSON file: {} : {}", path.display(), e)
+        format!(
+            "Failed to parse triggers JSON file: {} : {}",
+            path.display(),
+            e
+        )
     })?;
     let obj = root.as_object().ok_or_else(|| {
         format!(

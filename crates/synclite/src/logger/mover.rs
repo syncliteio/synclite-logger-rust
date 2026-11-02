@@ -12,14 +12,12 @@ use logger_shipper::LogShipper;
 use synclite_observability::{tracer_info, Tracer};
 
 use crate::consolidator::Consolidator;
-use crate::metadata::Metadata;
 
 /// Build a segment-ready callback that:
 ///   1. Copies the finalized segment from device home → `stage_subdir`,
 ///   2. Deletes the source file,
-///   3. Updates `log_segment_sequence_number` in the metadata file,
-///   4. Submits the staged path to `shipper` if one is configured,
-///   5. Notifies each `consolidator` about the staged main segment.
+///   3. Submits the staged path to `shipper` if one is configured,
+///   4. Notifies each `consolidator` about the staged main segment.
 ///
 /// Step 5 is the *path-only* notifier and is intended for deployments
 /// without a shipper. When a shipper is wired up the caller should pass
@@ -36,7 +34,7 @@ use crate::metadata::Metadata;
 /// and forget.
 pub fn make_callback(
     stage_subdir: PathBuf,
-    metadata_path: PathBuf,
+    _metadata_path: PathBuf,
     shipper: Option<Arc<LogShipper>>,
     consolidators: Vec<Arc<Consolidator>>,
     notify_consolidator_for_txn_files: bool,
@@ -67,6 +65,40 @@ pub fn make_callback(
             return;
         }
         let dst = stage_subdir.join(name);
+        // Per-transaction files published for this master segment
+        // (MultiWriter devices, e.g. DuckDB): `<seq>.sqllog.<commit>.txn`.
+        let txn_srcs: Vec<PathBuf> = parse_seq(name.to_string_lossy().as_ref())
+            .and_then(|seq| {
+                let parent = src.parent()?;
+                let entries = std::fs::read_dir(parent).ok()?;
+                Some(
+                    entries
+                        .flatten()
+                        .filter(|e| is_txn_file_for_seq(seq, &e.file_name().to_string_lossy()))
+                        .map(|e| e.path())
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        // Java `LogShipper` parity: txn files reach stage ahead of their
+        // master segment. Sources are deleted only after every copy
+        // succeeded (txn files first, master last), so a crash at any point
+        // leaves the master segment in the device home and the whole move is
+        // redone on restart.
+        let mut txn_dsts = Vec::with_capacity(txn_srcs.len());
+        for txn_src in &txn_srcs {
+            let txn_dst = stage_subdir.join(txn_src.file_name().unwrap_or_default());
+            if let Err(e) = std::fs::copy(txn_src, &txn_dst) {
+                tracing::error!(
+                    src = %txn_src.display(),
+                    dst = %txn_dst.display(),
+                    error = %e,
+                    "failed to copy txn file into stage"
+                );
+                return;
+            }
+            txn_dsts.push(txn_dst);
+        }
         if let Err(e) = std::fs::copy(src, &dst) {
             tracing::error!(
                 src = %src.display(),
@@ -76,6 +108,15 @@ pub fn make_callback(
             );
             return;
         }
+        for txn_src in &txn_srcs {
+            if let Err(e) = std::fs::remove_file(txn_src) {
+                tracing::warn!(
+                    src = %txn_src.display(),
+                    error = %e,
+                    "failed to delete source txn file after move"
+                );
+            }
+        }
         if let Err(e) = std::fs::remove_file(src) {
             tracing::warn!(
                 src = %src.display(),
@@ -83,71 +124,25 @@ pub fn make_callback(
                 "failed to delete source segment after move"
             );
         }
-        // For MultiWriter devices: when a main segment moves,
-        // move all published txn files for that same segment sequence too.
-        if let Some(seq) = parse_seq(name.to_string_lossy().as_ref()) {
-            if let Some(parent) = src.parent() {
-                if let Ok(entries) = std::fs::read_dir(parent) {
-                    for entry in entries.flatten() {
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        if !is_txn_file_for_seq(seq, &fname) {
-                            continue;
-                        }
-                        let txn_src = entry.path();
-                        let txn_dst = stage_subdir.join(&fname);
-                        if let Err(e) = std::fs::copy(&txn_src, &txn_dst) {
-                            tracing::error!(
-                                src = %txn_src.display(),
-                                dst = %txn_dst.display(),
-                                error = %e,
-                                "failed to copy txn file into stage"
-                            );
-                            continue;
-                        }
-                        if let Err(e) = std::fs::remove_file(&txn_src) {
-                            tracing::warn!(
-                                src = %txn_src.display(),
-                                error = %e,
-                                "failed to delete source txn file after move"
-                            );
-                        }
-                        if let Some(sh) = &shipper {
-                            if let Err(e) = sh.submit(&txn_dst) {
-                                tracing::error!(
-                                    segment = %txn_dst.display(),
-                                    error = %e,
-                                    "failed to enqueue txn file for shipping"
-                                );
-                            }
-                        }
-                        if notify_consolidator_for_txn_files {
-                            for consolidator in &consolidators {
-                                if let Err(e) = consolidator.notify_stage_path(txn_dst.clone()) {
-                                    tracing::error!(
-                                        segment = %txn_dst.display(),
-                                        error = %e,
-                                        "failed to notify consolidator about staged txn file"
-                                    );
-                                }
-                            }
-                        }
-                    }
+        for txn_dst in &txn_dsts {
+            if let Some(sh) = &shipper {
+                if let Err(e) = sh.submit(txn_dst) {
+                    tracing::error!(
+                        segment = %txn_dst.display(),
+                        error = %e,
+                        "failed to enqueue txn file for shipping"
+                    );
                 }
             }
-        }
-        // Best-effort: persist the seq we just moved.
-        if let Some(seq) = parse_seq(name.to_string_lossy().as_ref()) {
-            match Metadata::open_or_create(&metadata_path) {
-                Ok(md) => {
-                    if let Err(e) = md.put_i64("log_segment_sequence_number", seq as i64) {
-                        tracing::warn!(
+            if notify_consolidator_for_txn_files {
+                for consolidator in &consolidators {
+                    if let Err(e) = consolidator.notify_stage_path(txn_dst.clone()) {
+                        tracing::error!(
+                            segment = %txn_dst.display(),
                             error = %e,
-                            "failed to update log_segment_sequence_number"
+                            "failed to notify consolidator about staged txn file"
                         );
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to open metadata for seq update");
                 }
             }
         }

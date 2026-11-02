@@ -37,4 +37,3 @@ impl fmt::Display for LogSegmentStatus {
         f.write_str(self.as_str())
     }
 }
-

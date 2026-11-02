@@ -12,6 +12,11 @@ description = "Consolidator state, checkpoint, and bootstrap helpers."
 [lib]
 name = "consolidator_state"
 
+[features]
+default = []
+# Kept as a compatibility alias; DuckDB is always compiled in.
+duckdb = []
+
 [dependencies]
 consolidator-core.workspace = true
 logger-core.workspace = true
@@ -19,5 +24,14 @@ rusqlite.workspace = true
 duckdb.workspace = true
 postgres.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["time", "net"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 

@@ -1,13 +1,19 @@
 # synclite-logger (Python)
 
-PyO3 bindings over the SyncLite Rust runtime. The Python API mirrors the
-Rust wrapper crate 1:1 — `Connection`, `Statement`, `DuckDBConnection`,
-`DuckDBStatement`, plus module-level `initialize` and `await_sync` — so
-Python samples read like the Rust examples in
-`synclite-logger-rust/crates/synclite/examples/`.
+PyO3 bindings over the SyncLite Rust runtime. The package offers two layers:
 
-No DB-API adapter, no pre/post hooks, no separate user-DB connection.
-Python holds a `Connection` directly bound to the Rust type.
+- The basic API mirrors the Rust wrapper crate 1:1 — `Connection`,
+  `Statement`, `DuckDBConnection`, `DuckDBStatement`, plus module-level
+  `initialize` and `await_sync`.
+- `synclite.dbapi2` is a PEP 249 / Python DB-API 2.0 facade with connections,
+  cursors, transactions, result metadata, fetch methods, and standard DB-API
+  exceptions.
+- Optional SQLAlchemy 2.x dialects (`sqlite+synclite` and `duckdb+synclite`)
+    reuse the existing SQLite and DuckDB SQL behavior but route driver calls
+    through the SyncLite DB-API facade.
+
+Both layers use the same native connection; there is no separate unlogged
+user-database connection.
 
 ## Build / install (editable, dev)
 
@@ -76,6 +82,107 @@ sl.await_sync("myapp.db", 30.0)
 conn.close()
 ```
 
+## Python DB-API 2.0
+
+Initialize destinations with the basic API as usual, then open the database
+through `synclite.dbapi2`:
+
+```python
+import synclite as sl
+from synclite import dbapi2
+
+sl.initialize(
+        device_type="SQLITE",
+        device_name="sampledevice",
+        db_path="myapp.db",
+        destination=sl.DestinationOptions(
+                dst_type="POSTGRES",
+                dst_connection_string="postgresql://user:pw@localhost:5432/syncdb",
+                dst_database="syncdb",
+                dst_schema="public",
+        ),
+)
+
+with dbapi2.connect("myapp.db") as conn:
+        with conn.cursor() as cursor:
+                cursor.execute("INSERT INTO t(name) VALUES(?)", ("Alice",))
+                print(cursor.lastrowid)  # SQLite only
+
+                cursor.execute("SELECT id, name FROM t ORDER BY id")
+                print(cursor.description)
+                for row in cursor:
+                        print(row)
+
+conn.close()
+```
+
+Use `dbapi2.connect("myapp.duckdb", backend="duckdb")` for DuckDB, or pass
+`config_path=...` to call the corresponding native `open_with_config` API.
+Passing `initialize=True` selects the native initialize-and-open variant.
+
+DB-API behavior and backend notes:
+
+- `apilevel = "2.0"`, `threadsafety = 1`, and `paramstyle = "qmark"`.
+- DB-API connections run with native autocommit disabled. `commit()` and
+    `rollback()` define transaction fate, and `close()` rolls back pending work.
+    These transaction guarantees apply to transactional `SQLITE` and `DUCKDB`
+    devices; STORE and STREAMING device modes retain their native SyncLite
+    transaction semantics.
+- `Connection.flush()` rolls committed SyncLite log work only. It raises
+    `ProgrammingError` while the wrapper is tracking uncommitted mutations;
+    call `commit()` or `rollback()` first.
+- Query rows are buffered eagerly. `fetchone`, `fetchmany`, `fetchall`, cursor
+    iteration, and multiple independent cursors are supported.
+- `cursor.description` is available even when a query returns zero rows. Each
+    entry is the required seven-item DB-API sequence; unavailable size,
+    precision, scale, and nullability fields are `None`.
+- SQLite reports affected-row counts and `lastrowid` for successful insert-like
+    statements when SQLite produces a new row id.
+- DuckDB does not provide a general SQLite-style generated row ID, so
+    `cursor.lastrowid` is always `None`. Use `INSERT ... RETURNING` to retrieve
+    generated values. DuckDB mutation row counts are `-1` when unavailable.
+- The existing basic `execute()` and `query()` APIs are unchanged. Metadata is
+    collected only by `execute_with_result()` and the DB-API facade.
+
+## SQLAlchemy 2.x
+
+Install the optional dialect dependencies with `pip install "synclite[sqlalchemy]"`
+for SQLite or `pip install "synclite[sqlalchemy-duckdb]"` for DuckDB.
+Initialize the SyncLite device and its destination *before* creating an
+SQLAlchemy engine (see the [core](../../synclite-code-samples/python/core/synclite_rusqlite_postgres.py),
+[DB-API](../../synclite-code-samples/python/dbapi/synclite_dbapi_postgres.py), and
+[SQLAlchemy](../../synclite-code-samples/python/sqlalchemy/synclite_sqlalchemy_postgres.py)
+samples):
+
+```python
+import synclite as sl
+from sqlalchemy import create_engine, text
+
+sl.initialize(
+    device_type="SQLITE", device_name="sampledevice", db_path="myapp.db",
+    destination=sl.DestinationOptions(
+        dst_type="POSTGRES",
+        dst_connection_string="postgresql://user:pw@localhost:5432/syncdb",
+        dst_database="syncdb", dst_schema="public",
+        dst_sync_mode="REPLICATION",
+    ),
+)
+engine = create_engine("sqlite+synclite:///myapp.db")
+with engine.begin() as connection:
+    connection.execute(text("INSERT INTO t(name) VALUES(:name)"), {"name": "Alice"})
+engine.dispose()
+```
+
+`sqlite+synclite` means SQLite SQL with SyncLite's logged driver, **not** a
+direct connection to the PostgreSQL destination. For DuckDB, initialize a
+`DUCKDB` device and use `duckdb+synclite:///myapp.duckdb`. The dialects use
+`NullPool` because native connections are thread-affine; savepoints, two-phase
+transactions, and autocommit isolation are unsupported. SQLAlchemy commits
+locally; use SyncLite `flush()` and `await_sync()` separately when a short-lived
+application needs to wait for destination delivery. These dialects require a
+SyncLite wheel containing the DB-API and SQLAlchemy adapter; an older installed
+wheel will not expose them.
+
 For multiple destinations, use the same `initialize(...)` API with a non-empty
 `destinations` sequence:
 
@@ -123,13 +230,18 @@ parameterless statements.
 - `Connection.open(path)` / `open_with_config(path)` /
   `initialize(path)` / `initialize_with_config(path)`
 - `Connection.execute(sql, params=None) -> int`
+- `Connection.execute_with_result(sql, params=None) -> ExecutionResult`
 - `Connection.query(sql, params=None) -> list[tuple]`
 - `Connection.prepare(sql) -> Statement`
 - `Connection.{commit,rollback,flush,close,set_auto_commit,get_auto_commit}`
 - `Statement.execute(params=None) -> int`
+- `Statement.execute_with_result(params=None) -> ExecutionResult`
 - `Statement.query(params=None) -> list[tuple]`
 - `Statement.{add_batch,clear_batch,execute_batch}`
 - `DuckDBConnection` / `DuckDBStatement`: identical shape.
+- `dbapi2.connect(path, backend="sqlite", config_path=None, initialize=False)`
+- `dbapi2.Connection.{cursor,execute,executemany,commit,rollback,close,flush}`
+- `dbapi2.Cursor.{execute,executemany,fetchone,fetchmany,fetchall,close}`
 
 `device_type`, `dst_type`, `dst_sync_mode` are accepted as
 case-insensitive strings:

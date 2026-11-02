@@ -6,9 +6,7 @@ use std::time::Duration;
 use logger_core::DeviceType;
 use logger_db_traits::Value;
 use synclite::rusqlite::Connection as SlConn;
-use synclite::{
-    DestinationOptions, DstSyncMode, DstType, SyncLiteOptions, SyncState,
-};
+use synclite::{DestinationOptions, DstSyncMode, DstType, SyncLiteOptions, SyncState};
 
 fn fresh_workspace(tag: &str) -> (PathBuf, PathBuf) {
     let base = std::env::temp_dir()
@@ -58,6 +56,52 @@ fn sync_status_reports_not_initialized_before_first_init() {
     let (db, _dst) = fresh_workspace("not-init");
     let st = synclite::sync_status(&db).expect("status");
     assert_eq!(st.state, SyncState::NotInitialized);
+}
+
+#[test]
+#[ignore = "requires SYNCLITE_TEST_POSTGRES_URL pointing to an isolated test server"]
+fn postgres_initialize_reopen_await_uses_one_worker_and_one_snapshot() {
+    let (db, _) = fresh_workspace("postgres-reopen");
+    let root = db.parent().unwrap();
+    let work = root.join("work");
+    let schema = format!("synclite_facade_{}", uuid::Uuid::new_v4().simple());
+    let url = std::env::var("SYNCLITE_TEST_POSTGRES_URL").expect("test PostgreSQL URL");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let database: String = client.query_one("SELECT current_database()", &[]).unwrap().get(0);
+    let mut config = logger_config::SyncLiteConfig::default();
+    config.local_stage_dir = Some(root.join("stage"));
+    config.extra.insert(synclite::DEVICE_DATA_ROOT_KEY.into(), work.to_string_lossy().into_owned());
+    config.extra.insert("device-polling-interval-ms".into(), "20".into());
+    synclite::initialize(DeviceType::SQLITE, "pgreopen", &db, Some(DestinationOptions {
+        dst_type: DstType::Postgres,
+        dst_connection_string: url.clone(),
+        dst_database: Some(database),
+        dst_schema: Some(schema.clone()),
+        dst_sync_mode: DstSyncMode::Replication,
+    }), SyncLiteOptions { config: Some(config), ..SyncLiteOptions::default() }).unwrap();
+    write_rows(&db, &[(1, "first"), (2, "second")]);
+    synclite::await_sync(&db, Duration::from_secs(30)).expect("first PostgreSQL sync");
+    write_rows(&db, &[(3, "after reopen")]);
+    synclite::await_sync(&db, Duration::from_secs(30)).expect("reopened PostgreSQL sync");
+    let latency = synclite::sync_latency(&db).unwrap();
+    assert_eq!(latency.latency_ms, 0);
+    assert_eq!(client.query_one(&format!("SELECT COUNT(*) FROM {schema}.items"), &[]).unwrap().get::<_, i64>(0), 3);
+    let trace_path = std::fs::read_dir(&work).unwrap().filter_map(Result::ok)
+        .map(|entry| entry.path().join("synclite_device.trace")).find(|path| path.is_file()).expect("worker trace");
+    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    assert_eq!(trace.matches("Worker started/bootstrap pending").count(), 1, "{trace}");
+    assert_eq!(trace.matches("Starting to consolidate device snapshot :").count(), 1, "{trace}");
+    assert_eq!(trace.matches("Finished consolidating device snapshot :").count(), 1, "{trace}");
+    assert_eq!(trace.matches("Device status : INITIALIZED").count(), 1, "{trace}");
+    assert!(!trace.contains("step="), "INFO must not contain polling steps: {trace}");
+    assert!(!trace.contains("ALTER TABLE"), "fresh schema must not be promoted: {trace}");
+    assert!(!trace.contains("ERROR"), "{trace}");
+    println!("Trace analysis: initialize + two open/close/await cycles = one worker, one committed snapshot, three destination rows, zero pending latency.");
+    println!("Trace retained at {}", trace_path.display());
+    for line in trace.lines().filter(|line| line.contains("DeviceDstInitializer") || line.contains("Worker started") || line.contains("Device status :")) {
+        println!("{line}");
+    }
+    client.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
 }
 
 #[test]

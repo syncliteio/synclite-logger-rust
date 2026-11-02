@@ -71,6 +71,8 @@ pub fn reinitialize<P: AsRef<Path>>(db_path: P) -> Result<()> {
         Snapshot::read(&md, &layout)?
     };
 
+    consolidator_runtime::Consolidator::shutdown_device(&snap.uuid, &snap.device_name)?;
+
     // Destination metadata cleanup first: if it fails the local state
     // is still intact so the caller can retry once the destination is
     // reachable. We delete every row this device owns in the

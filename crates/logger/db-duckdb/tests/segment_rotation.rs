@@ -76,17 +76,14 @@ fn main_segment_count(segment_dir: &Path) -> usize {
     std::fs::read_dir(segment_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|x| x.to_str()) == Some("sqllog")
-        })
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("sqllog"))
         .count()
 }
 
 #[test]
 fn count_threshold_rotates_on_commit_boundary() {
     let dir = TempDir::new("count");
-    let mut cfg =
-        DuckDbDeviceConfig::new(dir.path().join("user.duckdb"), dir.path().join("stage"));
+    let mut cfg = DuckDbDeviceConfig::new(dir.path().join("user.duckdb"), dir.path().join("stage"));
     cfg.log_segment_switch_log_count_threshold = Some(2);
     cfg.log_segment_switch_duration_threshold_ms = None;
 
@@ -124,8 +121,7 @@ fn count_threshold_rotates_on_commit_boundary() {
 #[test]
 fn duration_threshold_rotates_on_commit_boundary() {
     let dir = TempDir::new("time");
-    let mut cfg =
-        DuckDbDeviceConfig::new(dir.path().join("user.duckdb"), dir.path().join("stage"));
+    let mut cfg = DuckDbDeviceConfig::new(dir.path().join("user.duckdb"), dir.path().join("stage"));
     cfg.log_segment_switch_log_count_threshold = None;
     cfg.log_segment_switch_duration_threshold_ms = Some(1);
 

@@ -1,17 +1,18 @@
 //! Python bindings (PyO3) over the `synclite` wrapper crate.
 //!
 //! Mirrors the Rust user-facing API 1:1 so Python samples read like the
-//! `synclite_rusqlite.rs` / `synclite_duckdb.rs` examples — no DB-API
-//! adapter, no pre/post hooks, no separate user-DB connection. Python
-//! holds a `Connection` and a `Statement` directly bound to the Rust
-//! types.
+//! `synclite_rusqlite.rs` / `synclite_duckdb.rs` examples. Python holds a
+//! `Connection` and a `Statement` directly bound to the Rust types. The
+//! optional `execute_with_result` path also exposes rows and metadata used
+//! by the pure-Python DB-API facade.
 //!
 //! Surface:
 //!
 //! - module fns: `initialize`, `await_sync`
 //! - classes: `Connection` (sqlite / sqlite-store / streaming),
 //!   `DuckDBConnection` (duckdb / duckdb-store), `Statement`,
-//!   `DuckDBStatement`, `DestinationOptions`
+//!   `DuckDBStatement`, `DestinationOptions`, `ColumnInfo`,
+//!   `ExecutionResult`
 //!
 //! `DeviceType`, `DstType`, `DstSyncMode` are accepted as case-insensitive
 //! strings on the Python side to keep the binding small.
@@ -22,14 +23,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use logger_core::DeviceType;
-use logger_db_traits::Value;
+use logger_db_traits::{ColumnInfo, ExecutionResult, Value};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use synclite::{
-    duckdb as sl_duck,
-    rusqlite as sl_sqlite,
-    DestinationOptions as RustDestinationOptions, DstSyncMode, DstType, SyncLiteOptions,
+    duckdb as sl_duck, rusqlite as sl_sqlite, DestinationOptions as RustDestinationOptions,
+    DstSyncMode, DstType, SyncLiteOptions,
 };
 
 /// Owns the background ticker for one managed Python connection.
@@ -223,6 +223,103 @@ impl PyDestinationOptions {
     }
 }
 
+// ---------- result metadata -------------------------------------------------
+
+/// Python view of one backend result column.
+#[pyclass(module = "synclite._native", name = "ColumnInfo", frozen)]
+#[derive(Clone)]
+struct PyColumnInfo {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    type_name: Option<String>,
+}
+
+#[pymethods]
+impl PyColumnInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "ColumnInfo(name={:?}, type_name={:?})",
+            self.name, self.type_name
+        )
+    }
+}
+
+/// Python view of one eager SQL execution result.
+#[pyclass(module = "synclite._native", name = "ExecutionResult", frozen)]
+struct PyExecutionResult {
+    rows: Option<Vec<Vec<Value>>>,
+    columns: Vec<ColumnInfo>,
+    row_count: Option<u64>,
+    last_insert_rowid: Option<i64>,
+    is_mutating: bool,
+}
+
+impl From<ExecutionResult> for PyExecutionResult {
+    fn from(result: ExecutionResult) -> Self {
+        Self {
+            rows: result.rows,
+            columns: result.columns,
+            row_count: result.row_count,
+            last_insert_rowid: result.last_insert_rowid,
+            is_mutating: result.is_mutating,
+        }
+    }
+}
+
+#[pymethods]
+impl PyExecutionResult {
+    #[getter]
+    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
+        self.rows
+            .as_ref()
+            .map(|rows| rows_to_pylist(py, rows.clone()))
+            .transpose()
+    }
+
+    #[getter]
+    fn columns(&self, py: Python<'_>) -> PyResult<Vec<Py<PyColumnInfo>>> {
+        self.columns
+            .iter()
+            .map(|column| {
+                Py::new(
+                    py,
+                    PyColumnInfo {
+                        name: column.name.clone(),
+                        type_name: column.type_name.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[getter]
+    fn row_count(&self) -> Option<u64> {
+        self.row_count
+    }
+
+    #[getter]
+    fn last_insert_rowid(&self) -> Option<i64> {
+        self.last_insert_rowid
+    }
+
+    #[getter]
+    fn is_mutating(&self) -> bool {
+        self.is_mutating
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ExecutionResult(rows={}, columns={}, row_count={:?}, last_insert_rowid={:?}, is_mutating={})",
+            self.rows.as_ref().map_or("None".to_string(), |rows| rows.len().to_string()),
+            self.columns.len(),
+            self.row_count,
+            self.last_insert_rowid,
+            self.is_mutating,
+        )
+    }
+}
+
 // ---------- Connection (sqlite / sqlite-store / streaming) ------------------
 
 /// SyncLite-wrapped SQLite-family connection — `rusqlite`-shaped.
@@ -277,6 +374,19 @@ impl PyConnection {
     ) -> PyResult<u64> {
         let p = convert_params(py, params)?;
         self.with_conn(|c| c.execute(sql, &p).map_err(map_err))
+    }
+
+    /// Execute one statement and return rows plus result metadata.
+    #[pyo3(signature = (sql, params = None))]
+    fn execute_with_result(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyExecutionResult>> {
+        let p = convert_params(py, params)?;
+        let result = self.with_conn(|c| c.execute_with_result(sql, &p).map_err(map_err))?;
+        Py::new(py, PyExecutionResult::from(result))
     }
 
     /// Execute a query and return all rows as `list[tuple]`.
@@ -405,15 +515,25 @@ struct PyStatement {
 impl PyStatement {
     /// Execute the prepared statement once.
     #[pyo3(signature = (params = None))]
-    fn execute(
-        &self,
-        py: Python<'_>,
-        params: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<u64> {
+    fn execute(&self, py: Python<'_>, params: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
         let p = convert_params(py, params)?;
         let bound = self.conn.bind(py);
         let conn = bound.borrow();
         conn.with_conn(|c| c.execute(&self.sql, &p).map_err(map_err))
+    }
+
+    /// Execute once and return rows plus result metadata.
+    #[pyo3(signature = (params = None))]
+    fn execute_with_result(
+        &self,
+        py: Python<'_>,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyExecutionResult>> {
+        let p = convert_params(py, params)?;
+        let bound = self.conn.bind(py);
+        let conn = bound.borrow();
+        let result = conn.with_conn(|c| c.execute_with_result(&self.sql, &p).map_err(map_err))?;
+        Py::new(py, PyExecutionResult::from(result))
     }
 
     /// Run a query through the prepared statement.
@@ -505,6 +625,18 @@ impl PyDuckConnection {
     ) -> PyResult<u64> {
         let p = convert_params(py, params)?;
         self.with_conn(|c| c.execute(sql, &p).map_err(map_err))
+    }
+
+    #[pyo3(signature = (sql, params = None))]
+    fn execute_with_result(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyExecutionResult>> {
+        let p = convert_params(py, params)?;
+        let result = self.with_conn(|c| c.execute_with_result(sql, &p).map_err(map_err))?;
+        Py::new(py, PyExecutionResult::from(result))
     }
 
     #[pyo3(signature = (sql, params = None))]
@@ -623,15 +755,24 @@ struct PyDuckStatement {
 #[pymethods]
 impl PyDuckStatement {
     #[pyo3(signature = (params = None))]
-    fn execute(
-        &self,
-        py: Python<'_>,
-        params: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<u64> {
+    fn execute(&self, py: Python<'_>, params: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
         let p = convert_params(py, params)?;
         let bound = self.conn.bind(py);
         let conn = bound.borrow();
         conn.with_conn(|c| c.execute(&self.sql, &p).map_err(map_err))
+    }
+
+    #[pyo3(signature = (params = None))]
+    fn execute_with_result(
+        &self,
+        py: Python<'_>,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyExecutionResult>> {
+        let p = convert_params(py, params)?;
+        let bound = self.conn.bind(py);
+        let conn = bound.borrow();
+        let result = conn.with_conn(|c| c.execute_with_result(&self.sql, &p).map_err(map_err))?;
+        Py::new(py, PyExecutionResult::from(result))
     }
 
     #[pyo3(signature = (params = None))]
@@ -716,10 +857,7 @@ fn map_err(err: logger_core::Error) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
-fn convert_params(
-    py: Python<'_>,
-    params: Option<&Bound<'_, PyAny>>,
-) -> PyResult<Vec<Value>> {
+fn convert_params(py: Python<'_>, params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
     let Some(obj) = params else {
         return Ok(Vec::new());
     };
@@ -781,10 +919,7 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
     })
 }
 
-fn rows_to_pylist<'py>(
-    py: Python<'py>,
-    rows: Vec<Vec<Value>>,
-) -> PyResult<Bound<'py, PyList>> {
+fn rows_to_pylist<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py, PyList>> {
     let out = PyList::empty_bound(py);
     for row in rows {
         let mut cells: Vec<Bound<'py, PyAny>> = Vec::with_capacity(row.len());
@@ -801,6 +936,8 @@ fn rows_to_pylist<'py>(
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDestinationOptions>()?;
+    m.add_class::<PyColumnInfo>()?;
+    m.add_class::<PyExecutionResult>()?;
     m.add_class::<PyConnection>()?;
     m.add_class::<PyStatement>()?;
     m.add_class::<PyDuckConnection>()?;

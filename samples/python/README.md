@@ -45,12 +45,31 @@ work unchanged against either.
 ## Run a sample
 
 ```pwsh
-python synclite_rusqlite.py
+python core\synclite_rusqlite.py
 ```
+
+The samples are grouped by Python API layer:
+
+| Folder | Sample | API |
+| --- | --- | --- |
+| `core` | `synclite_rusqlite.py` | Direct SyncLite `Connection` / `Statement` API |
+| `dbapi` | `synclite_dbapi.py` | PEP 249 `synclite.dbapi2` API |
+| `sqlalchemy` | `synclite_sqlalchemy.py` | SQLAlchemy `sqlite+synclite` dialect |
+
+The `dbapi` sample uses `executemany`, cursors, `fetchall`, and standard
+transaction methods. The `sqlalchemy` sample requires the optional extra:
+
+```pwsh
+pip install "synclite[sqlalchemy]"
+python sqlalchemy\synclite_sqlalchemy.py
+```
+
+All three samples perform the same local CRUD flow and then call
+`await_sync`; only the application-facing API changes.
 
 | Sample                            | Mirrors Rust example         | Device type     |
 | --------------------------------- | ---------------------------- | --------------- |
-| `synclite_rusqlite.py`            | `synclite_rusqlite.rs`       | `SQLITE`        |
+| `core/synclite_rusqlite.py`       | `synclite_rusqlite.rs`       | `SQLITE`        |
 | `synclite_rusqlite_store.py`      | `synclite_rusqlite_store.rs` | `SQLITE_STORE`  |
 | `synclite_streaming.py`           | `synclite_streaming.rs`      | `STREAMING`     |
 | `synclite_duckdb.py`              | `synclite_duckdb.rs`         | `DUCKDB`        |

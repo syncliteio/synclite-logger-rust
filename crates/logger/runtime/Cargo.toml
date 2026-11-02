@@ -9,6 +9,11 @@ repository.workspace = true
 homepage.workspace = true
 description = "Runtime adapter that wires SyncLite config and device initialization for language bindings."
 
+[features]
+default = []
+# Kept as a compatibility alias; DuckDB is always compiled in by synclite.
+duckdb = ["synclite/duckdb"]
+
 [dependencies]
 logger-core.workspace = true
 logger-config.workspace = true

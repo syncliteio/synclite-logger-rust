@@ -697,8 +697,12 @@ End-to-end runnable samples (Rust, Python, C++) — including the marquee
 - [samples/rust/](samples/rust/) — Cargo package with one runnable example per
   device type plus `synclite_rusqlite_postgres` (`cargo run --example
   synclite_rusqlite_postgres`).
-- [samples/python/](samples/python/) — uses the `synclite` PyO3 wheel; same
-  sample set, same names.
+- [samples/python/](samples/python/) — uses the `synclite` PyO3 wheel; choose
+  [core](samples/python/core/synclite_rusqlite.py),
+  [DB-API 2.0](samples/python/dbapi/synclite_dbapi.py), or
+  [SQLAlchemy](samples/python/sqlalchemy/synclite_sqlalchemy.py). The core API
+  mirrors the Rust connection and statement calls; the other two adapt them
+  to standard Python interfaces.
 - [samples/cpp/](samples/cpp/) — CMake project that links the `synclite-c`
   cdylib through the header-only `synclite.hpp` RAII wrapper.
 

@@ -20,7 +20,10 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let n = N.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("synclite-{tag}-{nanos:x}-{n}"));
         std::fs::create_dir_all(&p).unwrap();
@@ -49,7 +52,10 @@ fn find_stage_subdir(stage: &Path, device_name: &str) -> PathBuf {
             return entry.path();
         }
     }
-    panic!("no stage subdir matching {prefix}* under {}", stage.display());
+    panic!(
+        "no stage subdir matching {prefix}* under {}",
+        stage.display()
+    );
 }
 
 fn user_home_dir() -> PathBuf {
@@ -67,7 +73,10 @@ fn user_home_dir() -> PathBuf {
 }
 
 fn test_home() -> PathBuf {
-    user_home_dir().join("synclite").join("test").join("rustruntime")
+    user_home_dir()
+        .join("synclite")
+        .join("test")
+        .join("rustruntime")
 }
 
 fn rm_rf(path: &Path) {
@@ -109,9 +118,7 @@ fn wait_for_row_count(db_path: &Path, table: &str, expected: i64) {
 
     let conn = Connection::open(db_path).unwrap();
     let n: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(-1);
-    panic!(
-        "timed out waiting for row count in table {table}; expected {expected}, got {n}"
-    );
+    panic!("timed out waiting for row count in table {table}; expected {expected}, got {n}");
 }
 
 fn wait_for_min_row_count(db_path: &Path, table: &str, min_expected: i64) {
@@ -195,7 +202,8 @@ fn testrustSqliteSqliteShip() {
     let stage = test_root.join("stageDir");
     let target = test_root.join("workDir").join(name);
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join(name)
         .join(format!("{name}.db"));
     let conf = db.parent().unwrap().join("synclite.conf");
@@ -225,7 +233,7 @@ fn testrustSqliteSqliteShip() {
 
     synclite::initialize(
         logger_core::DeviceType::SQLITE,
-        "testdevice",
+        name,
         &db,
         None,
         synclite::SyncLiteOptions {
@@ -240,24 +248,41 @@ fn testrustSqliteSqliteShip() {
         .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
         .unwrap();
     logger
-        .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(7)])
+        .execute(
+            &format!("INSERT INTO {table}(x) VALUES (?)"),
+            &[ArgValue::Int(7)],
+        )
         .unwrap();
     logger.close().unwrap();
 
     // Segment 0 was shipped to the target dir.
     let shipped = target.join("0.sqllog");
-    assert!(shipped.exists(), "shipped segment missing: {}", shipped.display());
+    assert!(
+        shipped.exists(),
+        "shipped segment missing: {}",
+        shipped.display()
+    );
 
     // Local stage segment was cleaned by the cleaner after shipping.
     let stage_subdir = find_stage_subdir(&stage, name);
     let staged = stage_subdir.join("0.sqllog");
-    assert!(!staged.exists(), "staged segment should be cleaned: {}", staged.display());
+    assert!(
+        !staged.exists(),
+        "staged segment should be cleaned: {}",
+        staged.display()
+    );
 
     // Device home exists with metadata file.
     let device_home: PathBuf = format!("{}.synclite", db.display()).into();
-    assert!(device_home.exists(), "device home missing: {}", device_home.display());
+    assert!(
+        device_home.exists(),
+        "device home missing: {}",
+        device_home.display()
+    );
     let db_file = db.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(device_home.join(format!("{db_file}.synclite.metadata")).exists());
+    assert!(device_home
+        .join(format!("{db_file}.synclite.metadata"))
+        .exists());
 
     // The shipped segment carries the user SQL rows; initialize may also
     // contribute setup rows, so avoid asserting an exact global count.
@@ -271,7 +296,9 @@ fn testrustSqliteSqliteShip() {
         .unwrap();
     let insert_count: i64 = seg
         .query_row(
-            &format!("SELECT count(*) FROM commandlog WHERE sql LIKE 'INSERT INTO {table}(x) VALUES (%'"),
+            &format!(
+                "SELECT count(*) FROM commandlog WHERE sql LIKE 'INSERT INTO {table}(x) VALUES (%'"
+            ),
             [],
             |r| r.get(0),
         )
@@ -288,7 +315,8 @@ fn testrustDuckdbDuckdbShip() {
     let stage = test_root.join("stageDir");
     let target = test_root.join("workDir").join(name);
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join(name)
         .join(format!("{name}.duckdb"));
     let conf = db.parent().unwrap().join("synclite.conf");
@@ -318,7 +346,7 @@ fn testrustDuckdbDuckdbShip() {
 
     synclite::initialize(
         logger_core::DeviceType::DUCKDB,
-        "testdevice",
+        name,
         &db,
         None,
         synclite::SyncLiteOptions {
@@ -333,7 +361,10 @@ fn testrustDuckdbDuckdbShip() {
         .execute(&format!("CREATE TABLE {table}(ts BIGINT, v DOUBLE)"), &[])
         .unwrap();
     logger
-        .execute(&format!("INSERT INTO {table} VALUES (?, ?)"), &[ArgValue::Int(1), ArgValue::Real(1.5)])
+        .execute(
+            &format!("INSERT INTO {table} VALUES (?, ?)"),
+            &[ArgValue::Int(1), ArgValue::Real(1.5)],
+        )
         .unwrap();
     logger.close().unwrap();
 
@@ -357,7 +388,8 @@ fn testrustSqliteSqliteNoDestination() {
     let test_root = test_home();
     let stage = test_root.join("stageDir");
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join(name)
         .join(format!("{name}.db"));
     let conf = db.parent().unwrap().join("synclite.conf");
@@ -382,7 +414,7 @@ fn testrustSqliteSqliteNoDestination() {
 
     synclite::initialize(
         logger_core::DeviceType::SQLITE,
-        "testdevice",
+        name,
         &db,
         None,
         synclite::SyncLiteOptions {
@@ -393,13 +425,19 @@ fn testrustSqliteSqliteNoDestination() {
     .unwrap();
     let mut logger = Logger::open(&conf).unwrap();
     let table = name;
-    logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
+    logger
+        .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+        .unwrap();
     logger.close().unwrap();
 
     // No shipping ? segment lives under the stage subdir.
     let stage_subdir = find_stage_subdir(&stage, name);
     let staged = stage_subdir.join("0.sqllog");
-    assert!(staged.exists(), "staged segment missing: {}", staged.display());
+    assert!(
+        staged.exists(),
+        "staged segment missing: {}",
+        staged.display()
+    );
 }
 
 #[test]
@@ -419,6 +457,14 @@ fn testrustSqlitestoreSqliteConsolidate() {
     fs::create_dir_all(&stage).unwrap();
     fs::create_dir_all(&work_dir).unwrap();
     fs::create_dir_all(&db_dir).unwrap();
+    // The destination DB is shared with other suites and CONSOLIDATION
+    // appends, so drop this test's table left behind by a previous run.
+    if dest_db.exists() {
+        Connection::open(&dest_db)
+            .unwrap()
+            .execute_batch(&format!("DROP TABLE IF EXISTS {name}"))
+            .unwrap();
+    }
     fs::write(
         &conf,
         format!(
@@ -545,7 +591,7 @@ fn testrustSqlitestoreSqliteConsolidate() {
 
     synclite::initialize(
         logger_core::DeviceType::SQLITE_STORE,
-        "testdevice",
+        name,
         &db,
         None,
         synclite::SyncLiteOptions {
@@ -556,12 +602,23 @@ fn testrustSqlitestoreSqliteConsolidate() {
     .unwrap();
     let mut logger = Logger::open(&conf).unwrap();
     let table = name;
-    logger.execute(&format!("CREATE TABLE {table}(id INTEGER PRIMARY KEY, v TEXT)"), &[]).unwrap();
     logger
-        .execute(&format!("INSERT INTO {table}(id, v) VALUES (?, ?)",), &[ArgValue::Int(1), ArgValue::Text("a".into())],)
+        .execute(
+            &format!("CREATE TABLE {table}(id INTEGER PRIMARY KEY, v TEXT)"),
+            &[],
+        )
         .unwrap();
     logger
-        .execute(&format!("INSERT INTO {table}(id, v) VALUES (?, ?)",), &[ArgValue::Int(2), ArgValue::Text("b".into())],)
+        .execute(
+            &format!("INSERT INTO {table}(id, v) VALUES (?, ?)",),
+            &[ArgValue::Int(1), ArgValue::Text("a".into())],
+        )
+        .unwrap();
+    logger
+        .execute(
+            &format!("INSERT INTO {table}(id, v) VALUES (?, ?)",),
+            &[ArgValue::Int(2), ArgValue::Text("b".into())],
+        )
         .unwrap();
     logger.close().unwrap();
 
@@ -570,13 +627,21 @@ fn testrustSqlitestoreSqliteConsolidate() {
     let stage_subdir = find_stage_subdir(&stage, name);
     let stage_device_dir_name = stage_subdir.file_name().unwrap();
     let work_device_dir = work_dir.join(stage_device_dir_name);
-    assert!(work_device_dir.exists(), "work mirror device dir missing: {}", work_device_dir.display());
     assert!(
-        work_device_dir.join(format!("{name}.db.synclite.backup")).exists(),
+        work_device_dir.exists(),
+        "work mirror device dir missing: {}",
+        work_device_dir.display()
+    );
+    assert!(
+        work_device_dir
+            .join(format!("{name}.db.synclite.backup"))
+            .exists(),
         "work mirror backup missing"
     );
     assert!(
-        work_device_dir.join(format!("{name}.db.synclite.metadata")).exists(),
+        work_device_dir
+            .join(format!("{name}.db.synclite.metadata"))
+            .exists(),
         "work mirror metadata missing"
     );
 
@@ -669,11 +734,8 @@ fn testrustSqlitestoreSqliteConsolidate() {
     );
     assert!(checkpoint_log_size > 0);
 
-    let table_stats_count = wait_for_min_i64(
-        &device_stats_db,
-        "SELECT COUNT(*) FROM table_statistics",
-        1,
-    );
+    let table_stats_count =
+        wait_for_min_i64(&device_stats_db, "SELECT COUNT(*) FROM table_statistics", 1);
     assert!(table_stats_count >= 1);
 
     let dashboard_segments = wait_for_min_i64(
@@ -706,12 +768,16 @@ fn testrustSqlitestoreSqliteConsolidate() {
 
     let consolidator_stats_conn = Connection::open(&consolidator_stats_db).unwrap();
     let dashboard_job_start: i64 = consolidator_stats_conn
-        .query_row("SELECT last_job_start_time FROM dashboard", [], |r| r.get(0))
+        .query_row("SELECT last_job_start_time FROM dashboard", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(dashboard_job_start > 0);
 
     let dashboard_last_heartbeat: i64 = consolidator_stats_conn
-        .query_row("SELECT last_heartbeat_time FROM dashboard", [], |r| r.get(0))
+        .query_row("SELECT last_heartbeat_time FROM dashboard", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(dashboard_last_heartbeat >= dashboard_job_start);
 
@@ -721,10 +787,13 @@ fn testrustSqlitestoreSqliteConsolidate() {
     assert!(dashboard_latency >= 0);
 
     let status_last_commit: i64 = consolidator_stats_conn
-        .query_row("SELECT COALESCE(MAX(last_consolidated_commit_id), 0) FROM device_status", [], |r| r.get(0))
+        .query_row(
+            "SELECT COALESCE(MAX(last_consolidated_commit_id), 0) FROM device_status",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(status_last_commit > 0);
-
 }
 
 #[test]
@@ -736,7 +805,8 @@ fn testrustSqliteSqliteFanoutIndexed() {
     let target1 = test_root.join("workDir").join(format!("{name}-1"));
     let target2 = test_root.join("workDir").join(format!("{name}-2"));
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join(name)
         .join(format!("{name}.db"));
     let conf = db.parent().unwrap().join("synclite.conf");
@@ -771,10 +841,10 @@ fn testrustSqliteSqliteFanoutIndexed() {
 
     synclite::initialize(
         logger_core::DeviceType::SQLITE,
-        "testdevice",
+        name,
         &db,
-    None,
-    synclite::SyncLiteOptions {
+        None,
+        synclite::SyncLiteOptions {
             config_path: Some(conf.clone()),
             ..Default::default()
         },
@@ -782,7 +852,9 @@ fn testrustSqliteSqliteFanoutIndexed() {
     .unwrap();
     let mut logger = Logger::open(&conf).unwrap();
     let table = name;
-    logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
+    logger
+        .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+        .unwrap();
     logger.close().unwrap();
 
     assert!(target1.join("0.sqllog").exists());
@@ -796,7 +868,8 @@ fn testrustSqliteSqliteNativeLock() {
     let test_root = test_home();
     let stage = test_root.join("stageDir");
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join(name)
         .join(format!("{name}.db"));
     let conf = db.parent().unwrap().join("synclite.conf");
@@ -821,7 +894,7 @@ fn testrustSqliteSqliteNativeLock() {
 
     synclite::initialize(
         logger_core::DeviceType::SQLITE,
-        "testdevice",
+        name,
         &db,
         None,
         synclite::SyncLiteOptions {
@@ -846,7 +919,8 @@ fn testrustSqliteSqliteRejectBadName() {
     let test_root = test_home();
     let stage = test_root.join("stageDir");
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join(name)
         .join(format!("{name}.db"));
     let conf = db.parent().unwrap().join("synclite.conf");
@@ -876,7 +950,8 @@ fn testrustSqliteSqliteRejectBadName() {
 fn rusqlite_wrapper_supports_prepare_and_batch() {
     let test_root = test_home();
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join("rsqlite_wrapper_supports_prepare_and_batch")
         .join("demo.db");
     remove_path_retry(db.parent().unwrap());
@@ -902,7 +977,8 @@ fn rusqlite_wrapper_supports_prepare_and_batch() {
 fn duckdb_wrapper_supports_prepare_and_batch() {
     let test_root = test_home();
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join("duckdb_wrapper_supports_prepare_and_batch")
         .join("demo.duckdb");
     remove_path_retry(db.parent().unwrap());
@@ -928,7 +1004,8 @@ fn duckdb_wrapper_supports_prepare_and_batch() {
 fn rusqlite_wrapper_close_commits_pending_manual_txn() {
     let test_root = test_home();
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join("rsqlite_wrapper_close_commits_pending_manual_txn")
         .join("demo.db");
     remove_path_retry(db.parent().unwrap());
@@ -937,8 +1014,10 @@ fn rusqlite_wrapper_close_commits_pending_manual_txn() {
     {
         let mut conn = sl_rusqlite::Connection::open(&db).unwrap();
         conn.set_auto_commit(false);
-        conn.execute("CREATE TABLE t_close(x INTEGER)", &[]).unwrap();
-        conn.execute("INSERT INTO t_close(x) VALUES (1)", &[]).unwrap();
+        conn.execute("CREATE TABLE t_close(x INTEGER)", &[])
+            .unwrap();
+        conn.execute("INSERT INTO t_close(x) VALUES (1)", &[])
+            .unwrap();
         conn.close().unwrap();
     }
 
@@ -952,7 +1031,8 @@ fn rusqlite_wrapper_close_commits_pending_manual_txn() {
 fn duckdb_wrapper_close_commits_pending_manual_txn() {
     let test_root = test_home();
     let db = test_root
-        .join("db").join("rustologger")
+        .join("db")
+        .join("rustologger")
         .join("duckdb_wrapper_close_commits_pending_manual_txn")
         .join("demo.duckdb");
     remove_path_retry(db.parent().unwrap());
@@ -961,7 +1041,8 @@ fn duckdb_wrapper_close_commits_pending_manual_txn() {
     {
         let mut conn = sl_duckdb::Connection::open(&db).unwrap();
         conn.set_auto_commit(false);
-        conn.execute("CREATE TABLE t_close(x INTEGER)", &[]).unwrap();
+        conn.execute("CREATE TABLE t_close(x INTEGER)", &[])
+            .unwrap();
         conn.execute("INSERT INTO t_close VALUES (1)", &[]).unwrap();
         conn.close().unwrap();
     }
@@ -971,6 +1052,3 @@ fn duckdb_wrapper_close_commits_pending_manual_txn() {
     assert_eq!(rows[0][0], ArgValue::Int(1));
     reopened.close().unwrap();
 }
-
-
-

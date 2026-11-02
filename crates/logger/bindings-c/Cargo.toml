@@ -13,6 +13,11 @@ description = "C ABI and static/dynamic library bindings for SyncLite."
 name = "synclite_1_1_0"
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+default = []
+# Kept as a compatibility alias; DuckDB is always compiled in by synclite.
+duckdb = ["synclite/duckdb", "logger-runtime/duckdb"]
+
 [dependencies]
 logger-runtime.workspace = true
 logger-db-traits.workspace = true

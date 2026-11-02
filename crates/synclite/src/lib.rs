@@ -65,7 +65,7 @@ use logger_db_traits::DbDevice;
 // Convenience re-exports so downstream apps only need `synclite` in
 // `Cargo.toml` and don't have to depend on `logger_core` / `logger_db_traits`.
 pub use logger_core::{Backend, DeviceType, Error, Result};
-pub use logger_db_traits::{Row, Value};
+pub use logger_db_traits::{ColumnInfo, ExecutionResult, Row, Value};
 use logger_shipper::{LogCleaner, LogShipper, ShipperConfig};
 
 #[path = "logger/app_lock.rs"]
@@ -109,6 +109,10 @@ use metadata::Metadata;
 
 pub use consolidator::{DstSyncMode, DstType};
 pub use logger_config::SyncLiteConfig;
+
+/// Legacy error text retained for API compatibility; DuckDB is included by default.
+pub const DUCKDB_FEATURE_REQUIRED: &str =
+    "DuckDB support requires a DuckDB-enabled SyncLite build and the language DuckDB dependency";
 
 /// SyncLite-wrapped `duckdb`-style connection and statement APIs.
 pub mod duckdb;
@@ -168,6 +172,61 @@ fn user_home_or_cwd() -> PathBuf {
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+// Android has no writable desktop home/CWD. Keep durable stage and checkpoint
+// state alongside the app-private database, not in the disposable cache.
+#[cfg(any(target_os = "android", test))]
+fn android_job_root(db_path: &Path) -> Result<PathBuf> {
+    if !db_path.is_absolute() || db_path.file_name().is_none() {
+        return Err(Error::Config(
+            "Android databasePath must be an absolute file path in app-private storage (context.filesDir)".into(),
+        ));
+    }
+    let parent = db_path.parent().ok_or_else(|| {
+        Error::Config("Android databasePath must have an app-private parent directory".into())
+    })?;
+    Ok(parent.join("synclite").join("job1"))
+}
+
+#[cfg(test)]
+mod android_storage_tests {
+    use super::*;
+
+    #[test]
+    fn android_storage_uses_database_parent_not_home() {
+        let app_files = std::env::temp_dir().join("android-app-files");
+        let database = app_files.join("orders.db");
+        assert_eq!(
+            android_job_root(&database).unwrap(),
+            app_files.join("synclite/job1")
+        );
+        assert!(android_job_root(Path::new("orders.db")).is_err());
+    }
+}
+
+fn default_local_stage_dir_for_db(db_path: &Path) -> Result<PathBuf> {
+    #[cfg(target_os = "android")]
+    {
+        Ok(android_job_root(db_path)?.join("stageDir"))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = db_path;
+        Ok(default_local_stage_dir())
+    }
+}
+
+fn default_device_data_root_for_db(db_path: &Path) -> Result<PathBuf> {
+    #[cfg(target_os = "android")]
+    {
+        Ok(android_job_root(db_path)?.join("workDir"))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = db_path;
+        Ok(default_device_data_root())
+    }
 }
 
 /// Destination overrides for [`initialize`].
@@ -340,7 +399,7 @@ pub struct Logger {
 /// shuts down every earlier worker. On success `finish` transfers ownership to
 /// the logger and disarms rollback by emptying the guard.
 struct ConsolidatorStartupGuard {
-    workers: Vec<Arc<Consolidator>>,
+    workers: Vec<(Arc<Consolidator>, bool)>,
 }
 
 impl ConsolidatorStartupGuard {
@@ -350,8 +409,8 @@ impl ConsolidatorStartupGuard {
         }
     }
 
-    fn push(&mut self, worker: Arc<Consolidator>) {
-        self.workers.push(worker);
+    fn push(&mut self, worker: Arc<Consolidator>, created: bool) {
+        self.workers.push((worker, created));
     }
 
     fn len(&self) -> usize {
@@ -359,14 +418,16 @@ impl ConsolidatorStartupGuard {
     }
 
     fn finish(mut self) -> Vec<Arc<Consolidator>> {
-        std::mem::take(&mut self.workers)
+        std::mem::take(&mut self.workers).into_iter().map(|(worker, _)| worker).collect()
     }
 }
 
 impl Drop for ConsolidatorStartupGuard {
     fn drop(&mut self) {
-        for worker in self.workers.iter().rev() {
-            worker.shutdown();
+        for (worker, created) in self.workers.iter().rev() {
+            if *created {
+                worker.shutdown();
+            }
         }
     }
 }
@@ -448,6 +509,11 @@ impl<'a> PreparedStatement<'a> {
         self.logger.execute(&self.sql, params)
     }
 
+    /// Execute the statement and return rows plus result metadata when present.
+    pub fn execute_with_result(&mut self, params: &[Value]) -> Result<ExecutionResult> {
+        self.logger.execute_with_result(&self.sql, params)
+    }
+
     /// Execute a read-only query with one parameter set.
     pub fn query(&mut self, params: &[Value]) -> Result<Vec<Row>> {
         self.logger.query(&self.sql, params)
@@ -524,6 +590,10 @@ fn initialize_internal(
     destinations: Destinations,
     options: SyncLiteOptions,
 ) -> Result<()> {
+    // Android loads the AAR's ABI-specific JNI library directly. The desktop
+    // CDC helper extraction/dlopen path is not valid in an APK and is not
+    // needed by the SQLite-focused Android runtime.
+    #[cfg(not(target_os = "android"))]
     cdc_native::ensure_extracted();
 
     let mut cfg = match (options.config, options.config_path) {
@@ -561,7 +631,7 @@ fn initialize_internal(
     cfg.device_type = Some(device_type);
     cfg.db_path = Some(normalized_db_path.clone());
     if cfg.local_stage_dir.is_none() {
-        cfg.local_stage_dir = Some(default_local_stage_dir());
+        cfg.local_stage_dir = Some(default_local_stage_dir_for_db(&normalized_db_path)?);
     }
 
     // Fire any pending reinitialize trigger files dropped alongside
@@ -886,14 +956,16 @@ impl Logger {
     /// Build a fully wired logger from an already-parsed config.
     pub fn open_with(cfg: SyncLiteConfig) -> Result<Self> {
         let (backend, device_type, db_path) = resolve_backend_device_type_db_path(&cfg)?;
+        ensure_duckdb_backend_enabled(backend)?;
+        ensure_duckdb_destinations_enabled(&cfg)?;
         let requested_device_name = cfg.device_name.clone();
         if let Some(name) = requested_device_name.as_deref() {
             validate_device_name(name)?;
         }
-        let stage_dir = cfg
-            .local_stage_dir
-            .clone()
-            .unwrap_or_else(default_local_stage_dir);
+        let stage_dir = match cfg.local_stage_dir.clone() {
+            Some(path) => path,
+            None => default_local_stage_dir_for_db(&db_path)?,
+        };
         std::fs::create_dir_all(&stage_dir)?;
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1020,11 +1092,10 @@ impl Logger {
             let dst_indices = parse_cfg_destination_indices(&cfg);
             let multi_destination = dst_indices.len() > 1;
             let all_dst_indexes: Vec<i32> = dst_indices.iter().map(|i| *i as i32).collect();
-            let device_data_root = cfg
-                .extra
-                .get(DEVICE_DATA_ROOT_KEY)
-                .map(PathBuf::from)
-                .unwrap_or_else(default_device_data_root);
+            let device_data_root = match cfg.extra.get(DEVICE_DATA_ROOT_KEY) {
+                Some(path) => PathBuf::from(path),
+                None => default_device_data_root_for_db(&db_path)?,
+            };
             std::fs::create_dir_all(&device_data_root)?;
             let mut startup = ConsolidatorStartupGuard::new();
 
@@ -1378,7 +1449,8 @@ impl Logger {
                     consolidator_layout.dst_triggers_file = Some(trig_path);
                 }
 
-                startup.push(Consolidator::spawn(consolidator_layout)?);
+                let (worker, created) = Consolidator::spawn_or_reuse(consolidator_layout)?;
+                startup.push(worker, created);
             }
 
             // Java parity: each spawned per-destination consolidator
@@ -1424,9 +1496,8 @@ impl Logger {
             tracer.clone(),
         );
 
-        // Open backend. Segments are *written* in the device home; resume
-        // state is read from the stage subdir where finalized segments
-        // accumulate after the move.
+        // Open backend. Segments are written and restart-recovered in the
+        // device home; resume_dir is only for shipping/consolidation.
         let log_segment_page_size = cfg
             .log_segment_page_size
             .or_else(|| {
@@ -1442,11 +1513,33 @@ impl Logger {
         let log_segment_switch_duration_threshold_ms = cfg.log_segment_switch_duration_threshold_ms;
         let max_inlined_log_args = cfg.max_inlined_log_args.unwrap_or(16);
 
+        // Java parity: one restart-recovery mechanism for every device type.
+        // `log_segment_sequence_number` names the active segment and is
+        // persisted every time it changes.
+        let resume_segment_sequence = md
+            .get_i64("log_segment_sequence_number")?
+            .and_then(|seq| u64::try_from(seq).ok());
+        let metadata_path = layout.metadata_path.clone();
+        let on_active_segment_changed: std::sync::Arc<
+            dyn Fn(logger_core::SegmentSequence) + Send + Sync,
+        > = std::sync::Arc::new(move |seq| match Metadata::open_or_create(&metadata_path) {
+            Ok(md) => {
+                if let Err(e) = md.put_i64("log_segment_sequence_number", seq.0 as i64) {
+                    tracing::warn!(error = %e, "failed to persist active log segment sequence");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open metadata for active segment sequence")
+            }
+        });
+
         let device: Box<dyn DbDevice> = match backend {
             Backend::Sqlite => {
                 let mut dcfg = SqliteDeviceConfig::new(db_path.clone(), layout.device_home.clone());
                 dcfg.resume_dir = Some(archive.stage_subdir.clone());
+                dcfg.resume_segment_sequence = resume_segment_sequence;
                 dcfg.on_segment_ready = Some(cb);
+                dcfg.on_active_segment_changed = Some(on_active_segment_changed);
                 dcfg.log_segment_page_size = log_segment_page_size;
                 dcfg.log_segment_flush_batch_size = log_segment_flush_batch_size;
                 dcfg.device_type = device_type;
@@ -1463,7 +1556,9 @@ impl Logger {
             Backend::DuckDb => {
                 let mut dcfg = DuckDbDeviceConfig::new(db_path.clone(), layout.device_home.clone());
                 dcfg.resume_dir = Some(archive.stage_subdir.clone());
+                dcfg.resume_segment_sequence = resume_segment_sequence;
                 dcfg.on_segment_ready = Some(cb);
+                dcfg.on_active_segment_changed = Some(on_active_segment_changed);
                 dcfg.log_segment_page_size = log_segment_page_size;
                 dcfg.log_segment_flush_batch_size = log_segment_flush_batch_size;
                 dcfg.device_type = device_type;
@@ -1515,10 +1610,18 @@ impl Logger {
             recovered_data_seq
         );
 
+        // Seed the tracker with the commit id recovered from the user DB so
+        // `await_sync` right after a restart still waits for unsynced data.
+        let commit_tracker = register_commit_tracker(&db_path);
+        commit_tracker.fetch_max(
+            device.last_committed_commit_id(),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+
         Ok(Self {
             device,
             db_path: db_path.clone(),
-            commit_tracker: register_commit_tracker(&db_path),
+            commit_tracker,
             _shipper: shipper,
             _consolidators: consolidators,
             _app_lock: Some(app_lock),
@@ -1534,6 +1637,11 @@ impl Logger {
     /// Execute a mutating statement.
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         self.device.execute(sql, params)
+    }
+
+    /// Execute one statement and return rows plus backend result metadata.
+    pub fn execute_with_result(&mut self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
+        self.device.execute_with_result(sql, params)
     }
 
     /// Execute a mutating statement without writing to commandlog.
@@ -1718,20 +1826,22 @@ fn has_any_destination_config(cfg: &SyncLiteConfig) -> bool {
 fn parse_destination_specs(extra: &HashMap<String, String>) -> Result<Vec<DestinationSpec>> {
     let mut specs = Vec::new();
 
+    // The unsuffixed keys are destination 1 (the config loader also folds
+    // `device-stage-type-1` into them); keep scanning `-2`, `-3`, ... so a
+    // fan-out configuration ships to every destination.
+    let mut idx = 1usize;
     if let Some(value) = extra.get("device-stage-type") {
         let kind = parse_destination_kind(value, "device-stage-type")?;
-        if !has_stage_destination_config(extra, kind, "") {
-            return Ok(specs);
+        if has_stage_destination_config(extra, kind, "") {
+            specs.push(DestinationSpec {
+                kind,
+                suffix: String::new(),
+                key_name: "device-stage-type".to_string(),
+            });
         }
-        specs.push(DestinationSpec {
-            kind,
-            suffix: String::new(),
-            key_name: "device-stage-type".to_string(),
-        });
-        return Ok(specs);
+        idx = 2;
     }
 
-    let mut idx = 1usize;
     loop {
         let key = format!("device-stage-type-{idx}");
         let Some(value) = extra.get(&key) else { break };
@@ -1925,6 +2035,16 @@ fn parse_cfg_destination_indices(cfg: &SyncLiteConfig) -> Vec<usize> {
     indices.sort_unstable();
     indices.dedup();
     indices
+}
+
+fn ensure_duckdb_backend_enabled(backend: Backend) -> Result<()> {
+    let _ = backend;
+    Ok(())
+}
+
+fn ensure_duckdb_destinations_enabled(cfg: &SyncLiteConfig) -> Result<()> {
+    let _ = cfg;
+    Ok(())
 }
 
 fn parse_cfg_destination_backend_for_index(cfg: &SyncLiteConfig, dst_index: usize) -> DstType {
@@ -2212,8 +2332,6 @@ pub(crate) fn default_config_for_backend(db_path: PathBuf, dst_type: Backend) ->
     // exists yet.
     let device_name =
         persisted_device_name(&db_path).unwrap_or_else(|| derive_device_name(&db_path));
-    let stage_dir = default_local_stage_dir();
-
     let mut cfg = SyncLiteConfig::default();
     cfg.device_name = Some(device_name);
     cfg.backend = Some(dst_type);
@@ -2221,7 +2339,12 @@ pub(crate) fn default_config_for_backend(db_path: PathBuf, dst_type: Backend) ->
         persisted_device_type(&db_path)
             .unwrap_or_else(|| DeviceType::default_for_backend(dst_type)),
     );
-    cfg.local_stage_dir = Some(stage_dir);
+    // Leave the Android stage default unset until Logger::open_with resolves
+    // the database path. Desktop behavior remains unchanged.
+    #[cfg(not(target_os = "android"))]
+    {
+        cfg.local_stage_dir = Some(default_local_stage_dir());
+    }
     cfg.db_path = Some(db_path.clone());
     // Re-hydrate destination keys persisted by a prior
     // `synclite::initialize(..)` so this Logger spawns the same

@@ -8,8 +8,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::path::Path;
 use logger_core::Result;
+use std::path::Path;
 
 /// A target capable of accepting a finalized log segment.
 ///
@@ -38,5 +38,3 @@ pub use s3::{S3Archiver, S3Config, StaticCredentials};
 mod sftp;
 #[cfg(feature = "sftp")]
 pub use sftp::{SftpArchiver, SftpAuth, SftpConfig};
-
-

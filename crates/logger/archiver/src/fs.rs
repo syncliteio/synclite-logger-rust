@@ -87,5 +87,3 @@ mod tests {
         assert!(!dst_dir.path().join("seg-7.db.tmp").exists());
     }
 }
-
-

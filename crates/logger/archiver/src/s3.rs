@@ -154,8 +154,7 @@ impl S3Archiver {
 }
 
 async fn build_client(cfg: &S3Config) -> Client {
-    let mut loader =
-        aws_config::defaults(BehaviorVersion::latest()).region(region_for(cfg));
+    let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_for(cfg));
     if let Some(creds) = &cfg.credentials {
         let provider = Credentials::new(
             creds.access_key_id.clone(),
@@ -246,5 +245,3 @@ mod tests {
         assert_eq!(key, "logs/commandlog-3.db");
     }
 }
-
-
