@@ -84,19 +84,29 @@ local-data-stage-directory=synclite-stage\n"
 
     {
         let mut stmt = conn.prepare("INSERT INTO events(id, category, amount) VALUES(?, ?, ?)")?;
-        stmt.execute(&[Value::Int(1), Value::Text("stream".to_string()), Value::Int(40)])?;
-        stmt.execute(&[Value::Int(2), Value::Text("stream".to_string()), Value::Int(60)])?;
+        stmt.execute(&[
+            Value::Int(1),
+            Value::Text("stream".to_string()),
+            Value::Int(40),
+        ])?;
+        stmt.execute(&[
+            Value::Int(2),
+            Value::Text("stream".to_string()),
+            Value::Int(60),
+        ])?;
     }
 
     // STREAMING allows INSERTs and DDL, but rejects UPDATE / DELETE.
-    let update_err = conn.execute(
-        "UPDATE events SET amount = ? WHERE id = ?",
-        &[Value::Int(90), Value::Int(2)],
-    )
-    .expect_err("streaming should reject UPDATE");
+    let update_err = conn
+        .execute(
+            "UPDATE events SET amount = ? WHERE id = ?",
+            &[Value::Int(90), Value::Int(2)],
+        )
+        .expect_err("streaming should reject UPDATE");
     println!("UPDATE rejected: {update_err}");
 
-    let delete_err = conn.execute("DELETE FROM events WHERE id = ?", &[Value::Int(1)])
+    let delete_err = conn
+        .execute("DELETE FROM events WHERE id = ?", &[Value::Int(1)])
         .expect_err("streaming should reject DELETE");
     println!("DELETE rejected: {delete_err}");
 
@@ -109,8 +119,3 @@ local-data-stage-directory=synclite-stage\n"
     conn.close()?;
     Ok(())
 }
-
-
-
-
-

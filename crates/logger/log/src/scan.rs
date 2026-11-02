@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
 use logger_core::{Error, Result, SegmentSequence};
+use rusqlite::Connection;
 
 /// State recovered from a previously-used segment directory.
 #[derive(Debug, Clone)]
@@ -70,5 +70,3 @@ pub fn scan_segment_dir(dir: &Path) -> Result<ResumeState> {
         max_commit_id,
     })
 }
-
-

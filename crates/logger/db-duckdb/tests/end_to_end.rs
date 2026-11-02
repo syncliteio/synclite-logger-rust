@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection as SqliteConn;
 use logger_core::record::ArgValue;
 use logger_db_duckdb::{DuckDbDevice, DuckDbDeviceConfig};
 use logger_db_traits::DbDevice;
+use rusqlite::Connection as SqliteConn;
 
 /// Tiny RAII temp dir replacement.
 struct TempDir(PathBuf);
@@ -76,9 +76,7 @@ fn duckdb_writes_user_db_and_two_segments() {
     device.commit().unwrap();
 
     // Query path — must NOT be logged.
-    let rows = device
-        .query("SELECT count(*) FROM metrics", &[])
-        .unwrap();
+    let rows = device.query("SELECT count(*) FROM metrics", &[]).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], ArgValue::Int(2));
 
@@ -117,5 +115,3 @@ fn duckdb_writes_user_db_and_two_segments() {
         .unwrap();
     assert_eq!(c1, 3);
 }
-
-

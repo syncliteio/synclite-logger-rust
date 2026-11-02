@@ -13,4 +13,3 @@ pub mod sql_policy;
 
 pub use error::{Error, Result};
 pub use ids::{Backend, CommitId, DeviceId, DeviceType, OperationId, SegmentSequence};
-

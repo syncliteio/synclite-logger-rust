@@ -1,7 +1,7 @@
+use logger_core::DeviceType;
 use logger_core::Result;
 use logger_db_traits::Value;
 use synclite::duckdb::Connection;
-use logger_core::DeviceType;
 
 fn main() -> Result<()> {
     const DB_PATH: &str = "sample_duckdb.duckdb";
@@ -68,8 +68,16 @@ fn main() -> Result<()> {
 
     {
         let mut stmt = conn.prepare("INSERT INTO events(id, category, amount) VALUES(?, ?, ?)")?;
-        stmt.execute(&[Value::Int(1), Value::Text("retail".to_string()), Value::Int(40)])?;
-        stmt.execute(&[Value::Int(2), Value::Text("retail".to_string()), Value::Int(60)])?;
+        stmt.execute(&[
+            Value::Int(1),
+            Value::Text("retail".to_string()),
+            Value::Int(40),
+        ])?;
+        stmt.execute(&[
+            Value::Int(2),
+            Value::Text("retail".to_string()),
+            Value::Int(60),
+        ])?;
     }
 
     conn.execute(
@@ -80,8 +88,16 @@ fn main() -> Result<()> {
 
     {
         let mut stmt = conn.prepare("INSERT INTO events(id, category, amount) VALUES(?, ?, ?)")?;
-        stmt.add_batch(&[Value::Int(3), Value::Text("wholesale".to_string()), Value::Int(120)]);
-        stmt.add_batch(&[Value::Int(4), Value::Text("wholesale".to_string()), Value::Int(180)]);
+        stmt.add_batch(&[
+            Value::Int(3),
+            Value::Text("wholesale".to_string()),
+            Value::Int(120),
+        ]);
+        stmt.add_batch(&[
+            Value::Int(4),
+            Value::Text("wholesale".to_string()),
+            Value::Int(180),
+        ]);
         stmt.execute_batch()?;
     }
     conn.commit()?;
@@ -94,8 +110,3 @@ fn main() -> Result<()> {
     conn.close()?;
     Ok(())
 }
-
-
-
-
-

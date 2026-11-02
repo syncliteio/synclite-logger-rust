@@ -63,7 +63,7 @@ impl DeviceType {
 
     /// Whether this device follows transactional SQL-device logging semantics.
     pub fn is_transactional(self) -> bool {
-           matches!(self, DeviceType::SQLITE | DeviceType::DUCKDB)
+        matches!(self, DeviceType::SQLITE | DeviceType::DUCKDB)
     }
 
     /// Whether this device participates in in-doubt restart recovery.
@@ -157,4 +157,3 @@ pub struct OperationId(pub u64);
 /// Monotonic log-segment sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SegmentSequence(pub u64);
-

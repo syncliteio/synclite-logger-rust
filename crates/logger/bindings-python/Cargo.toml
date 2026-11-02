@@ -13,6 +13,11 @@ description = "PyO3 bindings exposing SyncLite runtime APIs to Python."
 name = "_native"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Kept as a compatibility alias; DuckDB is always compiled in by synclite.
+duckdb = ["synclite/duckdb"]
+
 [dependencies]
 synclite.workspace = true
 logger-db-traits.workspace = true

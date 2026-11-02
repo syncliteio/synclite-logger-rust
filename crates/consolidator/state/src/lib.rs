@@ -15,8 +15,11 @@ use duckdb::{
     Connection as DuckConnection,
 };
 use logger_core::{Error, Result};
-use postgres::{Client as PgClient, NoTls};
+use postgres::Client as PgClient;
 use rusqlite::{params, Connection, OptionalExtension};
+
+mod pg_connection;
+pub use pg_connection::{build_postgres_connection_string, connect_postgres, read_postgres_checkpoint};
 
 const DEFAULT_DST_ALIAS: &str = "DB-1";
 
@@ -29,46 +32,6 @@ pub const SYNCLITE_METADATA_VERSION_KEY: &str = "synclite_metadata_version";
 /// lockstep with any migration routine so a future consolidator version
 /// can detect an older store and upgrade it on initialization.
 pub const SYNCLITE_METADATA_VERSION: i64 = 1;
-
-/// Open a Postgres client for consolidator bookkeeping, applying the
-/// configured `dst-connection-timeout-s` so an unreachable destination
-/// cannot block the caller for the full OS TCP timeout. Offline-first:
-/// the consolidator worker owns all destination I/O, and a bounded
-/// connect keeps `initialize` / `Connection::close` responsive even when
-/// the destination is down.
-///
-/// If the connection string already carries an explicit `connect_timeout`
-/// we leave it untouched; otherwise we append the layout's value (skipped
-/// only when configured to 0, i.e. "no timeout").
-fn connect_pg(layout: &ConsolidatorLayout) -> Result<PgClient> {
-    let conn_str = pg_conn_str_with_timeout(
-        &layout.dst_connection_string,
-        layout.dst_connection_timeout_s,
-    );
-    PgClient::connect(&conn_str, NoTls).map_err(map_pg_err)
-}
-
-/// Append `connect_timeout=<secs>` to a Postgres connection string
-/// (URI or key/value form) unless one is already present or `secs == 0`.
-fn pg_conn_str_with_timeout(conn_str: &str, secs: u32) -> String {
-    if secs == 0 {
-        return conn_str.to_string();
-    }
-    let lower = conn_str.to_ascii_lowercase();
-    if lower.contains("connect_timeout=") {
-        return conn_str.to_string();
-    }
-    let trimmed = conn_str.trim();
-    let is_uri = lower.starts_with("postgres://") || lower.starts_with("postgresql://");
-    if is_uri {
-        let sep = if trimmed.contains('?') { '&' } else { '?' };
-        format!("{trimmed}{sep}connect_timeout={secs}")
-    } else if trimmed.is_empty() {
-        format!("connect_timeout={secs}")
-    } else {
-        format!("{trimmed} connect_timeout={secs}")
-    }
-}
 
 pub fn initialize_state_db(path: &Path) -> Result<()> {
     let conn = Connection::open(path).map_err(map_sql_err)?;
@@ -378,7 +341,7 @@ pub fn bootstrap_destination_metadata(layout: &ConsolidatorLayout, dst_index: i3
             .map_err(map_duck_err)?;
         }
         DstType::Postgres => {
-            let mut client = connect_pg(layout)?;
+            let mut client = connect_postgres(layout)?;
             // The consolidator metadata tables (and later, the user
             // tables) live in dst_schema when one is configured. Pre-
             // ensure it now so the very first CREATE TABLE below doesn't
@@ -494,6 +457,9 @@ pub fn record_bootstrap(
     Ok(())
 }
 
+/// Finalize local initialization AFTER the caller has successfully copied the
+/// snapshot to the destination. This function records completion; it does not
+/// copy snapshot data itself. A seeded checkpoint alone is not completion.
 pub fn initialize_from_backup(
     layout: &ConsolidatorLayout,
     state_conn: &Connection,
@@ -545,13 +511,16 @@ pub fn initialize_from_backup(
         )?;
     }
 
+    state_conn
+        .execute("UPDATE synclite_checkpoint SET initialization_status = 1", [])
+        .map_err(map_sql_err)?;
     Ok(true)
 }
 
 pub fn is_initialized(state_conn: &Connection) -> Result<bool> {
     Ok(state_conn
         .query_row(
-            "SELECT commit_id FROM synclite_checkpoint LIMIT 1",
+            "SELECT commit_id FROM synclite_checkpoint WHERE initialization_status = 1 LIMIT 1",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -1450,6 +1419,7 @@ pub fn map_destination_checkpoint(
                 DuckValue::BigInt(progress.applied_commit),
                 DuckValue::Text(update_ts.clone()),
                 DuckValue::BigInt(progress.applied_change),
+                DuckValue::BigInt(progress.applied_change),
                 DuckValue::BigInt(seq),
                 DuckValue::BigInt(seq),
                 DuckValue::BigInt(progress.applied_txn_cnt),
@@ -1502,7 +1472,7 @@ pub fn map_destination_checkpoint(
             }
         }
         DstType::Postgres => {
-            let mut client = connect_pg(layout)?;
+            let mut client = connect_postgres(layout)?;
             if !postgres_has_checkpoint_device_columns(&mut client, layout)? {
                 return Err(Error::Config(
                     "consolidator: destination synclite_checkpoint must contain synclite_device_id and synclite_device_name".to_string(),
@@ -2146,7 +2116,7 @@ pub fn get_consolidator_property(
                         dst_props_duck_get(&conn, &layout.device_id, &layout.device_name, key)
                     }
                     DstType::Postgres => {
-                        let mut client = connect_pg(layout)?;
+                        let mut client = connect_postgres(layout)?;
                         dst_props_pg_get(
                             &mut client,
                             layout,
@@ -2220,7 +2190,7 @@ pub fn upsert_consolidator_properties(
                         dst_props_duck_upsert(&conn, &layout.device_id, &layout.device_name, kvs)
                     }
                     DstType::Postgres => {
-                        let mut client = connect_pg(layout)?;
+                        let mut client = connect_postgres(layout)?;
                         dst_props_pg_upsert(
                             &mut client,
                             layout,
@@ -2261,7 +2231,7 @@ pub fn delete_consolidator_property(
                         dst_props_duck_delete(&conn, &layout.device_id, &layout.device_name, key)
                     }
                     DstType::Postgres => {
-                        let mut client = connect_pg(layout)?;
+                        let mut client = connect_postgres(layout)?;
                         dst_props_pg_delete(
                             &mut client,
                             layout,
@@ -2326,7 +2296,7 @@ pub fn upsert_consolidator_table_metadata(
                         )
                     }
                     DstType::Postgres => {
-                        let mut client = connect_pg(layout)?;
+                        let mut client = connect_postgres(layout)?;
                         dst_tblmeta_pg_upsert(
                             &mut client,
                             layout,
@@ -2397,7 +2367,7 @@ pub fn get_consolidator_table_metadata(
                         }
                     }
                     DstType::Postgres => {
-                        let mut client = connect_pg(layout)?;
+                        let mut client = connect_postgres(layout)?;
                         let meta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
                         let select_sql = format!(
                             "SELECT prop_value FROM {meta} \
@@ -2428,6 +2398,11 @@ pub fn mark_initialization_complete(
     dst_index: i32,
     snapshot_name: &str,
 ) -> Result<()> {
+    if get_consolidator_property(layout, dst_index, "initialized_snapshot_name")?.as_deref() == Some(snapshot_name)
+        && get_consolidator_property_long(layout, dst_index, "initialization_status")? == Some(1)
+    {
+        return Ok(());
+    }
     let new_count =
         get_consolidator_property_long(layout, dst_index, "initialization_count")?.unwrap_or(0) + 1;
     let kvs: Vec<(&str, String)> = vec![
@@ -2794,7 +2769,7 @@ pub fn get_initialized_tables(
                     }
                 }
                 DstType::Postgres => {
-                    let mut client = connect_pg(layout)?;
+                    let mut client = connect_postgres(layout)?;
                     let create_tblmeta_sql = pg_create_dst_table_metadata_sql(layout);
                     client
                         .batch_execute(create_tblmeta_sql.as_str())
@@ -2967,7 +2942,7 @@ pub fn reset_dst_schemas(layout: &ConsolidatorLayout, _dst_index: i32) -> Result
             Ok(())
         }
         DstType::Postgres => {
-            let mut client = connect_pg(layout)?;
+            let mut client = connect_postgres(layout)?;
             client
                 .execute(
                     "DELETE FROM synclite_consolidator_table_metadata WHERE synclite_device_id = $1 AND synclite_device_name = $2 AND prop_key = 'create_sql'",
@@ -3014,7 +2989,7 @@ pub fn reset_dst_table_metadata(layout: &ConsolidatorLayout, _dst_index: i32) ->
                 Ok(())
             }
             DstType::Postgres => {
-                let mut client = connect_pg(layout)?;
+                let mut client = connect_postgres(layout)?;
                 client
                     .batch_execute(CREATE_DST_TABLE_METADATA_TBL_SQL)
                     .map_err(map_pg_err)?;
@@ -3053,4 +3028,133 @@ pub fn delete_local_schema_for_table(
         .map_err(map_sql_err)?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) fn test_layout(root: &Path) -> ConsolidatorLayout {
+        let mut layout = ConsolidatorLayout::new(
+            root, Some(root.to_path_buf()), "dev-id", "dev", "sqlite_store", "db",
+            1, true, MetadataStore::Local, DstType::Sqlite,
+            DestinationSyncMode::Replication, "host=localhost".to_string(),
+            1, 0, false, 11, 7, 5, true,
+        );
+        layout.state_db_path = root.join("state.db");
+        layout.stats_db_path = root.join("stats.db");
+        layout.consolidator_stats_db_path = root.join("global.db");
+        layout
+    }
+
+    #[test]
+    fn initialization_publication_retry_does_not_increment_count_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = test_layout(root.path());
+        mark_initialization_complete(&layout, 1, "first.backup").unwrap();
+        mark_initialization_complete(&layout, 1, "first.backup").unwrap();
+        assert_eq!(get_consolidator_property_long(&layout, 1, "initialization_count").unwrap(), Some(1));
+        mark_initialization_complete(&layout, 1, "second.backup").unwrap();
+        assert_eq!(get_consolidator_property_long(&layout, 1, "initialization_count").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn checkpoint_seed_is_not_initialization_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        initialize_state_db(&path).unwrap();
+        let state = Connection::open(&path).unwrap();
+        assert!(!is_initialized(&state).unwrap());
+        let backup = root.path().join("backup.db");
+        Connection::open(&backup).unwrap().execute_batch(
+            "CREATE TABLE synclite_txn(commit_id INTEGER); INSERT INTO synclite_txn VALUES(42);"
+        ).unwrap();
+        ensure_synclite_checkpoint_seeded(&state, &backup).unwrap();
+        assert_eq!(get_commit_id(&state).unwrap(), 42);
+        assert!(!is_initialized(&state).unwrap());
+        update_synclite_checkpoint_for_segment(&state, 7).unwrap();
+        assert!(!is_initialized(&state).unwrap());
+        state.execute("UPDATE synclite_checkpoint SET initialization_status=2", []).unwrap();
+        assert!(!is_initialized(&state).unwrap());
+        state.execute("UPDATE synclite_checkpoint SET initialization_status=1", []).unwrap();
+        assert!(is_initialized(&state).unwrap());
+        ensure_synclite_checkpoint_seeded(&state, &backup).unwrap();
+        assert!(is_initialized(&state).unwrap());
+    }
+
+    #[test]
+    fn backup_completion_marks_local_flag_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = test_layout(root.path());
+        initialize_state_db(&layout.state_db_path).unwrap();
+        initialize_device_stats_db(&layout).unwrap();
+        initialize_consolidator_stats_db(&layout).unwrap();
+        let state = Connection::open(&layout.state_db_path).unwrap();
+        let stats = Connection::open(&layout.stats_db_path).unwrap();
+        let global = Connection::open(&layout.consolidator_stats_db_path).unwrap();
+        let backup = root.path().join("backup.db");
+        let meta = root.path().join("metadata.db");
+        assert!(!initialize_from_backup(&layout, &state, &stats, &global, &backup, &meta).unwrap());
+        assert!(!is_initialized(&state).unwrap());
+        Connection::open(&backup).unwrap().execute_batch(
+            "CREATE TABLE synclite_txn(commit_id INTEGER); INSERT INTO synclite_txn VALUES(42);"
+        ).unwrap();
+        ensure_synclite_checkpoint_seeded(&state, &backup).unwrap();
+        assert!(!is_initialized(&state).unwrap());
+        assert!(initialize_from_backup(&layout, &state, &stats, &global, &backup, &meta).unwrap());
+        assert!(is_initialized(&state).unwrap());
+        assert_eq!(get_commit_id(&state).unwrap(), 42);
+        // Completion must not rewrite progress on an already initialized DB.
+        state.execute("UPDATE synclite_checkpoint SET commit_id=99", []).unwrap();
+        assert!(initialize_from_backup(&layout, &state, &stats, &global, &backup, &meta).unwrap());
+        assert_eq!(get_commit_id(&state).unwrap(), 99);
+    }
+
+    #[test]
+    fn failed_finalization_does_not_mark_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = test_layout(root.path());
+        initialize_state_db(&layout.state_db_path).unwrap();
+        let state = Connection::open(&layout.state_db_path).unwrap();
+        let stats = Connection::open_in_memory().unwrap(); // Deliberately missing stats tables.
+        let global = Connection::open_in_memory().unwrap();
+        let backup = root.path().join("backup.db");
+        Connection::open(&backup).unwrap();
+        assert!(initialize_from_backup(&layout, &state, &stats, &global, &backup, &backup).is_err());
+        assert!(!is_initialized(&state).unwrap());
+    }
+
+    #[test]
+    fn shared_postgres_builder_preserves_explicit_options_and_layout_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let mut layout = test_layout(root.path());
+        layout.dst_user = Some("layout user".into());
+        layout.dst_password = Some("p a's\\word&é".into());
+        layout.dst_connection_timeout_s = 17;
+        for base in ["host=localhost", "postgresql://localhost/db"] {
+            layout.dst_connection_string = base.into();
+            let config: postgres::Config = build_postgres_connection_string(&layout).parse().unwrap();
+            assert_eq!(config.get_user(), Some("layout user"));
+            assert_eq!(config.get_password(), layout.dst_password.as_deref().map(str::as_bytes));
+            assert_eq!(config.get_connect_timeout(), Some(&std::time::Duration::from_secs(17)));
+        }
+        for base in [
+            "host=localhost user=explicit password=secret connect_timeout = '0'",
+            "postgresql://explicit:secret@localhost/db?connect_timeout=0",
+            "postgresql://explicit:secret@localhost/db?connect%5Ftimeout=0",
+        ] {
+            layout.dst_connection_string = base.into();
+            let config: postgres::Config = build_postgres_connection_string(&layout).parse().unwrap();
+            assert_eq!(config.get_user(), Some("explicit"));
+            assert_eq!(config.get_password(), Some(b"secret".as_slice()));
+            assert_eq!(config.get_connect_timeout(), None);
+        }
+        layout.dst_connection_string = "host=localhost connect_timeout=4".into();
+        let config: postgres::Config = build_postgres_connection_string(&layout).parse().unwrap();
+        assert_eq!(config.get_connect_timeout(), Some(&std::time::Duration::from_secs(4)));
+        layout.dst_connection_timeout_s = 0;
+        layout.dst_connection_string = "host=localhost".into();
+        let config: postgres::Config = build_postgres_connection_string(&layout).parse().unwrap();
+        assert_eq!(config.get_connect_timeout(), None);
+    }
 }

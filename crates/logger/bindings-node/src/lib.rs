@@ -53,7 +53,9 @@ fn json_to_value(value: JsonValue) -> Result<Value> {
             let mut bytes = Vec::with_capacity(values.len());
             for value in values {
                 let Some(byte) = value.as_u64() else {
-                    return Err(napi_error("blob arrays must contain only unsigned byte values"));
+                    return Err(napi_error(
+                        "blob arrays must contain only unsigned byte values",
+                    ));
                 };
                 if byte > u8::MAX as u64 {
                     return Err(napi_error("blob array values must be in the range 0..=255"));
@@ -89,8 +91,11 @@ fn rows_to_json(rows: Vec<Row>) -> Result<String> {
 /// Block until the embedded shipper and consolidator apply pending commits.
 #[napi]
 pub fn await_sync(db_path: String, timeout_seconds: u32) -> Result<()> {
-    synclite::await_sync(db_path, std::time::Duration::from_secs(timeout_seconds as u64))
-        .map_err(|e| napi_error(e.to_string()))
+    synclite::await_sync(
+        db_path,
+        std::time::Duration::from_secs(timeout_seconds as u64),
+    )
+    .map_err(|e| napi_error(e.to_string()))
 }
 
 fn parse_device_type(s: &str) -> Result<DeviceType> {
@@ -176,15 +181,18 @@ pub fn initialize(config_json: String) -> Result<()> {
     };
 
     let get_str = |key: &str| -> Option<String> {
-        config.get(key).and_then(JsonValue::as_str).map(str::to_string)
+        config
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
     };
 
     let device_type = get_str("device_type")
         .ok_or_else(|| napi_error("initialize config requires \"device_type\""))?;
     let device_name = get_str("device_name")
         .ok_or_else(|| napi_error("initialize config requires \"device_name\""))?;
-    let db_path = get_str("db_path")
-        .ok_or_else(|| napi_error("initialize config requires \"db_path\""))?;
+    let db_path =
+        get_str("db_path").ok_or_else(|| napi_error("initialize config requires \"db_path\""))?;
 
     let device = parse_device_type(&device_type)?;
 
@@ -246,7 +254,8 @@ macro_rules! connection_api {
         impl $name {
             #[napi(factory)]
             pub fn open(db_path: String) -> Result<Self> {
-                let connection = <$connection>::open(db_path).map_err(|e| napi_error(e.to_string()))?;
+                let connection =
+                    <$connection>::open(db_path).map_err(|e| napi_error(e.to_string()))?;
                 Ok(Self {
                     inner: Arc::new(Mutex::new(Some(connection))),
                 })
@@ -254,7 +263,8 @@ macro_rules! connection_api {
 
             #[napi(factory)]
             pub fn initialize(db_path: String) -> Result<Self> {
-                let connection = <$connection>::initialize(db_path).map_err(|e| napi_error(e.to_string()))?;
+                let connection =
+                    <$connection>::initialize(db_path).map_err(|e| napi_error(e.to_string()))?;
                 Ok(Self {
                     inner: Arc::new(Mutex::new(Some(connection))),
                 })
@@ -282,16 +292,22 @@ macro_rules! connection_api {
             pub fn execute(&self, sql: String, params_json: Option<String>) -> Result<u32> {
                 let params = parse_params(params_json)?;
                 self.with_connection(|connection| {
-                    connection.execute(&sql, &params).map_err(|e| napi_error(e.to_string()))
+                    connection
+                        .execute(&sql, &params)
+                        .map_err(|e| napi_error(e.to_string()))
                 })
-                .and_then(|count| u32::try_from(count).map_err(|_| napi_error("affected-row count exceeds u32")))
+                .and_then(|count| {
+                    u32::try_from(count).map_err(|_| napi_error("affected-row count exceeds u32"))
+                })
             }
 
             #[napi]
             pub fn query_json(&self, sql: String, params_json: Option<String>) -> Result<String> {
                 let params = parse_params(params_json)?;
                 let rows = self.with_connection(|connection| {
-                    connection.query(&sql, &params).map_err(|e| napi_error(e.to_string()))
+                    connection
+                        .query(&sql, &params)
+                        .map_err(|e| napi_error(e.to_string()))
                 })?;
                 rows_to_json(rows)
             }
@@ -311,22 +327,31 @@ macro_rules! connection_api {
 
             #[napi]
             pub fn commit(&self) -> Result<()> {
-                self.with_connection(|connection| connection.commit().map_err(|e| napi_error(e.to_string())))
+                self.with_connection(|connection| {
+                    connection.commit().map_err(|e| napi_error(e.to_string()))
+                })
             }
 
             #[napi]
             pub fn rollback(&self) -> Result<()> {
-                self.with_connection(|connection| connection.rollback().map_err(|e| napi_error(e.to_string())))
+                self.with_connection(|connection| {
+                    connection.rollback().map_err(|e| napi_error(e.to_string()))
+                })
             }
 
             #[napi]
             pub fn flush(&self) -> Result<()> {
-                self.with_connection(|connection| connection.flush().map_err(|e| napi_error(e.to_string())))
+                self.with_connection(|connection| {
+                    connection.flush().map_err(|e| napi_error(e.to_string()))
+                })
             }
 
             #[napi]
             pub fn close(&self) -> Result<()> {
-                let mut guard = self.inner.lock().map_err(|_| napi_error("connection mutex poisoned"))?;
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|_| napi_error("connection mutex poisoned"))?;
                 match guard.take() {
                     Some(connection) => connection.close().map_err(|e| napi_error(e.to_string())),
                     None => Ok(()),
@@ -335,9 +360,17 @@ macro_rules! connection_api {
         }
 
         impl $name {
-            fn with_connection<T>(&self, operation: impl FnOnce(&mut $connection) -> Result<T>) -> Result<T> {
-                let mut guard = self.inner.lock().map_err(|_| napi_error("connection mutex poisoned"))?;
-                let connection = guard.as_mut().ok_or_else(|| napi_error("connection is closed"))?;
+            fn with_connection<T>(
+                &self,
+                operation: impl FnOnce(&mut $connection) -> Result<T>,
+            ) -> Result<T> {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|_| napi_error("connection mutex poisoned"))?;
+                let connection = guard
+                    .as_mut()
+                    .ok_or_else(|| napi_error("connection is closed"))?;
                 operation(connection)
             }
         }

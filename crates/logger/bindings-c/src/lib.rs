@@ -38,8 +38,7 @@ fn cstr_arg<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
     }
     // SAFETY: caller provides a valid NUL-terminated UTF-8 string pointer.
     let c = unsafe { CStr::from_ptr(ptr) };
-    c.to_str()
-        .map_err(|_| format!("{name} is not valid UTF-8"))
+    c.to_str().map_err(|_| format!("{name} is not valid UTF-8"))
 }
 
 /// Open a SyncLite runtime from `synclite.conf` path (legacy `synclite_logger.conf`
@@ -501,17 +500,11 @@ pub unsafe extern "C" fn synclite_initialize(
             let d = &*destination;
             Some(DestinationOptions {
                 dst_type: parse_dst_type(req_cstr(d.dst_type, "dst_type")?)?,
-                dst_connection_string: req_cstr(
-                    d.dst_connection_string,
-                    "dst_connection_string",
-                )?
-                .to_owned(),
+                dst_connection_string: req_cstr(d.dst_connection_string, "dst_connection_string")?
+                    .to_owned(),
                 dst_database: opt_cstr(d.dst_database).map(|s| s.to_owned()),
                 dst_schema: opt_cstr(d.dst_schema).map(|s| s.to_owned()),
-                dst_sync_mode: parse_dst_sync_mode(req_cstr(
-                    d.dst_sync_mode,
-                    "dst_sync_mode",
-                )?)?,
+                dst_sync_mode: parse_dst_sync_mode(req_cstr(d.dst_sync_mode, "dst_sync_mode")?)?,
             })
         };
         let opts = SyncLiteOptions {
@@ -850,7 +843,11 @@ macro_rules! conn_impl {
             let conn_ref = &mut *conn;
             match conn_ref.inner.as_mut() {
                 Some(c) => {
-                    if c.get_auto_commit() { 1 } else { 0 }
+                    if c.get_auto_commit() {
+                        1
+                    } else {
+                        0
+                    }
                 }
                 None => {
                     set_last_error("connection is closed".into());
@@ -1013,8 +1010,12 @@ macro_rules! conn_impl {
             }
             let batches = std::mem::take(&mut s.batches);
             if batches.is_empty() {
-                if !out_rows.is_null() { *out_rows = ptr::null_mut(); }
-                if !out_len.is_null() { *out_len = 0; }
+                if !out_rows.is_null() {
+                    *out_rows = ptr::null_mut();
+                }
+                if !out_len.is_null() {
+                    *out_len = 0;
+                }
                 return 0;
             }
             let parent = &mut *s.parent;
@@ -1045,7 +1046,9 @@ macro_rules! conn_impl {
             match prepared.execute_batch() {
                 Ok(counts) => {
                     let mut boxed = counts.into_boxed_slice();
-                    if !out_len.is_null() { *out_len = boxed.len(); }
+                    if !out_len.is_null() {
+                        *out_len = boxed.len();
+                    }
                     if !out_rows.is_null() {
                         *out_rows = boxed.as_mut_ptr();
                     }
@@ -1195,9 +1198,15 @@ conn_impl!(
 /// `rows` must be a live handle from `synclite_*_query`.
 #[no_mangle]
 pub unsafe extern "C" fn synclite_rows_count(rows: *const SyncLiteRows) -> c_size {
-    if rows.is_null() { return 0; }
+    if rows.is_null() {
+        return 0;
+    }
     let r = &*rows;
-    if r.cols == 0 { 0 } else { r.cells.len() / r.cols }
+    if r.cols == 0 {
+        0
+    } else {
+        r.cells.len() / r.cols
+    }
 }
 
 /// Number of columns in each row of a result set.
@@ -1206,7 +1215,11 @@ pub unsafe extern "C" fn synclite_rows_count(rows: *const SyncLiteRows) -> c_siz
 /// `rows` must be a live handle from `synclite_*_query`.
 #[no_mangle]
 pub unsafe extern "C" fn synclite_rows_cols(rows: *const SyncLiteRows) -> c_size {
-    if rows.is_null() { 0 } else { (&*rows).cols }
+    if rows.is_null() {
+        0
+    } else {
+        (&*rows).cols
+    }
 }
 
 /// Borrow a cell. Returned pointer lives until `synclite_rows_free`. NULL on
@@ -1220,11 +1233,17 @@ pub unsafe extern "C" fn synclite_rows_cell(
     row: c_size,
     col: c_size,
 ) -> *const SyncLiteValue {
-    if rows.is_null() { return ptr::null(); }
+    if rows.is_null() {
+        return ptr::null();
+    }
     let r = &*rows;
-    if r.cols == 0 || col >= r.cols { return ptr::null(); }
+    if r.cols == 0 || col >= r.cols {
+        return ptr::null();
+    }
     let idx = row * r.cols + col;
-    if idx >= r.cells.len() { return ptr::null(); }
+    if idx >= r.cells.len() {
+        return ptr::null();
+    }
     &r.cells[idx] as *const SyncLiteValue
 }
 
@@ -1247,12 +1266,11 @@ pub unsafe extern "C" fn synclite_rows_free(rows: *mut SyncLiteRows) {
 /// length `len`, or be NULL with `len == 0`.
 #[no_mangle]
 pub unsafe extern "C" fn synclite_free_u64_array(ptr: *mut u64, len: c_size) {
-    if ptr.is_null() || len == 0 { return; }
+    if ptr.is_null() || len == 0 {
+        return;
+    }
     drop(Vec::from_raw_parts(ptr, len, len));
 }
 
 // Bring PathBuf into scope only inside the high-level impl.
 use std::path::PathBuf;
-
-
-

@@ -17,8 +17,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use logger_core::{Backend, DeviceType, Error, Result};
+use serde::{Deserialize, Serialize};
 
 /// Parsed contents of a `synclite.conf` file (legacy `synclite_logger.conf`
 /// also accepted).
@@ -172,25 +172,20 @@ impl SyncLiteConfig {
             );
         }
         if let Some(v) = props.remove("log-segment-switch-log-count-threshold") {
-            cfg.log_segment_switch_log_count_threshold = Some(
-                v.parse().map_err(|e| {
-                    Error::Config(format!("log-segment-switch-log-count-threshold: {e}"))
-                })?,
-            );
+            cfg.log_segment_switch_log_count_threshold = Some(v.parse().map_err(|e| {
+                Error::Config(format!("log-segment-switch-log-count-threshold: {e}"))
+            })?);
         }
         if let Some(v) = props.remove("log-segment-switch-duration-threshold-ms") {
-            cfg.log_segment_switch_duration_threshold_ms = Some(
-                v.parse().map_err(|e| {
-                    Error::Config(format!("log-segment-switch-duration-threshold-ms: {e}"))
-                })?,
-            );
+            cfg.log_segment_switch_duration_threshold_ms = Some(v.parse().map_err(|e| {
+                Error::Config(format!("log-segment-switch-duration-threshold-ms: {e}"))
+            })?);
         }
         if let Some(v) = props.remove("log-segment-shipping-frequency-ms") {
-            cfg.log_segment_shipping_frequency_ms = Some(
-                v.parse().map_err(|e| {
+            cfg.log_segment_shipping_frequency_ms =
+                Some(v.parse().map_err(|e| {
                     Error::Config(format!("log-segment-shipping-frequency-ms: {e}"))
-                })?,
-            );
+                })?);
         }
         if let Some(v) = props.remove("log-segment-page-size") {
             cfg.log_segment_page_size = Some(
@@ -223,27 +218,35 @@ impl SyncLiteConfig {
             );
         }
         if let Some(v) = props.remove("disable-async-logging-for-transactional-device") {
-            cfg.disable_async_logging_for_txn_device = Some(
-                v.parse().map_err(|e| {
-                    Error::Config(format!("disable-async-logging-for-transactional-device: {e}"))
-                })?,
-            );
+            cfg.disable_async_logging_for_txn_device = Some(v.parse().map_err(|e| {
+                Error::Config(format!(
+                    "disable-async-logging-for-transactional-device: {e}"
+                ))
+            })?);
         }
         if let Some(v) = props.remove("enable-async-logging-for-appender-device") {
-            cfg.enable_async_logging_for_appender_device = Some(
-                v.parse().map_err(|e| {
-                    Error::Config(format!("enable-async-logging-for-appender-device: {e}"))
-                })?,
-            );
+            cfg.enable_async_logging_for_appender_device = Some(v.parse().map_err(|e| {
+                Error::Config(format!("enable-async-logging-for-appender-device: {e}"))
+            })?);
         }
         if let Some(v) = props.remove("device-encryption-key-file") {
             cfg.encryption_key_file = Some(PathBuf::from(v));
         }
         if let Some(v) = props.remove("include-tables") {
-            cfg.include_tables = Some(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            cfg.include_tables = Some(
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
         }
         if let Some(v) = props.remove("exclude-tables") {
-            cfg.exclude_tables = Some(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            cfg.exclude_tables = Some(
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
         }
         if let Some(v) = props.remove("enable-command-handler") {
             cfg.enable_command_handler = Some(
@@ -259,7 +262,8 @@ impl SyncLiteConfig {
         }
         if let Some(v) = props.remove("command-handler-frequency-ms") {
             cfg.command_handler_frequency_ms = Some(
-                v.parse().map_err(|e| Error::Config(format!("command-handler-frequency-ms: {e}")))?,
+                v.parse()
+                    .map_err(|e| Error::Config(format!("command-handler-frequency-ms: {e}")))?,
             );
         }
         // Java parity: `trace-level` for the logger, `device-trace-level` for
@@ -279,10 +283,7 @@ impl SyncLiteConfig {
             cfg.backend = Some(parse_backend(&v)?);
         }
         if let Some(v) = props.remove("device-type") {
-            cfg.device_type = Some(
-                v.parse()
-                    .map_err(|e: String| Error::Config(e))?,
-            );
+            cfg.device_type = Some(v.parse().map_err(|e: String| Error::Config(e))?);
         }
 
         cfg.extra = props;
@@ -355,20 +356,44 @@ fn normalize_key_aliases(props: &mut HashMap<String, String>) {
     move_alias(props, "stage-sftp-port", "sftp:port");
     move_alias(props, "stage-sftp-user", "sftp:user-name");
     move_alias(props, "stage-sftp-password", "sftp:password");
-    move_alias(props, "stage-sftp-data-directory", "sftp:remote-data-stage-directory");
-    move_alias(props, "stage-sftp-command-directory", "sftp:remote-command-stage-directory");
+    move_alias(
+        props,
+        "stage-sftp-data-directory",
+        "sftp:remote-data-stage-directory",
+    );
+    move_alias(
+        props,
+        "stage-sftp-command-directory",
+        "sftp:remote-command-stage-directory",
+    );
     // S3
     move_alias(props, "stage-s3-endpoint", "s3:endpoint");
     move_alias(props, "stage-s3-access-key", "s3:access-key");
     move_alias(props, "stage-s3-secret-key", "s3:secret-key");
-    move_alias(props, "stage-s3-data-bucket-name", "s3:data-stage-bucket-name");
-    move_alias(props, "stage-s3-command-bucket-name", "s3:command-stage-bucket-name");
+    move_alias(
+        props,
+        "stage-s3-data-bucket-name",
+        "s3:data-stage-bucket-name",
+    );
+    move_alias(
+        props,
+        "stage-s3-command-bucket-name",
+        "s3:command-stage-bucket-name",
+    );
     // MinIO (separate transport, Java parity)
     move_alias(props, "stage-minio-endpoint", "minio:endpoint");
     move_alias(props, "stage-minio-access-key", "minio:access-key");
     move_alias(props, "stage-minio-secret-key", "minio:secret-key");
-    move_alias(props, "stage-minio-data-bucket-name", "minio:data-stage-bucket-name");
-    move_alias(props, "stage-minio-command-bucket-name", "minio:command-stage-bucket-name");
+    move_alias(
+        props,
+        "stage-minio-data-bucket-name",
+        "minio:data-stage-bucket-name",
+    );
+    move_alias(
+        props,
+        "stage-minio-command-bucket-name",
+        "minio:command-stage-bucket-name",
+    );
 }
 
 #[cfg(test)]
@@ -387,11 +412,11 @@ mod tests {
         assert_eq!(cfg.device_name.as_deref(), Some("test-device"));
         assert_eq!(cfg.backend, Some(Backend::Sqlite));
         assert_eq!(cfg.device_type, None);
+        assert_eq!(cfg.local_stage_dir, Some(PathBuf::from("/tmp/stage")));
         assert_eq!(
-            cfg.local_stage_dir,
-            Some(PathBuf::from("/tmp/stage"))
+            cfg.extra.get("custom-key").map(String::as_str),
+            Some("kept")
         );
-        assert_eq!(cfg.extra.get("custom-key").map(String::as_str), Some("kept"));
     }
 
     #[test]
@@ -420,10 +445,7 @@ mod tests {
         m.insert("device-stage-type-1".into(), "FS".into());
 
         let cfg = SyncLiteConfig::from_map(m).unwrap();
-        assert_eq!(
-            cfg.local_stage_dir,
-            Some(PathBuf::from("/tmp/stage1"))
-        );
+        assert_eq!(cfg.local_stage_dir, Some(PathBuf::from("/tmp/stage1")));
         assert_eq!(
             cfg.extra.get("device-stage-type").map(String::as_str),
             Some("FS")
@@ -444,5 +466,3 @@ mod tests {
         assert_eq!(cfg.local_stage_dir, Some(PathBuf::from("/tmp/bare")));
     }
 }
-
-

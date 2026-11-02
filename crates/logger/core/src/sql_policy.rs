@@ -43,10 +43,174 @@ pub struct InsertShape {
     pub value_count: usize,
 }
 
-/// Returns true when SQL starts with `CREATE`, `DROP`, or `ALTER`.
+/// Coarse statement classification used when a backend does not expose a
+/// safe prepared-statement read-only flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlStatementKind {
+    /// A statement expected not to mutate database state.
+    ReadOnly,
+    /// An `INSERT` or `REPLACE` statement.
+    Insert,
+    /// An `UPDATE` statement.
+    Update,
+    /// A `DELETE` statement.
+    Delete,
+    /// A schema-changing statement.
+    Ddl,
+    /// A recognized non-query command.
+    Command,
+    /// An unknown statement, treated conservatively as mutating.
+    Unknown,
+}
+
+/// Classify the top-level SQL operation while ignoring comments, quoted
+/// values, and nested CTE bodies.
+///
+/// Unknown operations are considered mutating so callers never accidentally
+/// bypass SyncLite logging.
+pub fn classify_sql_statement(sql: &str) -> SqlStatementKind {
+    let keywords = top_level_keywords(sql);
+    let Some(first) = keywords.first().map(String::as_str) else {
+        return SqlStatementKind::Unknown;
+    };
+
+    if first == "EXPLAIN" && !keywords.iter().any(|word| word == "ANALYZE") {
+        return SqlStatementKind::ReadOnly;
+    }
+
+    let primary = if first == "WITH" {
+        keywords.iter().skip(1).find_map(|word| {
+            matches!(
+                word.as_str(),
+                "SELECT" | "VALUES" | "FROM" | "INSERT" | "REPLACE" | "UPDATE" | "DELETE" | "MERGE"
+            )
+            .then_some(word.as_str())
+        })
+    } else if first == "EXPLAIN" {
+        keywords.iter().skip(1).find_map(|word| {
+            matches!(
+                word.as_str(),
+                "SELECT" | "VALUES" | "FROM" | "INSERT" | "REPLACE" | "UPDATE" | "DELETE" | "MERGE"
+            )
+            .then_some(word.as_str())
+        })
+    } else {
+        Some(first)
+    };
+
+    match primary {
+        Some(
+            "SELECT" | "VALUES" | "FROM" | "SHOW" | "DESCRIBE" | "DESC" | "SUMMARIZE" | "PRAGMA"
+            | "PIVOT" | "UNPIVOT" | "CALL",
+        ) => SqlStatementKind::ReadOnly,
+        Some("INSERT" | "REPLACE") => SqlStatementKind::Insert,
+        Some("UPDATE" | "MERGE") => SqlStatementKind::Update,
+        Some("DELETE") => SqlStatementKind::Delete,
+        Some("CREATE" | "DROP" | "ALTER") => SqlStatementKind::Ddl,
+        Some(
+            "ATTACH" | "DETACH" | "COPY" | "EXPORT" | "IMPORT" | "SET" | "RESET" | "TRUNCATE"
+            | "VACUUM" | "ANALYZE",
+        ) => SqlStatementKind::Command,
+        _ => SqlStatementKind::Unknown,
+    }
+}
+
+/// Return whether a keyword occurs at SQL nesting depth zero.
+pub fn has_top_level_keyword(sql: &str, keyword: &str) -> bool {
+    let keyword = keyword.to_ascii_uppercase();
+    top_level_keywords(sql).iter().any(|word| word == &keyword)
+}
+
+fn top_level_keywords(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut words = Vec::new();
+    let mut index = 0;
+    let mut depth = 0_u32;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        if index + 1 < bytes.len() && bytes[index + 1] == quote {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'[' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b']' {
+                        if index + 1 < bytes.len() && bytes[index + 1] == b']' {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'-' if index + 1 < bytes.len() && bytes[index + 1] == b'-' => {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                    index += 1;
+                }
+            }
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
+                index += 2;
+                let mut comment_depth = 1_u32;
+                while index < bytes.len() && comment_depth > 0 {
+                    if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'*' {
+                        comment_depth += 1;
+                        index += 2;
+                    } else if index + 1 < bytes.len()
+                        && bytes[index] == b'*'
+                        && bytes[index + 1] == b'/'
+                    {
+                        comment_depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+                {
+                    index += 1;
+                }
+                if depth == 0 {
+                    words.push(sql[start..index].to_ascii_uppercase());
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    words
+}
+
+/// Returns true when the top-level statement is `CREATE`, `DROP`, or `ALTER`.
 pub fn is_ddl(sql: &str) -> bool {
-    let upper = sql.trim_start().to_ascii_uppercase();
-    upper.starts_with("CREATE ") || upper.starts_with("DROP ") || upper.starts_with("ALTER ")
+    classify_sql_statement(sql) == SqlStatementKind::Ddl
 }
 
 /// Validate one SQL statement against STORE/STREAMING policy.
@@ -55,7 +219,9 @@ pub fn is_ddl(sql: &str) -> bool {
 pub fn validate_sql_policy(sql: &str, mode: SqlPolicyMode) -> Result<SqlShape> {
     let sql = sql.trim();
     if sql.is_empty() {
-        return Err(Error::Db("Unsupported SQL: empty SQL statement".to_string()));
+        return Err(Error::Db(
+            "Unsupported SQL: empty SQL statement".to_string(),
+        ));
     }
 
     if let Some(insert) = parse_insert_shape(sql) {
@@ -133,8 +299,10 @@ fn insert_regex() -> &'static Regex {
 fn delete_regex() -> &'static Regex {
     static DELETE: OnceLock<Regex> = OnceLock::new();
     DELETE.get_or_init(|| {
-        Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(?:[A-Za-z0-9_]+\.)?[A-Za-z0-9_]+(?:\s+WHERE\s+(.+))?\s*$")
-            .expect("valid delete regex")
+        Regex::new(
+            r"(?is)^\s*DELETE\s+FROM\s+(?:[A-Za-z0-9_]+\.)?[A-Za-z0-9_]+(?:\s+WHERE\s+(.+))?\s*$",
+        )
+        .expect("valid delete regex")
     })
 }
 
@@ -174,8 +342,7 @@ fn contains_select_regex() -> &'static Regex {
 fn contains_word_call_regex() -> &'static Regex {
     static WORD_CALL: OnceLock<Regex> = OnceLock::new();
     WORD_CALL.get_or_init(|| {
-        Regex::new(r"(?i)\b[A-Za-z_][A-Za-z0-9_]*\s*\(")
-            .expect("valid word-call detector regex")
+        Regex::new(r"(?i)\b[A-Za-z_][A-Za-z0-9_]*\s*\(").expect("valid word-call detector regex")
     })
 }
 
@@ -192,6 +359,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classifies_queries_ctes_and_returning() {
+        assert_eq!(
+            classify_sql_statement("-- comment\nSELECT * FROM t"),
+            SqlStatementKind::ReadOnly
+        );
+        assert_eq!(
+            classify_sql_statement("WITH source AS (SELECT 1) SELECT * FROM source"),
+            SqlStatementKind::ReadOnly
+        );
+        assert_eq!(
+            classify_sql_statement("WITH source AS (SELECT 1) INSERT INTO t SELECT * FROM source"),
+            SqlStatementKind::Insert
+        );
+        assert_eq!(
+            classify_sql_statement("UPDATE t SET value = 1"),
+            SqlStatementKind::Update
+        );
+        assert_eq!(
+            classify_sql_statement("CREATE TABLE t(id INTEGER)"),
+            SqlStatementKind::Ddl
+        );
+        assert_eq!(
+            classify_sql_statement("CALL pragma_version()"),
+            SqlStatementKind::ReadOnly
+        );
+        assert!(has_top_level_keyword(
+            "INSERT INTO t VALUES (1) RETURNING id",
+            "returning"
+        ));
+        assert!(!has_top_level_keyword(
+            "SELECT 'RETURNING', (SELECT returning FROM nested)",
+            "returning"
+        ));
+    }
+
+    #[test]
     fn store_accepts_simple_update_delete() {
         assert!(matches!(
             validate_sql_policy("UPDATE t SET v = ? WHERE id = ?", SqlPolicyMode::Store),
@@ -205,12 +408,9 @@ mod tests {
 
     #[test]
     fn store_rejects_select_and_function_calls_in_update_delete() {
-        let u = validate_sql_policy(
-            "UPDATE t SET v = (SELECT 'x')",
-            SqlPolicyMode::Store,
-        )
-        .expect_err("expected update with select to be rejected")
-        .to_string();
+        let u = validate_sql_policy("UPDATE t SET v = (SELECT 'x')", SqlPolicyMode::Store)
+            .expect_err("expected update with select to be rejected")
+            .to_string();
         assert!(u.contains("Unsupported SQL"));
 
         let d = validate_sql_policy(
@@ -221,13 +421,9 @@ mod tests {
         .to_string();
         assert!(d.contains("Unsupported SQL"));
 
-        let f = validate_sql_policy(
-            "UPDATE t SET v = lower(?)",
-            SqlPolicyMode::Store,
-        )
-        .expect_err("expected update with function call to be rejected")
-        .to_string();
+        let f = validate_sql_policy("UPDATE t SET v = lower(?)", SqlPolicyMode::Store)
+            .expect_err("expected update with function call to be rejected")
+            .to_string();
         assert!(f.contains("Unsupported SQL"));
     }
 }
-

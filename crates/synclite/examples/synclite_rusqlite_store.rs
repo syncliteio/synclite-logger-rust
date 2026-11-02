@@ -84,8 +84,16 @@ local-data-stage-directory=synclite-stage\n"
 
     {
         let mut stmt = conn.prepare("INSERT INTO users(id, name, score) VALUES(?, ?, ?)")?;
-        stmt.execute(&[Value::Int(1), Value::Text("Alice".to_string()), Value::Int(100)])?;
-        stmt.execute(&[Value::Int(2), Value::Text("Bob".to_string()), Value::Int(200)])?;
+        stmt.execute(&[
+            Value::Int(1),
+            Value::Text("Alice".to_string()),
+            Value::Int(100),
+        ])?;
+        stmt.execute(&[
+            Value::Int(2),
+            Value::Text("Bob".to_string()),
+            Value::Int(200),
+        ])?;
     }
 
     conn.execute(
@@ -103,8 +111,3 @@ local-data-stage-directory=synclite-stage\n"
     conn.close()?;
     Ok(())
 }
-
-
-
-
-

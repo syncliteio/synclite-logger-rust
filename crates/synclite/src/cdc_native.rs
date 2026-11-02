@@ -9,6 +9,12 @@
 //! Hosts not covered by an embedded prebuilt (e.g. macOS) fall through:
 //! the loader keeps searching the workspace `native/` directory, the
 //! system loader path, and any user-supplied `SYNCLITE_CDC_LIB_DIR`.
+//!
+//! Android deliberately embeds/extracts nothing: the AAR builds the custom C
+//! sources as `libsynclitecdc.so` for each ABI. The consolidator dlopens that
+//! SONAME through the application's native linker namespace, which supports
+//! both extracted nativeLibraryDir files and unextracted APK libraries. The
+//! bundled rusqlite SQLite is not the custom CDC library.
 
 use std::env;
 use std::fs;

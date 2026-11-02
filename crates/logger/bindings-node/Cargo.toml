@@ -13,6 +13,11 @@ description = "Node.js N-API bindings for the SyncLite Rust runtime."
 name = "synclite_node_1_1_0"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Kept as a compatibility alias; DuckDB is always compiled in by synclite.
+duckdb = ["synclite/duckdb"]
+
 [dependencies]
 napi = { version = "2.16", default-features = false, features = ["napi8"] }
 napi-derive = "2.16"

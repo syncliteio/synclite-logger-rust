@@ -84,8 +84,16 @@ local-data-stage-directory=synclite-stage\n"
 
     {
         let mut stmt = conn.prepare("INSERT INTO events(id, category, amount) VALUES(?, ?, ?)")?;
-        stmt.execute(&[Value::Int(1), Value::Text("retail".to_string()), Value::Int(40)])?;
-        stmt.execute(&[Value::Int(2), Value::Text("retail".to_string()), Value::Int(60)])?;
+        stmt.execute(&[
+            Value::Int(1),
+            Value::Text("retail".to_string()),
+            Value::Int(40),
+        ])?;
+        stmt.execute(&[
+            Value::Int(2),
+            Value::Text("retail".to_string()),
+            Value::Int(60),
+        ])?;
     }
 
     conn.execute(
@@ -103,8 +111,3 @@ local-data-stage-directory=synclite-stage\n"
     conn.close()?;
     Ok(())
 }
-
-
-
-
-

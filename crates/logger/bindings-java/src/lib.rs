@@ -19,6 +19,10 @@
 //! - `nativeIsSyncPaused(dbPath)          -> boolean`
 //! - `nativeReinitialize(dbPath, clean)   -> void`
 //!
+//! The Android AAR also uses `io.synclite.NativeSqlite` exports in the
+//! `android_sqlite` module for SQLite device initialization, connection,
+//! transaction, query, prepared-batch, flush, and await operations.
+//!
 //! Handles are boxed Rust values containing an `Arc<Consolidator>`.
 //! All exports trap panics + map errors to `SyncLiteException`.
 
@@ -36,6 +40,8 @@ use consolidator_core::{
     ConsolidatorLayout, DestinationSyncMode as DstSyncMode, DstType, MetadataStore,
 };
 use consolidator_runtime::Consolidator;
+
+mod android_sqlite;
 
 // ---------- error / panic helpers --------------------------------------------
 
@@ -350,8 +356,10 @@ pub extern "system" fn Java_io_synclite_NativeConsolidator_nativeSpawnConsolidat
         // SYNCLITE_CDC_LIB_DIR so the consolidator runtime can dlopen
         // it for SQL replicator replay. The pure-Rust facade does this
         // inside `initialize`; the JNI spawn path bypasses that, so we
-        // mirror it here. Without this, SQL device replay falls back
-        // to the compat path and writes empty `.cdclog` segments.
+        // mirror it here. Android ships only the SQLite-focused JNI AAR;
+        // its native libraries are loaded by the platform and must not be
+        // extracted to a desktop-style temporary directory.
+        #[cfg(not(target_os = "android"))]
         synclite::cdc_native::ensure_extracted();
 
         let db_path = PathBuf::from(jstring_to_string(env, &db_path)?);

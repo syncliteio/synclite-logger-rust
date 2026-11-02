@@ -24,17 +24,18 @@
 //! Both ports write segments as `<N>.sqllog` inside a per-device
 //! `synclite-<device>-<uuid>/` stage subdirectory.
 
-use std::fs;
 use std::collections::HashSet;
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use duckdb::Connection as DuckConnection;
-use rusqlite::Connection;
 use logger_core::record::ArgValue;
 use logger_core::DeviceType;
-use logger_db_traits::Row;
+use logger_db_sqlite::{SqliteDevice, SqliteDeviceConfig};
+use logger_db_traits::{DbDevice, Row};
+use rusqlite::Connection;
 use synclite::{duckdb as sl_duckdb, rusqlite as sl_rusqlite};
 
 // --------------------------------------------------------------------------
@@ -57,7 +58,10 @@ fn inferred_device_type(device_name: &str, engine: &str) -> &'static str {
     if device_name.contains("stream") {
         return "STREAMING";
     }
-    match (engine.to_ascii_lowercase().as_str(), device_name.contains("store")) {
+    match (
+        engine.to_ascii_lowercase().as_str(),
+        device_name.contains("store"),
+    ) {
         ("sqlite", true) => "SQLITE_STORE",
         ("sqlite", false) => "SQLITE",
         ("duckdb", true) => "DUCKDB_STORE",
@@ -73,7 +77,11 @@ fn slugify_alnum(input: &str) -> String {
             out.push(ch.to_ascii_lowercase());
         }
     }
-    if out.is_empty() { "na".to_string() } else { out }
+    if out.is_empty() {
+        "na".to_string()
+    } else {
+        out
+    }
 }
 
 fn normalize_naming_terms(input: &str) -> String {
@@ -157,14 +165,26 @@ fn normalized_scenario_suffix(scenario_name: &str) -> String {
     let normalized = normalize_naming_terms(&spaced);
     let mut parts: Vec<String> = normalized
         .split_whitespace()
-        .map(|p| p.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+        .map(|p| {
+            p.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+        })
         .filter(|p| !p.is_empty())
         .collect();
 
     parts.retain(|p| {
         !matches!(
             p.as_str(),
-            "duckdb" | "sqlite" | "store" | "sql" | "streaming" | "test" | "testrust" | "rust" | "device"
+            "duckdb"
+                | "sqlite"
+                | "store"
+                | "sql"
+                | "streaming"
+                | "test"
+                | "testrust"
+                | "rust"
+                | "device"
         )
     });
 
@@ -262,7 +282,11 @@ impl Workspace {
                 .chars()
                 .filter(|ch| ch.is_ascii_alphanumeric())
                 .collect();
-            if s.is_empty() { "device".to_string() } else { s }
+            if s.is_empty() {
+                "device".to_string()
+            } else {
+                s
+            }
         };
         // Keep deterministic names for reproducibility while avoiding collisions
         // when multiple long test names compact to the same prefix.
@@ -280,10 +304,21 @@ impl Workspace {
         let work_dir = test_home.join("workDir");
         // Match the Java test layout under ~/synclite/test/rustruntime/db/rustologger/<TestName>/
         // while keeping Rust-created artifacts distinct via the -rust device suffix.
-        let db_dir = test_home.join("db").join("rustologger").join(&sanitized_device_name);
-        let ext = if engine.eq_ignore_ascii_case("duckdb") { "duckdb" } else { "db" };
+        let db_dir = test_home
+            .join("db")
+            .join("rustologger")
+            .join(&sanitized_device_name);
+        let ext = if engine.eq_ignore_ascii_case("duckdb") {
+            "duckdb"
+        } else {
+            "db"
+        };
         let db_path = db_dir.join(format!("{sanitized_device_name}.{ext}"));
-        let target = if with_target { Some(db_dir.join("target")) } else { None };
+        let target = if with_target {
+            Some(db_dir.join("target"))
+        } else {
+            None
+        };
         let conf = db_dir.join("synclite.conf");
         let device_type = inferred_device_type(device_name, engine)
             .parse::<DeviceType>()
@@ -361,6 +396,23 @@ impl Workspace {
             "no stage subdir matching {prefix}* under {}",
             self.stage.display()
         )
+    }
+
+    /// Disable the embedded destination for tests that inspect the local
+    /// mover output. Otherwise the consolidator is allowed to consume and
+    /// clean the staged segment before the assertion runs.
+    fn disable_destination(&self) {
+        let filtered: String = fs::read_to_string(&self.conf)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line.starts_with("dst-")
+                    && !line.starts_with("metadata-store-")
+                    && !line.starts_with("device-data-root=")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&self.conf, filtered).unwrap();
     }
 
     /// `<db_path>.synclite/` device home directory.
@@ -537,8 +589,10 @@ fn seed_preexisting_user_db(ws: &Workspace, table_name: &str) {
 
 fn backup_row_count_for_table(backup_path: &Path, table_name: &str) -> i64 {
     let c = Connection::open(backup_path).unwrap();
-    c.query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |r| r.get(0))
-        .unwrap()
+    c.query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |r| {
+        r.get(0)
+    })
+    .unwrap()
 }
 
 fn preexisting_data_init_backup_and_logging_core(engine: &str, device_name: &str, test_name: &str) {
@@ -582,13 +636,25 @@ fn preexisting_data_init_backup_and_logging_core(engine: &str, device_name: &str
 fn locate_segment(ws: &Workspace) -> PathBuf {
     let seg = try_locate_segment(ws).unwrap_or_else(|| {
         let dir = ws.target.clone().unwrap_or_else(|| ws.stage_subdir());
-        panic!(
-            "no non-empty <N>.sqllog segment found in {}",
-            dir.display()
-        )
+        panic!("no non-empty <N>.sqllog segment found in {}", dir.display())
     });
     eprintln!("DEBUG locate_segment selected {}", seg.display());
     seg
+}
+
+/// Put a finalized segment back in the device home to model an interrupted
+/// process. Restart recovery is intentionally metadata-authoritative and must
+/// never discover an active segment by scanning the stage directory.
+fn restore_active_segment(ws: &Workspace, staged: &Path) -> PathBuf {
+    let home = ws.device_home();
+    fs::create_dir_all(&home).unwrap();
+    let active = home.join(staged.file_name().unwrap());
+    fs::copy(staged, &active).unwrap();
+    fs::remove_file(staged).unwrap();
+    let conn = Connection::open(&active).unwrap();
+    conn.execute("UPDATE metadata SET value = 'NEW' WHERE key = 'status'", [])
+        .unwrap();
+    active
 }
 
 fn try_locate_segment(ws: &Workspace) -> Option<PathBuf> {
@@ -706,11 +772,9 @@ fn assert_synclite_txn_matches_latest_segment(ws: &Workspace) {
     let latest_seg_commit = segment_max_commit_id(&locate_segment(ws));
     let user_commit = user_db_synclite_txn_commit_id(ws);
     assert_eq!(
-        user_commit,
-        latest_seg_commit,
+        user_commit, latest_seg_commit,
         "synclite_txn.commit_id {} must match latest segment commit_id {}",
-        user_commit,
-        latest_seg_commit
+        user_commit, latest_seg_commit
     );
 }
 
@@ -746,11 +810,19 @@ fn segment_commandlog_ci_count_starting_with(seg: &Path, keyword: &str) -> i64 {
 
 fn segment_commandlog_null_sql_count(seg: &Path) -> i64 {
     let c = Connection::open(seg).unwrap();
-    c.query_row("SELECT COUNT(*) FROM commandlog WHERE sql IS NULL", [], |r| r.get(0))
-        .unwrap()
+    c.query_row(
+        "SELECT COUNT(*) FROM commandlog WHERE sql IS NULL",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
 }
 
-fn segment_commandlog_count_for_commit_starting_with(seg: &Path, commit_id: i64, keyword: &str) -> i64 {
+fn segment_commandlog_count_for_commit_starting_with(
+    seg: &Path,
+    commit_id: i64,
+    keyword: &str,
+) -> i64 {
     let c = Connection::open(seg).unwrap();
     c.query_row(
         "SELECT COUNT(*) FROM commandlog WHERE commit_id = ?1 AND sql LIKE ?2",
@@ -760,13 +832,18 @@ fn segment_commandlog_count_for_commit_starting_with(seg: &Path, commit_id: i64,
     .unwrap()
 }
 
-fn segment_distinct_commit_ids_starting_with(seg: &Path, keyword: &str) -> std::collections::BTreeSet<i64> {
+fn segment_distinct_commit_ids_starting_with(
+    seg: &Path,
+    keyword: &str,
+) -> std::collections::BTreeSet<i64> {
     let mut out = std::collections::BTreeSet::new();
     for p in segment_and_txn_files(seg) {
         eprintln!("DEBUG segment file: {}", p.display());
         let c = Connection::open(&p).unwrap();
         let mut stmt = c
-            .prepare("SELECT DISTINCT commit_id FROM commandlog WHERE sql IS NOT NULL AND sql LIKE ?1")
+            .prepare(
+                "SELECT DISTINCT commit_id FROM commandlog WHERE sql IS NOT NULL AND sql LIKE ?1",
+            )
             .unwrap();
         let rows = stmt
             .query_map([format!("{keyword}%")], |r| r.get::<_, i64>(0))
@@ -846,7 +923,11 @@ fn segment_and_txn_null_sql_count(seg: &Path) -> i64 {
         .sum()
 }
 
-fn segment_and_txn_count_for_commit_starting_with(seg: &Path, commit_id: i64, keyword: &str) -> i64 {
+fn segment_and_txn_count_for_commit_starting_with(
+    seg: &Path,
+    commit_id: i64,
+    keyword: &str,
+) -> i64 {
     segment_and_txn_files(seg)
         .into_iter()
         .map(|p| segment_commandlog_count_for_commit_starting_with(&p, commit_id, keyword))
@@ -1042,13 +1123,12 @@ fn wait_for_sql_device_consolidation_and_validate_expected_count(
 
 /// Core flow shared by Java `SQLiteTransactionalTest.testBasicTableOperations`
 /// and `SQLiteStoreTest.testBasicTableOperations`.
-fn sqlite_basic_table_operations_core(device_name: &str, test_name: &str, expect_txn_markers: bool) {
-    let ws = Workspace::new(
-        test_name,
-        device_name,
-        "sqlite",
-        false,
-    );
+fn sqlite_basic_table_operations_core(
+    device_name: &str,
+    test_name: &str,
+    expect_txn_markers: bool,
+) {
+    let ws = Workspace::new(test_name, device_name, "sqlite", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
     if expect_txn_markers {
@@ -1065,20 +1145,31 @@ fn sqlite_basic_table_operations_core(device_name: &str, test_name: &str, expect
     logger
         .execute(
             &format!("INSERT INTO {table} (id, name, value) VALUES (?, ?, ?)"),
-            &[ArgValue::Int(1), ArgValue::Text("test1".into()), ArgValue::Int(100)],
+            &[
+                ArgValue::Int(1),
+                ArgValue::Text("test1".into()),
+                ArgValue::Int(100),
+            ],
         )
         .unwrap();
     logger
         .execute(
             &format!("INSERT INTO {table} (id, name, value) VALUES (?, ?, ?)"),
-            &[ArgValue::Int(2), ArgValue::Text("test2".into()), ArgValue::Int(200)],
+            &[
+                ArgValue::Int(2),
+                ArgValue::Text("test2".into()),
+                ArgValue::Int(200),
+            ],
         )
         .unwrap();
     logger.commit().unwrap();
 
     assert_eq!(count(&mut logger, &table), 2);
     let rows = logger
-        .query(&format!("SELECT id, name, value FROM {table} ORDER BY id"), &[])
+        .query(
+            &format!("SELECT id, name, value FROM {table} ORDER BY id"),
+            &[],
+        )
         .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(as_i64(&rows[0][0]), 1);
@@ -1141,12 +1232,7 @@ fn sqlite_basic_table_operations_core(device_name: &str, test_name: &str, expect
 #[test]
 fn sqlite_execute_unlogged_runs_ddl_and_dml_without_commandlog_entries() {
     let test_name = "sqlite_execute_unlogged_runs_ddl_and_dml_without_commandlog_entries";
-    let ws = Workspace::new(
-        test_name,
-        "sqliteunlogged-rust",
-        "sqlite",
-        false,
-    );
+    let ws = Workspace::new(test_name, "sqliteunlogged-rust", "sqlite", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
 
@@ -1167,8 +1253,14 @@ fn sqlite_execute_unlogged_runs_ddl_and_dml_without_commandlog_entries() {
     logger.close().unwrap();
 
     let seg = locate_segment(&ws);
-    assert_eq!(segment_commandlog_ci_count_starting_with(&seg, &format!("CREATE TABLE {table}")), 1);
-    assert_eq!(segment_commandlog_ci_count_starting_with(&seg, &format!("INSERT INTO {table}")), 0);
+    assert_eq!(
+        segment_commandlog_ci_count_starting_with(&seg, &format!("CREATE TABLE {table}")),
+        1
+    );
+    assert_eq!(
+        segment_commandlog_ci_count_starting_with(&seg, &format!("INSERT INTO {table}")),
+        0
+    );
 }
 
 /// Exact mapping: Java `SQLiteTransactionalTest.testBasicTableOperations`.
@@ -1182,11 +1274,7 @@ fn sqlite_transactional_test_basic_table_operations() {
     );
     let table = test_table_name(&ws);
     reset_destination_table_if_exists(&table);
-    sqlite_basic_table_operations_core(
-        "sqlitetransactional-rust",
-        "SQLiteTransactionalTest",
-        true,
-    );
+    sqlite_basic_table_operations_core("sqlitetransactional-rust", "SQLiteTransactionalTest", true);
 }
 
 /// Exact mapping: Java `SQLiteStoreTest.testBasicTableOperations`.
@@ -1198,12 +1286,7 @@ fn sqlite_store_test_basic_table_operations() {
 #[test]
 fn sqlite_store_rejects_non_values_and_subquery_dml_shapes() {
     let test_name = "sqlite_store_rejects_non_values_and_subquery_dml_shapes";
-    let ws = Workspace::new(
-        test_name,
-        "sqlitestorevalidate-rust",
-        "sqlite",
-        false,
-    );
+    let ws = Workspace::new(test_name, "sqlitestorevalidate-rust", "sqlite", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
 
@@ -1269,11 +1352,7 @@ fn sqlite_transactional_rollback_logs_marker() {
 
 #[test]
 fn sqlite_store_rollback_has_no_marker() {
-    sqlite_rollback_marker_core(
-        "sqliterollbackstore-rust",
-        "SQLiteStoreRollbackTest",
-        true,
-    );
+    sqlite_rollback_marker_core("sqliterollbackstore-rust", "SQLiteStoreRollbackTest", true);
 }
 
 fn close_drops_uncommitted_store_tail_core(engine: &str, device_name: &str, test_name: &str) {
@@ -1282,7 +1361,9 @@ fn close_drops_uncommitted_store_tail_core(engine: &str, device_name: &str, test
 
     {
         let mut logger = open_logger(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(id INTEGER)"), &[]).unwrap();
+        logger
+            .execute(&format!("CREATE TABLE {table}(id INTEGER)"), &[])
+            .unwrap();
         logger.commit().unwrap();
         logger.set_auto_commit(false);
         logger
@@ -1323,12 +1404,7 @@ fn duckdb_store_close_drops_uncommitted_tail_from_segment() {
 #[test]
 fn sqlite_transactional_prepared_batch_logs_sql_once_and_cleans_on_rollback() {
     let test_name = "sqlite_transactional_prepared_batch_logs_sql_once_and_cleans_on_rollback";
-    let ws = Workspace::new(
-        test_name,
-        "sqlitepreparedbatchtxn-rust",
-        "sqlite",
-        false,
-    );
+    let ws = Workspace::new(test_name, "sqlitepreparedbatchtxn-rust", "sqlite", false);
     let table = test_table_name(&ws);
     reset_destination_table_if_exists(&table);
     let mut logger = open_logger(&ws);
@@ -1373,20 +1449,20 @@ fn sqlite_transactional_prepared_batch_logs_sql_once_and_cleans_on_rollback() {
 
     let latest_commit = segment_max_commit_id(&seg);
     assert_eq!(
-        segment_commandlog_count_for_commit_starting_with(&seg, latest_commit, &format!("INSERT INTO {table}")),
+        segment_commandlog_count_for_commit_starting_with(
+            &seg,
+            latest_commit,
+            &format!("INSERT INTO {table}")
+        ),
         1
     );
 }
 
 #[test]
 fn sqlite_transactional_default_autocommit_splits_create_and_batch_into_separate_txns() {
-    let test_name = "sqlite_transactional_default_autocommit_splits_create_and_batch_into_separate_txns";
-    let ws = Workspace::new(
-        test_name,
-        "sqliteautocommitboundary-rust",
-        "sqlite",
-        false,
-    );
+    let test_name =
+        "sqlite_transactional_default_autocommit_splits_create_and_batch_into_separate_txns";
+    let ws = Workspace::new(test_name, "sqliteautocommitboundary-rust", "sqlite", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
 
@@ -1408,11 +1484,17 @@ fn sqlite_transactional_default_autocommit_splits_create_and_batch_into_separate
     logger.close().unwrap();
 
     let seg = locate_segment(&ws);
-    let ddl_commits = segment_distinct_commit_ids_starting_with(&seg, &format!("CREATE TABLE {table}"));
-    let dml_commits = segment_distinct_commit_ids_starting_with(&seg, &format!("INSERT INTO {table}"));
+    let ddl_commits =
+        segment_distinct_commit_ids_starting_with(&seg, &format!("CREATE TABLE {table}"));
+    let dml_commits =
+        segment_distinct_commit_ids_starting_with(&seg, &format!("INSERT INTO {table}"));
 
     assert_eq!(ddl_commits.len(), 1, "CREATE should map to exactly one txn");
-    assert_eq!(dml_commits.len(), 1, "Batch INSERT should map to exactly one txn");
+    assert_eq!(
+        dml_commits.len(),
+        1,
+        "Batch INSERT should map to exactly one txn"
+    );
     assert_ne!(
         ddl_commits.iter().next().unwrap(),
         dml_commits.iter().next().unwrap(),
@@ -1449,11 +1531,17 @@ fn sqlite_store_default_autocommit_splits_create_and_batch_into_separate_txns() 
     logger.close().unwrap();
 
     let seg = locate_segment(&ws);
-    let ddl_commits = segment_distinct_commit_ids_starting_with(&seg, &format!("CREATE TABLE {table}"));
-    let dml_commits = segment_distinct_commit_ids_starting_with(&seg, &format!("INSERT INTO {table}"));
+    let ddl_commits =
+        segment_distinct_commit_ids_starting_with(&seg, &format!("CREATE TABLE {table}"));
+    let dml_commits =
+        segment_distinct_commit_ids_starting_with(&seg, &format!("INSERT INTO {table}"));
 
     assert_eq!(ddl_commits.len(), 1, "CREATE should map to exactly one txn");
-    assert_eq!(dml_commits.len(), 1, "Batch INSERT should map to exactly one txn");
+    assert_eq!(
+        dml_commits.len(),
+        1,
+        "Batch INSERT should map to exactly one txn"
+    );
     assert_ne!(
         ddl_commits.iter().next().unwrap(),
         dml_commits.iter().next().unwrap(),
@@ -1464,12 +1552,7 @@ fn sqlite_store_default_autocommit_splits_create_and_batch_into_separate_txns() 
 #[test]
 fn sqlite_execute_splits_semicolon_sql_and_honors_txn_messages() {
     let test_name = "sqlite_execute_splits_semicolon_sql_and_honors_txn_messages";
-    let ws = Workspace::new(
-        test_name,
-        "sqlitesplitsql-rust",
-        "sqlite",
-        false,
-    );
+    let ws = Workspace::new(test_name, "sqlitesplitsql-rust", "sqlite", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
 
@@ -1495,7 +1578,11 @@ fn sqlite_execute_splits_semicolon_sql_and_honors_txn_messages() {
 
     let seg = locate_segment(&ws);
     let rollback_commits = segment_distinct_commit_ids_starting_with(&seg, "ROLLBACK");
-    assert_eq!(rollback_commits.len(), 1, "expected exactly one rollback commit");
+    assert_eq!(
+        rollback_commits.len(),
+        1,
+        "expected exactly one rollback commit"
+    );
     let rollback_commit = *rollback_commits.iter().next().unwrap();
     assert_eq!(
         segment_commandlog_exact_sql_count_for_commit(&seg, rollback_commit, "COMMIT"),
@@ -1508,12 +1595,7 @@ fn sqlite_execute_splits_semicolon_sql_and_honors_txn_messages() {
 #[test]
 fn sqlite_store_api_test_all_apis() {
     let test_name = "sqlite_store_api_test_all_apis";
-    let ws = Workspace::new(
-        test_name,
-        "sqlitestoreapi-rust",
-        "sqlite",
-        false,
-    );
+    let ws = Workspace::new(test_name, "sqlitestoreapi-rust", "sqlite", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
 
@@ -1540,7 +1622,10 @@ fn sqlite_store_api_test_all_apis() {
     assert_eq!(count(&mut logger, &table), 2);
 
     let alice = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Alice".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Alice".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&alice[0][0]), 100);
 
@@ -1551,12 +1636,18 @@ fn sqlite_store_api_test_all_apis() {
         )
         .unwrap();
     let alice = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Alice".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Alice".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&alice[0][0]), 999);
 
     logger
-        .execute(&format!("DELETE FROM {table} WHERE name = ?"), &[ArgValue::Text("Bob".into())])
+        .execute(
+            &format!("DELETE FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Bob".into())],
+        )
         .unwrap();
     assert_eq!(count(&mut logger, &table), 1);
 
@@ -1588,25 +1679,40 @@ fn sqlite_store_api_test_all_apis() {
         )
         .unwrap();
     let carol = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Carol".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Carol".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&carol[0][0]), 350);
     let dave = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Dave".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Dave".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&dave[0][0]), 450);
 
     logger
-        .execute(&format!("DELETE FROM {table} WHERE name = ?"), &[ArgValue::Text("Carol".into())])
+        .execute(
+            &format!("DELETE FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Carol".into())],
+        )
         .unwrap();
     logger
-        .execute(&format!("DELETE FROM {table} WHERE name = ?"), &[ArgValue::Text("Dave".into())])
+        .execute(
+            &format!("DELETE FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Dave".into())],
+        )
         .unwrap();
     assert_eq!(count(&mut logger, &table), 1);
 
     logger.execute(&format!("DROP TABLE {table}"), &[]).unwrap();
     logger
-        .execute(&format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"), &[])
+        .execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"),
+            &[],
+        )
         .unwrap();
     logger.commit().unwrap();
     assert_eq!(count(&mut logger, &table), 0);
@@ -1627,12 +1733,7 @@ fn sqlite_store_api_test_all_apis() {
 #[test]
 fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
     let test_name = "sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite";
-    let ws = Workspace::new(
-        test_name,
-        "sqlitedevicee2e-rust",
-        "sqlite",
-        false,
-    );
+    let ws = Workspace::new(test_name, "sqlitedevicee2e-rust", "sqlite", false);
 
     let dst_work_dir = test_home().join("workDir");
     fs::create_dir_all(&dst_work_dir).unwrap();
@@ -1641,7 +1742,11 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
     let work_prefix = format!("synclite-{}-", ws.device_name);
     if let Ok(entries) = fs::read_dir(&dst_work_dir) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&work_prefix) {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&work_prefix)
+            {
                 rm_rf(&entry.path());
             }
         }
@@ -1674,11 +1779,17 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
         .unwrap();
     logger.commit().unwrap();
     logger
-        .execute(&format!("INSERT INTO {src_table} SELECT * FROM {src_table}"), &[])
+        .execute(
+            &format!("INSERT INTO {src_table} SELECT * FROM {src_table}"),
+            &[],
+        )
         .unwrap();
     logger.commit().unwrap();
     logger
-        .execute(&format!("UPDATE {src_table} SET id = id + 10 WHERE id > 0"), &[])
+        .execute(
+            &format!("UPDATE {src_table} SET id = id + 10 WHERE id > 0"),
+            &[],
+        )
         .unwrap();
     logger.commit().unwrap();
     logger
@@ -1686,7 +1797,10 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
         .unwrap();
     logger.commit().unwrap();
     logger
-        .execute(&format!("ALTER TABLE {src_table} ADD COLUMN extra TEXT"), &[])
+        .execute(
+            &format!("ALTER TABLE {src_table} ADD COLUMN extra TEXT"),
+            &[],
+        )
         .unwrap();
     logger.commit().unwrap();
     logger
@@ -1694,11 +1808,17 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
         .unwrap();
     logger.commit().unwrap();
     logger
-        .execute(&format!("ALTER TABLE {src_table} RENAME COLUMN v TO v_new"), &[])
+        .execute(
+            &format!("ALTER TABLE {src_table} RENAME COLUMN v TO v_new"),
+            &[],
+        )
         .unwrap();
     logger.commit().unwrap();
     logger
-        .execute(&format!("ALTER TABLE {src_table} RENAME TO {final_table}"), &[])
+        .execute(
+            &format!("ALTER TABLE {src_table} RENAME TO {final_table}"),
+            &[],
+        )
         .unwrap();
     logger.commit().unwrap();
     logger.close().unwrap();
@@ -1708,10 +1828,14 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
     let src = Connection::open(&ws.db_path).unwrap();
     let dst = Connection::open(&dest_db).unwrap();
     let src_final_cnt: i64 = src
-        .query_row(&format!("SELECT COUNT(*) FROM {final_table}"), [], |r| r.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {final_table}"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let dst_final_cnt: i64 = dst
-        .query_row(&format!("SELECT COUNT(*) FROM {final_table}"), [], |r| r.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {final_table}"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(src_final_cnt, 0);
     assert_eq!(dst_final_cnt, 0);
@@ -1734,6 +1858,9 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
             })
             .collect();
         let mut operation_types = HashSet::new();
+        let mut insert_rows = 0_i64;
+        let mut update_rows = 0_i64;
+        let mut delete_rows = 0_i64;
         for path in &segments {
             if let Ok(conn) = Connection::open(path) {
                 if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT op_type FROM cdclog") {
@@ -1743,14 +1870,41 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
                         }
                     }
                 }
+                for (op_type, count) in [
+                    ("INSERT", &mut insert_rows),
+                    ("UPDATE", &mut update_rows),
+                    ("DELETE", &mut delete_rows),
+                ] {
+                    if let Ok(n) = conn.query_row(
+                        "SELECT COUNT(*) FROM cdclog WHERE op_type = ?1 AND table_name = ?2",
+                        [op_type, src_table.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    ) {
+                        *count += n;
+                    }
+                }
             }
         }
         let expected_operations = [
-            "INSERT", "UPDATE", "DELETE", "ADDCOLUMN", "DROPCOLUMN",
-            "RENAMECOLUMN", "RENAMETABLE",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "ADDCOLUMN",
+            "DROPCOLUMN",
+            "RENAMECOLUMN",
+            "RENAMETABLE",
         ];
         if !segments.is_empty()
-            && expected_operations.iter().all(|op| operation_types.contains(*op))
+            && expected_operations
+                .iter()
+                .all(|op| operation_types.contains(*op))
+            // DDL rows are emitted before the native writer commits the DML
+            // rows. Wait for the complete row-image set before taking the
+            // snapshot below; otherwise a concurrent test run can observe a
+            // valid-looking cdclog containing only a prefix of the workload.
+            && insert_rows >= 4
+            && update_rows >= 4
+            && delete_rows >= 4
         {
             break segments;
         }
@@ -1822,7 +1976,12 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(cdclog_exists, 1, "cdclog table missing in {}", first_cdclog.display());
+    assert_eq!(
+        cdclog_exists,
+        1,
+        "cdclog table missing in {}",
+        first_cdclog.display()
+    );
     assert_eq!(
         cdclog_schemas_exists,
         1,
@@ -1862,15 +2021,24 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
     for (idx, path) in cdc_segments.iter().enumerate() {
         let alias = format!("segment_{idx}");
         cdc_conn
-            .execute(&format!("ATTACH DATABASE ?1 AS {alias}"), [path.to_string_lossy().as_ref()])
+            .execute(
+                &format!("ATTACH DATABASE ?1 AS {alias}"),
+                [path.to_string_lossy().as_ref()],
+            )
             .unwrap();
         if idx == 0 {
             cdc_conn
-                .execute(&format!("CREATE TABLE cdclog AS SELECT * FROM {alias}.cdclog WHERE 1 = 0"), [])
+                .execute(
+                    &format!("CREATE TABLE cdclog AS SELECT * FROM {alias}.cdclog WHERE 1 = 0"),
+                    [],
+                )
                 .unwrap();
         }
         cdc_conn
-            .execute(&format!("INSERT INTO cdclog SELECT * FROM {alias}.cdclog"), [])
+            .execute(
+                &format!("INSERT INTO cdclog SELECT * FROM {alias}.cdclog"),
+                [],
+            )
             .unwrap();
     }
 
@@ -1933,7 +2101,9 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
         )
         .unwrap();
     let update_rows: Vec<(i64, String, i64, String)> = update_stmt
-        .query_map([src_table.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .query_map([src_table.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -1993,8 +2163,14 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(max_update_rows_per_commit, 4, "expected 4 UPDATE row images in one commit");
-    assert_eq!(max_delete_rows_per_commit, 4, "expected 4 DELETE row images in one commit");
+    assert_eq!(
+        max_update_rows_per_commit, 4,
+        "expected 4 UPDATE row images in one commit"
+    );
+    assert_eq!(
+        max_delete_rows_per_commit, 4,
+        "expected 4 DELETE row images in one commit"
+    );
 
     for op in ["ADDCOLUMN", "DROPCOLUMN", "RENAMECOLUMN", "RENAMETABLE"] {
         let cnt: i64 = cdc_conn
@@ -2010,30 +2186,25 @@ fn sqlite_sql_device_end_to_end_consolidates_into_destination_sqlite() {
 
 #[test]
 fn sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite() {
-    let store_test_name = "sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite_store";
+    let store_test_name =
+        "sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite_store";
     let sql_test_name = "sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite_sql";
     let dst_work_dir = test_home().join("workDir");
     fs::create_dir_all(&dst_work_dir).unwrap();
     let dest_db = dst_work_dir.join("consolidated_db.sqlite");
 
-    let store_ws = Workspace::new(
-        store_test_name,
-        "sharedstore-rust",
-        "sqlite",
-        false,
-    );
-    let sql_ws = Workspace::new(
-        sql_test_name,
-        "sharedsql-rust",
-        "sqlite",
-        false,
-    );
+    let store_ws = Workspace::new(store_test_name, "sharedstore-rust", "sqlite", false);
+    let sql_ws = Workspace::new(sql_test_name, "sharedsql-rust", "sqlite", false);
 
     for device_name in [&store_ws.device_name, &sql_ws.device_name] {
         let work_prefix = format!("synclite-{}-", device_name);
         if let Ok(entries) = fs::read_dir(&dst_work_dir) {
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&work_prefix) {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&work_prefix)
+                {
                     rm_rf(&entry.path());
                 }
             }
@@ -2048,7 +2219,10 @@ fn sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite() {
     {
         let mut logger = open_logger(&store_ws);
         logger
-            .execute(&format!("CREATE TABLE {store_table}(id INTEGER PRIMARY KEY, v TEXT)"), &[])
+            .execute(
+                &format!("CREATE TABLE {store_table}(id INTEGER PRIMARY KEY, v TEXT)"),
+                &[],
+            )
             .unwrap();
         logger
             .execute(
@@ -2073,7 +2247,10 @@ fn sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite() {
         let mut logger = open_logger(&sql_ws);
         logger.set_auto_commit(false);
         logger
-            .execute(&format!("CREATE TABLE {sql_table}(id INTEGER PRIMARY KEY, v TEXT)"), &[])
+            .execute(
+                &format!("CREATE TABLE {sql_table}(id INTEGER PRIMARY KEY, v TEXT)"),
+                &[],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger
@@ -2097,10 +2274,14 @@ fn sqlite_store_and_sql_device_consolidate_into_same_destination_sqlite() {
 
     let dst = Connection::open(&dest_db).unwrap();
     let store_cnt: i64 = dst
-        .query_row(&format!("SELECT COUNT(*) FROM {store_table}"), [], |r| r.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {store_table}"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let sql_cnt: i64 = dst
-        .query_row(&format!("SELECT COUNT(*) FROM {sql_table}"), [], |r| r.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {sql_table}"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(store_cnt, 2);
     assert_eq!(sql_cnt, 2);
@@ -2145,8 +2326,12 @@ fn sqlite_user_db_persists_across_reopens() {
     }
 
     // First segment should exist locally (no shipper).
-    let seg0 = ws.stage_subdir().join("0.sqllog");
-    assert!(seg0.exists(), "first segment must be present at {}", seg0.display());
+    let seg0 = locate_segment(&ws);
+    assert!(
+        seg0.exists(),
+        "first segment must be present at {}",
+        seg0.display()
+    );
     let first_commit = segment_max_commit_id(&seg0);
     assert!(first_commit > 0);
 
@@ -2154,7 +2339,9 @@ fn sqlite_user_db_persists_across_reopens() {
     {
         let mut logger = open_logger(&ws);
         assert_eq!(count(&mut logger, &table), 1);
-        let rows = logger.query(&format!("SELECT name FROM {table}"), &[]).unwrap();
+        let rows = logger
+            .query(&format!("SELECT name FROM {table}"), &[])
+            .unwrap();
         assert_eq!(as_text(&rows[0][0]), "alpha");
 
         // Append more data to confirm the new segment is writable.
@@ -2179,8 +2366,8 @@ fn sqlite_user_db_persists_across_reopens() {
     }
 
     // Second segment present, sequence resumed at 1.
-    let seg1 = ws.stage_subdir().join("1.sqllog");
-    assert!(seg1.exists(), "second segment must be present at {}", seg1.display());
+    let seg1 = locate_segment(&ws);
+    assert!(seg1 != seg0, "reopen must finalize a new segment");
     let second_commit = segment_max_commit_id(&seg1);
     assert!(
         second_commit >= first_commit,
@@ -2204,16 +2391,22 @@ fn sqlite_restart_recovery_unknown_fate_with_equal_commit_appends_commit() {
     {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
         logger
-            .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(1)])
+            .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+            .unwrap();
+        logger
+            .execute(
+                &format!("INSERT INTO {table}(x) VALUES (?)"),
+                &[ArgValue::Int(1)],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
-    let seg = locate_segment(&ws);
-    let commit_id = segment_max_commit_id(&seg);
+    let staged = locate_segment(&ws);
+    let commit_id = segment_max_commit_id(&staged);
+    let seg = restore_active_segment(&ws, &staged);
     remove_fate_sql_for_commit(&seg, commit_id);
 
     {
@@ -2221,8 +2414,9 @@ fn sqlite_restart_recovery_unknown_fate_with_equal_commit_appends_commit() {
         logger.close().unwrap();
     }
 
+    let recovered = locate_segment(&ws);
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "COMMIT"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "COMMIT"),
         1
     );
     assert_synclite_txn_matches_latest_segment(&ws);
@@ -2240,16 +2434,22 @@ fn sqlite_restart_recovery_unknown_fate_with_higher_segment_commit_appends_rollb
     {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
         logger
-            .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(1)])
+            .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+            .unwrap();
+        logger
+            .execute(
+                &format!("INSERT INTO {table}(x) VALUES (?)"),
+                &[ArgValue::Int(1)],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
-    let seg = locate_segment(&ws);
-    let commit_id = segment_max_commit_id(&seg);
+    let staged = locate_segment(&ws);
+    let commit_id = segment_max_commit_id(&staged);
+    let seg = restore_active_segment(&ws, &staged);
     remove_fate_sql_for_commit(&seg, commit_id);
     set_user_synclite_txn_commit_id(&ws, commit_id - 1);
 
@@ -2258,12 +2458,13 @@ fn sqlite_restart_recovery_unknown_fate_with_higher_segment_commit_appends_rollb
         logger.close().unwrap();
     }
 
+    let recovered = locate_segment(&ws);
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "ROLLBACK"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "ROLLBACK"),
         1
     );
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "COMMIT"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "COMMIT"),
         0
     );
 }
@@ -2280,16 +2481,22 @@ fn sqlite_store_restart_recovery_unknown_fate_with_equal_commit_appends_commit()
     {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
         logger
-            .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(1)])
+            .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+            .unwrap();
+        logger
+            .execute(
+                &format!("INSERT INTO {table}(x) VALUES (?)"),
+                &[ArgValue::Int(1)],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
-    let seg = locate_segment(&ws);
-    let commit_id = segment_max_commit_id(&seg);
+    let staged = locate_segment(&ws);
+    let commit_id = segment_max_commit_id(&staged);
+    let seg = restore_active_segment(&ws, &staged);
     remove_fate_sql_for_commit(&seg, commit_id);
 
     {
@@ -2297,8 +2504,9 @@ fn sqlite_store_restart_recovery_unknown_fate_with_equal_commit_appends_commit()
         logger.close().unwrap();
     }
 
+    let recovered = locate_segment(&ws);
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "COMMIT"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "COMMIT"),
         1
     );
     assert_synclite_txn_matches_latest_segment(&ws);
@@ -2316,15 +2524,21 @@ fn sqlite_store_restart_recovery_unknown_fate_with_higher_segment_commit_appends
     {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
         logger
-            .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(1)])
+            .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+            .unwrap();
+        logger
+            .execute(
+                &format!("INSERT INTO {table}(x) VALUES (?)"),
+                &[ArgValue::Int(1)],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
-    let seg = locate_segment(&ws);
+    let staged = locate_segment(&ws);
+    let seg = restore_active_segment(&ws, &staged);
     let commit_id = segment_max_commit_id(&seg);
     remove_fate_sql_for_commit(&seg, commit_id);
     set_user_synclite_txn_commit_id(&ws, commit_id - 1);
@@ -2334,9 +2548,10 @@ fn sqlite_store_restart_recovery_unknown_fate_with_higher_segment_commit_appends
         logger.close().unwrap();
     }
 
-    assert_eq!(segment_commandlog_count_for(&seg, commit_id), 0);
+    let recovered = locate_segment(&ws);
+    assert_eq!(segment_commandlog_count_for(&recovered, commit_id), 0);
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "COMMIT"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "COMMIT"),
         0
     );
 }
@@ -2348,12 +2563,7 @@ fn sqlite_store_restart_recovery_unknown_fate_with_higher_segment_commit_appends
 /// Core flow shared by Java `DuckDBTransactionalTest.testBasicTableOperations`
 /// and `DuckDBStoreTest.testBasicTableOperations`.
 fn duckdb_basic_table_operations_core(device_name: &str, test_name: &str) {
-    let ws = Workspace::new(
-        test_name,
-        device_name,
-        "duckdb",
-        false,
-    );
+    let ws = Workspace::new(test_name, device_name, "duckdb", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
 
@@ -2366,20 +2576,31 @@ fn duckdb_basic_table_operations_core(device_name: &str, test_name: &str) {
     logger
         .execute(
             &format!("INSERT INTO {table} (id, name, value) VALUES (?, ?, ?)"),
-            &[ArgValue::Int(1), ArgValue::Text("test1".into()), ArgValue::Int(100)],
+            &[
+                ArgValue::Int(1),
+                ArgValue::Text("test1".into()),
+                ArgValue::Int(100),
+            ],
         )
         .unwrap();
     logger
         .execute(
             &format!("INSERT INTO {table} (id, name, value) VALUES (?, ?, ?)"),
-            &[ArgValue::Int(2), ArgValue::Text("test2".into()), ArgValue::Int(200)],
+            &[
+                ArgValue::Int(2),
+                ArgValue::Text("test2".into()),
+                ArgValue::Int(200),
+            ],
         )
         .unwrap();
     logger.commit().unwrap();
 
     assert_eq!(count(&mut logger, &table), 2);
     let rows = logger
-        .query(&format!("SELECT id, name, value FROM {table} ORDER BY id"), &[])
+        .query(
+            &format!("SELECT id, name, value FROM {table} ORDER BY id"),
+            &[],
+        )
         .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(as_i64(&rows[0][0]), 1);
@@ -2455,16 +2676,16 @@ fn duckdb_execute_unlogged_runs_ddl_and_dml_without_commandlog_entries() {
 
     let seg = locate_segment(&ws);
     assert!(segment_and_txn_ci_count_starting_with(&seg, &format!("CREATE TABLE {table}")) >= 1);
-    assert_eq!(segment_and_txn_ci_count_starting_with(&seg, &format!("INSERT INTO {table}")), 0);
+    assert_eq!(
+        segment_and_txn_ci_count_starting_with(&seg, &format!("INSERT INTO {table}")),
+        0
+    );
 }
 
 /// Exact mapping: Java `DuckDBTransactionalTest.testBasicTableOperations`.
 #[test]
 fn duckdb_transactional_test_basic_table_operations() {
-    duckdb_basic_table_operations_core(
-        "duckdbtransactional-rust",
-        "DuckDBTransactionalTest",
-    );
+    duckdb_basic_table_operations_core("duckdbtransactional-rust", "DuckDBTransactionalTest");
 }
 
 /// Exact mapping: Java `DuckDBStoreTest.testBasicTableOperations`.
@@ -2552,11 +2773,7 @@ fn duckdb_transactional_rollback_logs_marker() {
 
 #[test]
 fn duckdb_store_rollback_has_no_marker() {
-    duckdb_rollback_marker_core(
-        "duckdbrollbackstore-rust",
-        "DuckDBStoreRollbackTest",
-        true,
-    );
+    duckdb_rollback_marker_core("duckdbrollbackstore-rust", "DuckDBStoreRollbackTest", true);
 }
 
 #[test]
@@ -2608,7 +2825,11 @@ fn duckdb_transactional_prepared_batch_logs_sql_once_and_cleans_on_rollback() {
 
     let latest_commit = segment_max_commit_id(&seg);
     assert_eq!(
-        segment_and_txn_count_for_commit_starting_with(&seg, latest_commit, &format!("INSERT INTO {table}")),
+        segment_and_txn_count_for_commit_starting_with(
+            &seg,
+            latest_commit,
+            &format!("INSERT INTO {table}")
+        ),
         1
     );
 }
@@ -2640,7 +2861,11 @@ fn duckdb_store_default_autocommit_splits_create_and_batch_into_separate_txns() 
 
     logger.close().unwrap();
 
-    eprintln!("DEBUG stage_subdir={} db_path={}", ws.stage_subdir().display(), ws.db_path.display());
+    eprintln!(
+        "DEBUG stage_subdir={} db_path={}",
+        ws.stage_subdir().display(),
+        ws.db_path.display()
+    );
     let stage = ws.stage_subdir();
     if let Ok(entries) = fs::read_dir(&stage) {
         for entry in entries.flatten() {
@@ -2654,11 +2879,17 @@ fn duckdb_store_default_autocommit_splits_create_and_batch_into_separate_txns() 
     }
 
     let seg = locate_segment(&ws);
-    let ddl_commits = segment_distinct_commit_ids_starting_with(&seg, &format!("CREATE TABLE {table}"));
-    let dml_commits = segment_distinct_commit_ids_starting_with(&seg, &format!("INSERT INTO {table}"));
+    let ddl_commits =
+        segment_distinct_commit_ids_starting_with(&seg, &format!("CREATE TABLE {table}"));
+    let dml_commits =
+        segment_distinct_commit_ids_starting_with(&seg, &format!("INSERT INTO {table}"));
 
     assert_eq!(ddl_commits.len(), 1, "CREATE should map to exactly one txn");
-    assert_eq!(dml_commits.len(), 1, "Batch INSERT should map to exactly one txn");
+    assert_eq!(
+        dml_commits.len(),
+        1,
+        "Batch INSERT should map to exactly one txn"
+    );
     assert_ne!(
         ddl_commits.iter().next().unwrap(),
         dml_commits.iter().next().unwrap(),
@@ -2714,12 +2945,7 @@ fn duckdb_store_manual_txn_uses_master_and_txn_files_without_txn_markers() {
 #[test]
 fn duckdb_store_execute_splits_semicolon_sql_and_honors_txn_messages() {
     let test_name = "testruststoreduckdbsplitssqlexecute";
-    let ws = Workspace::new(
-        test_name,
-        test_name,
-        "duckdb",
-        false,
-    );
+    let ws = Workspace::new(test_name, test_name, "duckdb", false);
     let table_name = test_table_name(&ws);
     let mut logger = open_logger(&ws);
 
@@ -2764,14 +2990,21 @@ fn duckdb_shadow_schema_rebuilt_on_reopen() {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
         logger
-            .execute(&format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT)"), &[])
+            .execute(
+                &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT)"),
+                &[],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
     let shadow_path = ws.sqlite_shadow_schema();
-    assert!(shadow_path.exists(), "shadow schema file missing: {}", shadow_path.display());
+    assert!(
+        shadow_path.exists(),
+        "shadow schema file missing: {}",
+        shadow_path.display()
+    );
 
     let shadow = Connection::open(&shadow_path).unwrap();
     let table = test_table_name(&ws);
@@ -2801,18 +3034,16 @@ fn duckdb_shadow_schema_rebuilt_on_reopen() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(rebuilt_count, 1, "shadow schema was not rebuilt from DuckDB on reopen");
+    assert_eq!(
+        rebuilt_count, 1,
+        "shadow schema was not rebuilt from DuckDB on reopen"
+    );
 }
 
 /// Exact mapping: Java `DuckDBStoreAPITest.testAllAPIs`.
 #[test]
 fn duckdb_store_api_test_all_apis() {
-    let ws = Workspace::new(
-        "DuckDBStoreAPITest",
-        "duckdbstoreapi-rust",
-        "duckdb",
-        false,
-    );
+    let ws = Workspace::new("DuckDBStoreAPITest", "duckdbstoreapi-rust", "duckdb", false);
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
 
@@ -2839,7 +3070,10 @@ fn duckdb_store_api_test_all_apis() {
     assert_eq!(count(&mut logger, &table), 2);
 
     let alice = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Alice".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Alice".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&alice[0][0]), 100);
 
@@ -2850,12 +3084,18 @@ fn duckdb_store_api_test_all_apis() {
         )
         .unwrap();
     let alice = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Alice".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Alice".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&alice[0][0]), 999);
 
     logger
-        .execute(&format!("DELETE FROM {table} WHERE name = ?"), &[ArgValue::Text("Bob".into())])
+        .execute(
+            &format!("DELETE FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Bob".into())],
+        )
         .unwrap();
     assert_eq!(count(&mut logger, &table), 1);
 
@@ -2887,25 +3127,40 @@ fn duckdb_store_api_test_all_apis() {
         )
         .unwrap();
     let carol = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Carol".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Carol".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&carol[0][0]), 350);
     let dave = logger
-        .query(&format!("SELECT score FROM {table} WHERE name = ?"), &[ArgValue::Text("Dave".into())])
+        .query(
+            &format!("SELECT score FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Dave".into())],
+        )
         .unwrap();
     assert_eq!(as_i64(&dave[0][0]), 450);
 
     logger
-        .execute(&format!("DELETE FROM {table} WHERE name = ?"), &[ArgValue::Text("Carol".into())])
+        .execute(
+            &format!("DELETE FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Carol".into())],
+        )
         .unwrap();
     logger
-        .execute(&format!("DELETE FROM {table} WHERE name = ?"), &[ArgValue::Text("Dave".into())])
+        .execute(
+            &format!("DELETE FROM {table} WHERE name = ?"),
+            &[ArgValue::Text("Dave".into())],
+        )
         .unwrap();
     assert_eq!(count(&mut logger, &table), 1);
 
     logger.execute(&format!("DROP TABLE {table}"), &[]).unwrap();
     logger
-        .execute(&format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"), &[])
+        .execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"),
+            &[],
+        )
         .unwrap();
     logger.commit().unwrap();
     assert_eq!(count(&mut logger, &table), 0);
@@ -2952,14 +3207,20 @@ fn duckdb_user_db_persists_across_reopens() {
     }
 
     let seg0 = ws.stage_subdir().join("0.sqllog");
-    assert!(seg0.exists(), "first segment must be present at {}", seg0.display());
+    assert!(
+        seg0.exists(),
+        "first segment must be present at {}",
+        seg0.display()
+    );
     let first_commit = segment_max_commit_id(&seg0);
     assert!(first_commit > 0);
 
     {
         let mut logger = open_logger(&ws);
         assert_eq!(count(&mut logger, &table), 1);
-        let rows = logger.query(&format!("SELECT name FROM {table}"), &[]).unwrap();
+        let rows = logger
+            .query(&format!("SELECT name FROM {table}"), &[])
+            .unwrap();
         assert_eq!(as_text(&rows[0][0]), "alpha");
 
         logger
@@ -2980,7 +3241,11 @@ fn duckdb_user_db_persists_across_reopens() {
     }
 
     let seg1 = ws.stage_subdir().join("1.sqllog");
-    assert!(seg1.exists(), "second segment must be present at {}", seg1.display());
+    assert!(
+        seg1.exists(),
+        "second segment must be present at {}",
+        seg1.display()
+    );
     let second_commit = segment_max_commit_id(&seg1);
     assert!(
         second_commit >= first_commit,
@@ -3004,7 +3269,10 @@ fn duckdb_reopen_without_writes_does_not_ship_empty_segment() {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
         logger
-            .execute(&format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"), &[])
+            .execute(
+                &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"),
+                &[],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
@@ -3013,7 +3281,11 @@ fn duckdb_reopen_without_writes_does_not_ship_empty_segment() {
     }
 
     let seg0 = ws.stage_subdir().join("0.sqllog");
-    assert!(seg0.exists(), "expected first segment at {}", seg0.display());
+    assert!(
+        seg0.exists(),
+        "expected first segment at {}",
+        seg0.display()
+    );
 
     {
         let logger = open_logger(&ws);
@@ -3040,16 +3312,22 @@ fn duckdb_restart_recovery_unknown_fate_with_equal_commit_appends_commit() {
     {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
         logger
-            .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(1)])
+            .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+            .unwrap();
+        logger
+            .execute(
+                &format!("INSERT INTO {table}(x) VALUES (?)"),
+                &[ArgValue::Int(1)],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
-    let seg = locate_segment(&ws);
-    let commit_id = segment_max_commit_id(&seg);
+    let staged = locate_segment(&ws);
+    let commit_id = segment_max_commit_id(&staged);
+    let seg = restore_active_segment(&ws, &staged);
     remove_fate_sql_for_commit(&seg, commit_id);
 
     {
@@ -3057,8 +3335,9 @@ fn duckdb_restart_recovery_unknown_fate_with_equal_commit_appends_commit() {
         logger.close().unwrap();
     }
 
+    let recovered = locate_segment(&ws);
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "COMMIT"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "COMMIT"),
         1
     );
     assert_synclite_txn_matches_latest_segment(&ws);
@@ -3076,16 +3355,22 @@ fn duckdb_store_restart_recovery_unknown_fate_with_equal_commit_appends_commit()
     {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
         logger
-            .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(1)])
+            .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+            .unwrap();
+        logger
+            .execute(
+                &format!("INSERT INTO {table}(x) VALUES (?)"),
+                &[ArgValue::Int(1)],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
-    let seg = locate_segment(&ws);
-    let commit_id = segment_max_commit_id(&seg);
+    let staged = locate_segment(&ws);
+    let commit_id = segment_max_commit_id(&staged);
+    let seg = restore_active_segment(&ws, &staged);
     remove_fate_sql_for_commit(&seg, commit_id);
 
     {
@@ -3093,8 +3378,9 @@ fn duckdb_store_restart_recovery_unknown_fate_with_equal_commit_appends_commit()
         logger.close().unwrap();
     }
 
+    let recovered = locate_segment(&ws);
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "COMMIT"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "COMMIT"),
         1
     );
     assert_synclite_txn_matches_latest_segment(&ws);
@@ -3112,16 +3398,22 @@ fn duckdb_store_restart_recovery_unknown_fate_with_higher_segment_commit_appends
     {
         let mut logger = open_logger(&ws);
         let table = test_table_name(&ws);
-        logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
         logger
-            .execute(&format!("INSERT INTO {table}(x) VALUES (?)"), &[ArgValue::Int(1)])
+            .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+            .unwrap();
+        logger
+            .execute(
+                &format!("INSERT INTO {table}(x) VALUES (?)"),
+                &[ArgValue::Int(1)],
+            )
             .unwrap();
         logger.commit().unwrap();
         logger.close().unwrap();
     }
 
-    let seg = locate_segment(&ws);
-    let commit_id = segment_max_commit_id(&seg);
+    let staged = locate_segment(&ws);
+    let commit_id = segment_max_commit_id(&staged);
+    let seg = restore_active_segment(&ws, &staged);
     remove_fate_sql_for_commit(&seg, commit_id);
     set_user_synclite_txn_commit_id(&ws, commit_id - 1);
 
@@ -3130,13 +3422,13 @@ fn duckdb_store_restart_recovery_unknown_fate_with_higher_segment_commit_appends
         logger.close().unwrap();
     }
 
-    assert_eq!(segment_commandlog_count_for(&seg, commit_id), 0);
+    let recovered = locate_segment(&ws);
+    assert_eq!(segment_commandlog_count_for(&recovered, commit_id), 0);
     assert_eq!(
-        segment_commandlog_exact_sql_count_for_commit(&seg, commit_id, "COMMIT"),
+        segment_commandlog_exact_sql_count_for_commit(&recovered, commit_id, "COMMIT"),
         0
     );
 }
-
 
 // --------------------------------------------------------------------------
 // Layout behavior (BackupAgent + LogMover)
@@ -3183,24 +3475,35 @@ fn duckdb_store_device_init_with_preexisting_data_keeps_backup_and_logs_new_writ
 /// segment file landed as `<N>.sqllog`.
 #[test]
 fn sqlite_layout_behavior() {
-    let ws = Workspace::new(
-        "SQLiteLayoutParity",
-        "sqlitelayout-rust",
-        "sqlite",
-        false,
-    );
+    let ws = Workspace::new("SQLiteLayoutParity", "sqlitelayout-rust", "sqlite", false);
+    ws.disable_destination();
     let mut logger = open_logger(&ws);
     let table = test_table_name(&ws);
-    logger.execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[]).unwrap();
+    logger
+        .execute(&format!("CREATE TABLE {table}(x INTEGER)"), &[])
+        .unwrap();
     logger.commit().unwrap();
     logger.close().unwrap();
 
     // Device home <db_path>.synclite/ exists with metadata file.
     let device_home = ws.device_home();
-    assert!(device_home.exists(), "device home missing: {}", device_home.display());
-    let db_file_name = ws.db_path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        device_home.exists(),
+        "device home missing: {}",
+        device_home.display()
+    );
+    let db_file_name = ws
+        .db_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let local_meta = device_home.join(format!("{db_file_name}.synclite.metadata"));
-    assert!(local_meta.exists(), "metadata file missing: {}", local_meta.display());
+    assert!(
+        local_meta.exists(),
+        "metadata file missing: {}",
+        local_meta.display()
+    );
 
     // Java parity: the local backup snapshot is retained so a wiped or
     // re-created stage_subdir can be re-staged without re-snapshotting
@@ -3211,22 +3514,39 @@ fn sqlite_layout_behavior() {
     // Stage subdir `synclite-<effective-device-name>-<uuid>` exists with the
     // staged backup, metadata copy, and the 0.sqllog segment.
     let stage_subdir = ws.stage_subdir();
-    assert!(stage_subdir.join(format!("{db_file_name}.synclite.backup")).exists());
-    assert!(stage_subdir.join(format!("{db_file_name}.synclite.metadata")).exists());
-    assert!(stage_subdir.join("0.sqllog").exists());
+    assert!(stage_subdir
+        .join(format!("{db_file_name}.synclite.backup"))
+        .exists());
+    assert!(stage_subdir
+        .join(format!("{db_file_name}.synclite.metadata"))
+        .exists());
+    assert!(
+        try_locate_segment(&ws).is_some(),
+        "a finalized segment must be present in the stage subdir"
+    );
 
     // UUID is recorded in local metadata.
     let c = Connection::open(&local_meta).unwrap();
     let uuid: String = c
-        .query_row("SELECT value FROM metadata WHERE key='uuid'", [], |r| r.get(0))
+        .query_row("SELECT value FROM metadata WHERE key='uuid'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(!uuid.is_empty());
     let device_type: String = c
-        .query_row("SELECT value FROM metadata WHERE key='device_type'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM metadata WHERE key='device_type'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(device_type, "SQLITE");
     let database_name: String = c
-        .query_row("SELECT value FROM metadata WHERE key='database_name'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM metadata WHERE key='database_name'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(database_name, db_file_name);
 
@@ -3247,7 +3567,11 @@ fn sqlite_layout_behavior() {
     assert_eq!(txn_tables, 0);
 
     // Stage subdir name carries the same uuid.
-    let subdir_name = stage_subdir.file_name().unwrap().to_string_lossy().into_owned();
+    let subdir_name = stage_subdir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(subdir_name, format!("synclite-{}-{uuid}", ws.device_name));
 }
 
@@ -3271,13 +3595,21 @@ fn streaming_test_basic_table_operations() {
     logger
         .execute(
             &format!("INSERT INTO {table} (id, name, value) VALUES (?, ?, ?)"),
-            &[ArgValue::Int(1), ArgValue::Text("s1".into()), ArgValue::Int(10)],
+            &[
+                ArgValue::Int(1),
+                ArgValue::Text("s1".into()),
+                ArgValue::Int(10),
+            ],
         )
         .unwrap();
     logger
         .execute(
             &format!("INSERT INTO {table} (id, name, value) VALUES (?, ?, ?)"),
-            &[ArgValue::Int(2), ArgValue::Text("s2".into()), ArgValue::Int(20)],
+            &[
+                ArgValue::Int(2),
+                ArgValue::Text("s2".into()),
+                ArgValue::Int(20),
+            ],
         )
         .unwrap();
     assert_execute_err_contains(
@@ -3368,12 +3700,16 @@ fn write_isolated_dest_conf(ws: &Workspace, extras: &str) -> PathBuf {
 fn sqlite_dst_table_columns(dest_db: &Path, table: &str) -> Vec<(String, String)> {
     let conn = Connection::open(dest_db).unwrap();
     let mut stmt = conn
-        .prepare(&format!("SELECT name, type FROM pragma_table_info('{table}')"))
+        .prepare(&format!(
+            "SELECT name, type FROM pragma_table_info('{table}')"
+        ))
         .unwrap();
-    stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect()
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect()
 }
 
 fn sqlite_dst_table_exists(dest_db: &Path, table: &str) -> bool {
@@ -3434,7 +3770,10 @@ fn sqlite_store_dst_filter_mapper_table_and_column_rules() {
         )
         .unwrap();
     logger
-        .execute(&format!("CREATE TABLE {blocked} (id INTEGER PRIMARY KEY, v TEXT)"), &[])
+        .execute(
+            &format!("CREATE TABLE {blocked} (id INTEGER PRIMARY KEY, v TEXT)"),
+            &[],
+        )
         .unwrap();
     logger
         .execute(
@@ -3445,7 +3784,11 @@ fn sqlite_store_dst_filter_mapper_table_and_column_rules() {
     logger
         .execute(
             &format!("INSERT INTO {allowed} (id, v, secret) VALUES (?, ?, ?)"),
-            &[ArgValue::Int(1), ArgValue::Text("keep".into()), ArgValue::Text("hide".into())],
+            &[
+                ArgValue::Int(1),
+                ArgValue::Text("keep".into()),
+                ArgValue::Text("hide".into()),
+            ],
         )
         .unwrap();
     logger
@@ -3481,8 +3824,14 @@ fn sqlite_store_dst_filter_mapper_table_and_column_rules() {
     // Allowed table must drop the `secret` column.
     let cols = sqlite_dst_table_columns(&dest_db, &allowed);
     let col_names: Vec<String> = cols.iter().map(|(n, _)| n.to_ascii_lowercase()).collect();
-    assert!(col_names.contains(&"id".to_string()), "id column missing: {col_names:?}");
-    assert!(col_names.contains(&"v".to_string()), "v column missing: {col_names:?}");
+    assert!(
+        col_names.contains(&"id".to_string()),
+        "id column missing: {col_names:?}"
+    );
+    assert!(
+        col_names.contains(&"v".to_string()),
+        "v column missing: {col_names:?}"
+    );
     assert!(
         !col_names.contains(&"secret".to_string()),
         "secret column should be filtered out: {col_names:?}"
@@ -3491,7 +3840,11 @@ fn sqlite_store_dst_filter_mapper_table_and_column_rules() {
     // Spot-check destination row values for the renamed table.
     let conn = Connection::open(&dest_db).unwrap();
     let v: String = conn
-        .query_row(&format!("SELECT v FROM {renamed_dst} WHERE id = 7"), [], |r| r.get(0))
+        .query_row(
+            &format!("SELECT v FROM {renamed_dst} WHERE id = 7"),
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(v, "hello");
 }
@@ -3508,9 +3861,8 @@ fn sqlite_store_dst_value_mapper_rewrites_inserted_values() {
     let mappings_path = db_dir.join("value_mappings.json");
 
     let table = format!("vm_{}", ws.device_name);
-    let mappings_json = format!(
-        "{{ \"{table}.name\": {{ \"alice\": \"AA\", \"bob\": \"BB\" }} }}\n",
-    );
+    let mappings_json =
+        format!("{{ \"{table}.name\": {{ \"alice\": \"AA\", \"bob\": \"BB\" }} }}\n",);
     fs::write(&mappings_path, mappings_json).unwrap();
 
     let extras = format!(
@@ -3632,6 +3984,511 @@ fn sqlite_store_dst_data_type_mapper_all_text_overrides_dest_column_types() {
     );
 }
 
+#[test]
+fn sqlite_reopens_active_segment_after_unclean_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("device.db");
+    let segment_dir = dir.path().join("device-home");
+    let resume_dir = dir.path().join("stage");
+    let table = "restart_data";
+    let config = || {
+        let mut cfg = SqliteDeviceConfig::new(&db_path, &segment_dir);
+        cfg.resume_dir = Some(resume_dir.clone());
+        cfg.log_segment_flush_batch_size = 1;
+        cfg
+    };
+    let active_path;
 
+    {
+        let mut device = SqliteDevice::open(config()).unwrap();
+        device
+            .execute(
+                &format!("CREATE TABLE {table}(id INTEGER PRIMARY KEY, value TEXT)"),
+                &[],
+            )
+            .unwrap();
+        device
+            .execute(
+                &format!("INSERT INTO {table}(id, value) VALUES (?, ?)"),
+                &[ArgValue::Int(1), ArgValue::Text("before-restart".into())],
+            )
+            .unwrap();
+        device.commit().unwrap();
+        active_path = device.current_segment_path().to_path_buf();
+        assert!(
+            active_path.exists(),
+            "active segment missing: {}",
+            active_path.display()
+        );
+        // Simulate process death: dropping the device must leave the active
+        // segment in its device home rather than renaming or deleting it.
+    }
 
+    let mut reopened = SqliteDevice::open(config()).unwrap();
+    assert_eq!(reopened.current_segment_path(), active_path.as_path());
+    reopened
+        .execute(
+            &format!("INSERT INTO {table}(id, value) VALUES (?, ?)"),
+            &[ArgValue::Int(2), ArgValue::Text("after-restart".into())],
+        )
+        .unwrap();
+    reopened.commit().unwrap();
+    Box::new(reopened).close().unwrap();
 
+    let db = Connection::open(&db_path).unwrap();
+    let count: i64 = db
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 2);
+    let segment = Connection::open(&active_path).unwrap();
+    let inserts: i64 = segment
+        .query_row(
+            &format!("SELECT COUNT(*) FROM commandlog WHERE sql LIKE 'INSERT INTO {table}%'"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(inserts, 2);
+}
+
+#[test]
+fn sqlite_segment_sequence_is_gap_free_across_restarts() {
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("device.db");
+    let segment_dir = dir.path().join("device-home");
+    let stage_dir = dir.path().join("stage");
+    fs::create_dir_all(&stage_dir).unwrap();
+    // Persisted `log_segment_sequence_number` (Java metadata parity).
+    let persisted: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let config = || {
+        let mut cfg = SqliteDeviceConfig::new(&db_path, &segment_dir);
+        cfg.resume_dir = Some(stage_dir.clone());
+        cfg.log_segment_flush_batch_size = 1;
+        cfg.resume_segment_sequence = *persisted.lock().unwrap();
+        let p = persisted.clone();
+        cfg.on_active_segment_changed = Some(Arc::new(move |seq| {
+            *p.lock().unwrap() = Some(seq.0);
+        }));
+        // Mover parity: finalized segments leave the device home for stage.
+        let stage = stage_dir.clone();
+        cfg.on_segment_ready = Some(Arc::new(move |path: &Path| {
+            fs::rename(path, stage.join(path.file_name().unwrap())).unwrap();
+        }));
+        cfg
+    };
+    let insert = |device: &mut SqliteDevice, id: i64| {
+        device
+            .execute(
+                "INSERT INTO t(id, v) VALUES (?, ?)",
+                &[ArgValue::Int(id), ArgValue::Text("x".into())],
+            )
+            .unwrap();
+        device.commit().unwrap();
+    };
+
+    let mut id = 0;
+    for run in 0..4 {
+        let mut device = SqliteDevice::open(config()).unwrap();
+        if run == 0 {
+            // Flushing an empty segment must not consume a sequence.
+            device.roll_segment().unwrap();
+            device
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+                .unwrap();
+            device.commit().unwrap();
+        }
+        id += 1;
+        insert(&mut device, id);
+        device.roll_segment().unwrap();
+        device.roll_segment().unwrap();
+        if run % 2 == 0 {
+            // Unclean stop with an empty active segment.
+            drop(device);
+        } else {
+            id += 1;
+            insert(&mut device, id);
+            Box::new(device).close().unwrap();
+        }
+        // Restart with nothing written must reuse the same active segment.
+        Box::new(SqliteDevice::open(config()).unwrap())
+            .close()
+            .unwrap();
+    }
+
+    let mut staged: Vec<u64> = fs::read_dir(&stage_dir)
+        .unwrap()
+        .filter_map(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".sqllog")
+                .and_then(|n| n.parse().ok())
+        })
+        .collect();
+    staged.sort_unstable();
+    let expected: Vec<u64> = (0..staged.len() as u64).collect();
+    assert_eq!(
+        staged, expected,
+        "staged segments must be 0..N with no gaps"
+    );
+    assert_eq!(staged.len(), 6);
+}
+
+#[test]
+fn sqlite_restart_ships_segment_finalized_before_crash() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("device.db");
+    let segment_dir = dir.path().join("device-home");
+    let stage_dir = dir.path().join("stage");
+    fs::create_dir_all(&stage_dir).unwrap();
+    let config = |resume_seq: Option<u64>| {
+        let mut cfg = SqliteDeviceConfig::new(&db_path, &segment_dir);
+        cfg.log_segment_flush_batch_size = 1;
+        cfg.resume_segment_sequence = resume_seq;
+        let stage = stage_dir.clone();
+        cfg.on_segment_ready = Some(Arc::new(move |path: &Path| {
+            fs::rename(path, stage.join(path.file_name().unwrap())).unwrap();
+        }));
+        cfg
+    };
+    {
+        let mut device = SqliteDevice::open(config(None)).unwrap();
+        device
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        device.commit().unwrap();
+    }
+    // Crash inside the switch: segment 0 finalized, `1.sqllog` not yet
+    // created and the mover never ran.
+    Connection::open(segment_dir.join("0.sqllog"))
+        .unwrap()
+        .execute(
+            "UPDATE metadata SET value = 'READY_TO_APPLY' WHERE key = 'status'",
+            [],
+        )
+        .unwrap();
+
+    let device = SqliteDevice::open(config(Some(0))).unwrap();
+    assert_eq!(device.current_segment_path(), segment_dir.join("1.sqllog"));
+    assert!(stage_dir.join("0.sqllog").exists());
+    assert!(!segment_dir.join("0.sqllog").exists());
+}
+
+#[test]
+fn sqlite_roll_never_fails_on_occupied_next_slot() {
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("device.db");
+    let segment_dir = dir.path().join("device-home");
+    let shipped: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = SqliteDeviceConfig::new(&db_path, &segment_dir);
+    cfg.log_segment_flush_batch_size = 1;
+    let s = shipped.clone();
+    cfg.on_segment_ready = Some(Arc::new(move |path: &Path| {
+        s.lock()
+            .unwrap()
+            .push(path.file_name().unwrap().to_string_lossy().into_owned());
+    }));
+    let mut device = SqliteDevice::open(cfg).unwrap();
+    device
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", &[])
+        .unwrap();
+    device.commit().unwrap();
+    // Plant a record-holding `1.sqllog` (copy of the live segment) and an
+    // empty half-created `2.sqllog` in the slots the roll will need.
+    fs::copy(segment_dir.join("0.sqllog"), segment_dir.join("1.sqllog")).unwrap();
+    fs::write(segment_dir.join("2.sqllog"), b"").unwrap();
+
+    device.roll_segment().unwrap();
+    assert_eq!(device.current_segment_path(), segment_dir.join("2.sqllog"));
+    assert_eq!(*shipped.lock().unwrap(), vec!["0.sqllog", "1.sqllog"]);
+}
+
+#[test]
+fn duckdb_segment_sequence_is_gap_free_across_restarts() {
+    use logger_db_duckdb::{DuckDbDevice, DuckDbDeviceConfig};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("device.duckdb");
+    let segment_dir = dir.path().join("device-home");
+    let stage_dir = dir.path().join("stage");
+    fs::create_dir_all(&stage_dir).unwrap();
+    let persisted: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let config = || {
+        let mut cfg = DuckDbDeviceConfig::new(&db_path, &segment_dir);
+        cfg.resume_dir = Some(stage_dir.clone());
+        cfg.log_segment_flush_batch_size = 1;
+        cfg.resume_segment_sequence = *persisted.lock().unwrap();
+        let p = persisted.clone();
+        cfg.on_active_segment_changed = Some(Arc::new(move |seq| {
+            *p.lock().unwrap() = Some(seq.0);
+        }));
+        let stage = stage_dir.clone();
+        cfg.on_segment_ready = Some(Arc::new(move |path: &Path| {
+            fs::rename(path, stage.join(path.file_name().unwrap())).unwrap();
+        }));
+        cfg
+    };
+    let insert = |device: &mut DuckDbDevice, id: i64| {
+        device
+            .execute(
+                "INSERT INTO t(id, v) VALUES (?, ?)",
+                &[ArgValue::Int(id), ArgValue::Text("x".into())],
+            )
+            .unwrap();
+        device.commit().unwrap();
+    };
+
+    let mut id = 0;
+    for run in 0..4 {
+        let mut device = DuckDbDevice::open(config()).unwrap();
+        if run == 0 {
+            device.roll_segment().unwrap();
+            device
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+                .unwrap();
+            device.commit().unwrap();
+        }
+        id += 1;
+        insert(&mut device, id);
+        device.roll_segment().unwrap();
+        device.roll_segment().unwrap();
+        if run % 2 == 0 {
+            drop(device);
+        } else {
+            id += 1;
+            insert(&mut device, id);
+            Box::new(device).close().unwrap();
+        }
+        Box::new(DuckDbDevice::open(config()).unwrap())
+            .close()
+            .unwrap();
+    }
+
+    let mut staged: Vec<u64> = fs::read_dir(&stage_dir)
+        .unwrap()
+        .filter_map(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".sqllog")
+                .and_then(|n| n.parse().ok())
+        })
+        .collect();
+    staged.sort_unstable();
+    let expected: Vec<u64> = (0..staged.len() as u64).collect();
+    assert_eq!(
+        staged, expected,
+        "staged segments must be 0..N with no gaps"
+    );
+    assert_eq!(staged.len(), 6);
+}
+
+#[test]
+fn duckdb_restart_resolves_txn_files_like_java() {
+    use logger_db_duckdb::{DuckDbDevice, DuckDbDeviceConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("device.duckdb");
+    let segment_dir = dir.path().join("device-home");
+    let config = || {
+        let mut cfg = DuckDbDeviceConfig::new(&db_path, &segment_dir);
+        cfg.log_segment_flush_batch_size = 1_000_000;
+        cfg
+    };
+
+    let commit_id;
+    {
+        let mut device = DuckDbDevice::open(config()).unwrap();
+        device
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        device.commit().unwrap();
+        device
+            .execute("INSERT INTO t(id) VALUES (?)", &[ArgValue::Int(1)])
+            .unwrap();
+        device.commit().unwrap();
+        // Process killed: the log must already be durable (Java flushes the
+        // log at every commit) even with a huge flush batch size.
+    }
+    let seg = segment_dir.join("0.sqllog");
+    commit_id = Connection::open(&seg)
+        .unwrap()
+        .query_row("SELECT MAX(commit_id) FROM commandlog", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap() as u64;
+    let txn_file = segment_dir.join(format!("0.sqllog.{commit_id}.txn"));
+    assert!(
+        txn_file.exists(),
+        "published txn file missing: {} in {:?}",
+        txn_file.display(),
+        fs::read_dir(&segment_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    let replay: i64 = Connection::open(&seg)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM commandlog WHERE commit_id = ?1 AND sql = 'REPLAY_TXN'",
+            [commit_id as i64],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(replay, 1, "REPLAY_TXN must be durable before publish");
+
+    // Simulate the crash window after publish but before the user DB commit:
+    // COMMIT marker absent and synclite_txn behind the logged commit id.
+    Connection::open(&seg)
+        .unwrap()
+        .execute(
+            "DELETE FROM commandlog WHERE commit_id = ?1 AND sql = 'COMMIT'",
+            [commit_id as i64],
+        )
+        .unwrap();
+    DuckConnection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE synclite_txn SET commit_id = ?",
+            [(commit_id - 1) as i64],
+        )
+        .unwrap();
+    // Unpublished stage file of a transaction that never committed.
+    let orphan = segment_dir.join("txn-1-2.sqllog");
+    fs::write(&orphan, b"").unwrap();
+
+    let device = DuckDbDevice::open(config()).unwrap();
+    assert_eq!(device.current_segment_path(), seg.as_path());
+    assert!(!txn_file.exists(), "in-doubt txn file must be removed");
+    assert!(!orphan.exists(), "orphan txn stage file must be removed");
+    drop(device);
+    let rows: i64 = Connection::open(&seg)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM commandlog WHERE commit_id = ?1",
+            [commit_id as i64],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "in-doubt commit must be discarded from the segment"
+    );
+}
+
+#[test]
+fn last_committed_commit_id_tracks_commits_and_survives_restart() {
+    use logger_db_duckdb::{DuckDbDevice, DuckDbDeviceConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let open_dev = |kind: &str| -> Box<dyn DbDevice> {
+        let home = dir.path().join(format!("{kind}-home"));
+        if kind == "duckdb" {
+            Box::new(
+                DuckDbDevice::open(DuckDbDeviceConfig::new(
+                    dir.path().join("device.duckdb"),
+                    home,
+                ))
+                .unwrap(),
+            )
+        } else {
+            Box::new(
+                SqliteDevice::open(SqliteDeviceConfig::new(dir.path().join("device.db"), home))
+                    .unwrap(),
+            )
+        }
+    };
+    for kind in ["sqlite", "duckdb"] {
+        let committed = {
+            let mut device = open_dev(kind);
+            assert_eq!(device.last_committed_commit_id(), 0, "{kind}: fresh device");
+            device
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", &[])
+                .unwrap();
+            device.commit().unwrap();
+            device
+                .execute("INSERT INTO t(id) VALUES (?)", &[ArgValue::Int(1)])
+                .unwrap();
+            device.commit().unwrap();
+            let id = device.last_committed_commit_id();
+            assert!(
+                id > 0,
+                "{kind}: commit must advance last_committed_commit_id"
+            );
+            device.close().unwrap();
+            id
+        };
+        let device = open_dev(kind);
+        assert_eq!(
+            device.last_committed_commit_id(),
+            committed,
+            "{kind}: restart must recover last committed commit id"
+        );
+        device.close().unwrap();
+    }
+}
+
+#[test]
+fn sqlite_reopens_live_segment_when_persisted_sequence_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("device.db");
+    let segment_dir = dir.path().join("device-home");
+    let resume_dir = dir.path().join("stage");
+    let config = |resume_seq: Option<u64>| {
+        let mut cfg = SqliteDeviceConfig::new(&db_path, &segment_dir);
+        cfg.resume_dir = Some(resume_dir.clone());
+        cfg.log_segment_flush_batch_size = 1;
+        cfg.resume_segment_sequence = resume_seq;
+        cfg
+    };
+
+    // Build a live `1.sqllog` by rolling once, then dropping uncleanly.
+    let live_path;
+    {
+        let mut device = SqliteDevice::open(config(None)).unwrap();
+        device
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .unwrap();
+        device
+            .execute(
+                "INSERT INTO t(id, v) VALUES (?, ?)",
+                &[ArgValue::Int(1), ArgValue::Text("a".into())],
+            )
+            .unwrap();
+        device.commit().unwrap();
+        device.roll_segment().unwrap();
+        device
+            .execute(
+                "INSERT INTO t(id, v) VALUES (?, ?)",
+                &[ArgValue::Int(2), ArgValue::Text("b".into())],
+            )
+            .unwrap();
+        device.commit().unwrap();
+        live_path = device.current_segment_path().to_path_buf();
+    }
+    assert!(live_path.exists());
+    // The finalized predecessor has been shipped away and the persisted
+    // sequence still points at it (crash before metadata was updated).
+    let stale = segment_dir.join("0.sqllog");
+    let _ = std::fs::remove_file(&stale);
+
+    let mut reopened = SqliteDevice::open(config(Some(0))).unwrap();
+    assert_eq!(reopened.current_segment_path(), live_path.as_path());
+    reopened
+        .execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[ArgValue::Int(3), ArgValue::Text("c".into())],
+        )
+        .unwrap();
+    reopened.commit().unwrap();
+    Box::new(reopened).close().unwrap();
+}

@@ -23,6 +23,8 @@ name = "synclite"
 
 [features]
 default = []
+# Kept as a compatibility alias; DuckDB is part of every default build.
+duckdb = ["consolidator-runtime/duckdb"]
 # Enable the S3 archiver via logger-archiver's matching feature.
 s3 = ["logger-archiver/s3"]
 # Enable the SFTP archiver via logger-archiver's matching feature.
@@ -38,6 +40,7 @@ logger-archiver.workspace = true
 logger-shipper.workspace = true
 consolidator-core.workspace = true
 consolidator-runtime.workspace = true
+consolidator-state.workspace = true
 tracing.workspace = true
 synclite-observability.workspace = true
 rusqlite.workspace = true
@@ -46,8 +49,22 @@ postgres.workspace = true
 uuid.workspace = true
 fs2.workspace = true
 
+# DuckDB publishes no prebuilt Android shared library, so Android targets
+# compile the bundled DuckDB sources into the JNI library (no libduckdb.so
+# sidecar). Desktop targets keep using the downloaded prebuilt library.
+[target.'cfg(target_os = "android")'.dependencies]
+duckdb = { workspace = true, features = ["bundled"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 rusqlite.workspace = true
+tokio = { workspace = true, features = ["time", "net"] }
+tokio-postgres = "0.7"
+# status.rs test module compiles consolidator-state's sources in-crate, so it
+# needs the same TLS dependencies as that crate.
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
 
 

@@ -23,12 +23,12 @@
 
 use std::path::{Path, PathBuf};
 
-use parking_lot::Mutex;
-use rusqlite::{types::Null, Connection};
 use logger_core::{
     record::{ArgValue, CommandLogRecord},
     Error, Result,
 };
+use parking_lot::Mutex;
+use rusqlite::{types::Null, Connection};
 
 use crate::status::LogSegmentStatus;
 
@@ -173,6 +173,70 @@ impl LogSegmentWriter {
         })
     }
 
+    /// Reopen an existing, non-finalized segment for append after a process
+    /// restart. The insert shape is derived from the on-disk schema so older
+    /// segments (including segments widened past the configured default) can
+    /// be resumed without changing their layout.
+    pub fn open_existing_with_page_size_and_arg_columns_and_flush_batch<P: AsRef<Path>>(
+        path: P,
+        _page_size: u32,
+        _arg_columns: u32,
+        flush_batch_size: u64,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(Error::Log(format!(
+                "segment file does not exist: {}",
+                path.display()
+            )));
+        }
+        let conn = Connection::open(&path).map_err(db_err)?;
+        let status: String = conn
+            .query_row("SELECT value FROM metadata WHERE key = 'status'", [], |r| {
+                r.get(0)
+            })
+            .map_err(db_err)?;
+        if status == LogSegmentStatus::ReadyToApply.as_str() {
+            return Err(Error::Log(format!(
+                "segment is already finalized: {}",
+                path.display()
+            )));
+        }
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(commandlog)")
+            .map_err(db_err)?;
+        let mut rows = stmt.query([]).map_err(db_err)?;
+        let mut arg_columns = 0;
+        while let Some(row) = rows.next().map_err(db_err)? {
+            let name: String = row.get(1).map_err(db_err)?;
+            if let Some(number) = name.strip_prefix("arg").and_then(|n| n.parse::<u32>().ok()) {
+                arg_columns = arg_columns.max(number);
+            }
+        }
+        if arg_columns == 0 {
+            return Err(Error::Log(format!(
+                "segment commandlog has no arg columns: {}",
+                path.display()
+            )));
+        }
+        drop(rows);
+        drop(stmt);
+
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
+        Ok(Self {
+            path,
+            inner: Mutex::new(Inner {
+                conn,
+                arg_columns,
+                insert_sql: build_insert_sql(arg_columns),
+                finalized: false,
+                pending_since_commit: 0,
+                flush_batch_size: flush_batch_size.max(1),
+            }),
+        })
+    }
+
     /// Path of the underlying segment file.
     pub fn path(&self) -> &Path {
         &self.path
@@ -214,9 +278,15 @@ impl LogSegmentWriter {
                 let bind_idx = i + 5;
                 if i < record.args.len() {
                     match &record.args[i] {
-                        ArgValue::Null => stmt.raw_bind_parameter(bind_idx, Null).map_err(db_err)?,
-                        ArgValue::Int(v) => stmt.raw_bind_parameter(bind_idx, *v).map_err(db_err)?,
-                        ArgValue::Real(v) => stmt.raw_bind_parameter(bind_idx, *v).map_err(db_err)?,
+                        ArgValue::Null => {
+                            stmt.raw_bind_parameter(bind_idx, Null).map_err(db_err)?
+                        }
+                        ArgValue::Int(v) => {
+                            stmt.raw_bind_parameter(bind_idx, *v).map_err(db_err)?
+                        }
+                        ArgValue::Real(v) => {
+                            stmt.raw_bind_parameter(bind_idx, *v).map_err(db_err)?
+                        }
                         ArgValue::Text(v) => stmt
                             .raw_bind_parameter(bind_idx, v.as_str())
                             .map_err(db_err)?,
@@ -228,9 +298,7 @@ impl LogSegmentWriter {
                     stmt.raw_bind_parameter(bind_idx, Null).map_err(db_err)?;
                 }
             }
-            stmt
-                .raw_execute()
-                .map_err(db_err)?;
+            stmt.raw_execute().map_err(db_err)?;
         }
         inner.pending_since_commit += 1;
         if inner.pending_since_commit >= inner.flush_batch_size {
@@ -253,22 +321,40 @@ impl LogSegmentWriter {
         Ok(count == 0)
     }
 
+    /// Durably commit every buffered row (Java `executeLogBatch()` +
+    /// `commitLogSegment()`). Called at transaction boundaries so the log is
+    /// never behind the user database after a crash.
+    pub fn flush(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.finalized || inner.pending_since_commit == 0 {
+            return Ok(());
+        }
+        inner
+            .conn
+            .execute_batch("COMMIT; BEGIN IMMEDIATE;")
+            .map_err(db_err)?;
+        inner.pending_since_commit = 0;
+        Ok(())
+    }
+
     /// Remove all commandlog rows for a specific commit id.
     ///
     /// Used to discard an incomplete tail transaction before close so a
     /// segment never ships with a commit id that has no terminal fate.
     pub fn delete_commit_rows(&self, commit_id: u64) -> Result<()> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if inner.finalized {
             return Err(Error::Log("segment already finalized".into()));
         }
-        inner
+        let deleted = inner
             .conn
             .execute(
                 "DELETE FROM commandlog WHERE commit_id = ?1",
                 [commit_id as i64],
             )
             .map_err(db_err)?;
+        // Count the change as pending so `flush()` makes it durable.
+        inner.pending_since_commit += deleted as u64;
         Ok(())
     }
 
@@ -396,7 +482,7 @@ mod tests {
             change_number: change,
             commit_id: CommitId(1),
             operation_id: OperationId(change),
-                sql: Some(sql.into()),
+            sql: Some(sql.into()),
             arg_count: args.len() as u32,
             args,
         }
@@ -474,16 +560,22 @@ mod tests {
         let path = dir.path().join("segment-wide.db");
         let w = LogSegmentWriter::create(&path).unwrap();
         let many: Vec<ArgValue> = (0..20).map(|i| ArgValue::Int(i as i64)).collect();
-        w.append(&rec(0, "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", many))
-            .unwrap();
+        w.append(&rec(
+            0,
+            "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            many,
+        ))
+        .unwrap();
         w.finalize().unwrap();
         drop(w);
         let conn = Connection::open(&path).unwrap();
         let arg20: i64 = conn
-            .query_row("SELECT arg20 FROM commandlog WHERE change_number = 0", [], |r| r.get(0))
+            .query_row(
+                "SELECT arg20 FROM commandlog WHERE change_number = 0",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(arg20, 19);
     }
 }
-
-

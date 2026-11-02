@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use logger_core::{Backend, DeviceType, Error, Result};
-use logger_db_traits::{Row, Value};
+use logger_db_traits::{ExecutionResult, Row, Value};
 
 use crate::sql_split::split_sqls;
 use crate::{default_config_for_backend, derive_device_name, Logger, SyncLiteOptions};
@@ -118,6 +118,25 @@ impl Connection {
         Ok(affected)
     }
 
+    /// Execute exactly one statement and return rows plus result metadata.
+    pub fn execute_with_result(&mut self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
+        let sqls = split_sqls(sql);
+        if sqls.len() != 1 {
+            return Err(Error::Db(
+                "execute_with_result requires exactly one SQL statement".into(),
+            ));
+        }
+        let next_sql = &sqls[0];
+        if self.process_txn_message_if_needed(next_sql)? {
+            return Ok(ExecutionResult::transaction_control());
+        }
+        let result = self.runtime.execute_with_result(next_sql, params)?;
+        if self.user_auto_commit {
+            self.runtime.commit()?;
+        }
+        Ok(result)
+    }
+
     /// Execute a mutating statement without writing to commandlog.
     pub fn execute_unlogged(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let sqls = split_sqls(sql);
@@ -209,6 +228,11 @@ impl<'a> Statement<'a> {
     /// Execute the prepared statement once.
     pub fn execute(&mut self, params: &[Value]) -> Result<u64> {
         self.conn.execute(&self.sql, params)
+    }
+
+    /// Execute once and return rows plus result metadata when present.
+    pub fn execute_with_result(&mut self, params: &[Value]) -> Result<ExecutionResult> {
+        self.conn.execute_with_result(&self.sql, params)
     }
 
     /// Run a query through the prepared statement.

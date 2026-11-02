@@ -214,11 +214,7 @@ fn sqlite_reinit_consolidation() {
 
 #[test]
 fn sqlite_reinit_replication() {
-    run_reinit(
-        DeviceType::SQLITE,
-        "sqlitedevrep",
-        DstSyncMode::Replication,
-    );
+    run_reinit(DeviceType::SQLITE, "sqlitedevrep", DstSyncMode::Replication);
 }
 
 #[test]
@@ -246,11 +242,7 @@ fn duckdb_reinit_consolidation() {
 
 #[test]
 fn duckdb_reinit_replication() {
-    run_reinit(
-        DeviceType::DUCKDB,
-        "duckdbdevrep",
-        DstSyncMode::Replication,
-    );
+    run_reinit(DeviceType::DUCKDB, "duckdbdevrep", DstSyncMode::Replication);
 }
 
 #[test]

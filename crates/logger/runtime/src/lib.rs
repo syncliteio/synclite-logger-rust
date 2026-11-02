@@ -207,7 +207,11 @@ fn worker_loop(mut logger: Logger, rx: mpsc::Receiver<RuntimeCommand>) -> Result
             RuntimeCommand::PostUserExecute { sql, reply } => {
                 let _ = reply.send(logger.post_user_execute(&sql));
             }
-            RuntimeCommand::PreUserExecuteBatch { sql, batch_params, reply } => {
+            RuntimeCommand::PreUserExecuteBatch {
+                sql,
+                batch_params,
+                reply,
+            } => {
                 let _ = reply.send(logger.pre_user_execute_batch(&sql, &batch_params));
             }
             RuntimeCommand::PostUserExecuteBatch { sql, reply } => {
@@ -336,15 +340,14 @@ impl Runtime {
         let async_mode = should_use_async_logger(device_type, &cfg);
         let logger = Logger::open_with(cfg)?;
         let mode_logger = if async_mode {
-            let queue_size = usize::try_from(log_queue_size)
-                .map_err(|_| Error::Config("log-queue-size is too large for this platform".into()))?;
+            let queue_size = usize::try_from(log_queue_size).map_err(|_| {
+                Error::Config("log-queue-size is too large for this platform".into())
+            })?;
             ModeLogger::Async(AsyncLogger::spawn(logger, backend, queue_size)?)
         } else {
             ModeLogger::Txn(TxnLogger { logger })
         };
-        Ok(Self {
-            mode_logger,
-        })
+        Ok(Self { mode_logger })
     }
 }
 
@@ -352,7 +355,8 @@ fn should_use_async_logger(device_type: DeviceType, cfg: &SyncLiteConfig) -> boo
     if device_type.is_transactional() {
         !cfg.disable_async_logging_for_txn_device.unwrap_or(false)
     } else {
-        cfg.enable_async_logging_for_appender_device.unwrap_or(false)
+        cfg.enable_async_logging_for_appender_device
+            .unwrap_or(false)
     }
 }
 
@@ -428,5 +432,3 @@ mod tests {
         assert!(should_use_async_logger(DeviceType::SQLITE_STORE, &cfg));
     }
 }
-
-

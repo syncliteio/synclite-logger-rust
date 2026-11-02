@@ -10,7 +10,10 @@
 
 use std::time::Duration;
 
-use logger_core::{record::{ArgValue, CommandLogRecord}, Backend, Result};
+use logger_core::{
+    record::{ArgValue, CommandLogRecord},
+    Backend, Result,
+};
 
 /// A SQL parameter / bound argument.
 ///
@@ -20,6 +23,57 @@ pub type Value = ArgValue;
 
 /// One row's worth of selected values (used by simple read paths).
 pub type Row = Vec<Value>;
+
+/// Metadata for one column in a result set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    /// Backend-provided result-column name.
+    pub name: String,
+    /// Backend-provided declared or logical type name, when available.
+    pub type_name: Option<String>,
+}
+
+/// Eager outcome of executing one SQL statement.
+///
+/// `rows == None` denotes a statement with no result set, while
+/// `rows == Some(Vec::new())` denotes a result set that contained no rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionResult {
+    /// Materialized result rows, or `None` when the statement has no result set.
+    pub rows: Option<Vec<Row>>,
+    /// Result-column metadata. Empty when `rows` is `None`.
+    pub columns: Vec<ColumnInfo>,
+    /// Number of affected rows, when the backend can report it reliably.
+    pub row_count: Option<u64>,
+    /// Generated SQLite row id for this execution, when one was produced.
+    pub last_insert_rowid: Option<i64>,
+    /// Whether the statement was executed through the mutating/logged path.
+    pub is_mutating: bool,
+}
+
+impl ExecutionResult {
+    /// Construct a result for a statement that produced no result set.
+    pub fn command(row_count: Option<u64>, last_insert_rowid: Option<i64>) -> Self {
+        Self {
+            rows: None,
+            columns: Vec::new(),
+            row_count,
+            last_insert_rowid,
+            is_mutating: true,
+        }
+    }
+
+    /// Construct a result for transaction control handled by a facade.
+    pub fn transaction_control() -> Self {
+        Self {
+            rows: None,
+            columns: Vec::new(),
+            row_count: Some(0),
+            last_insert_rowid: None,
+            is_mutating: false,
+        }
+    }
+}
 
 /// Runtime-owned transactional log queue state.
 ///
@@ -94,6 +148,17 @@ pub trait DbDevice: Send {
     /// Returns the number of rows affected, where the backend reports it.
     fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64>;
 
+    /// Execute one statement and return rows, result metadata, and mutation
+    /// facts in a single backend operation.
+    ///
+    /// This opt-in path powers richer language adapters. Existing `execute`
+    /// and `query` calls remain metadata-free and retain their current cost.
+    fn execute_with_result(&mut self, _sql: &str, _params: &[Value]) -> Result<ExecutionResult> {
+        Err(logger_core::Error::Db(
+            "this database device does not support result-bearing execution".to_string(),
+        ))
+    }
+
     /// Execute a non-query statement without writing to commandlog.
     ///
     /// This still applies backend SQL-policy checks and mutates the user DB,
@@ -140,7 +205,11 @@ pub trait DbDevice: Send {
     ///
     /// SyncLite behavior note: implementations may log SQL only for the first
     /// batch row and log subsequent rows as args-only (`sql = NULL`).
-    fn execute_prepared_batch(&mut self, sql: &str, batch_params: &[Vec<Value>]) -> Result<Vec<u64>> {
+    fn execute_prepared_batch(
+        &mut self,
+        sql: &str,
+        batch_params: &[Vec<Value>],
+    ) -> Result<Vec<u64>> {
         let mut out = Vec::with_capacity(batch_params.len());
         for params in batch_params {
             out.push(self.execute(sql, params)?);
@@ -200,5 +269,3 @@ pub trait DbDevice: Send {
     /// can ship it. After this call the device is unusable.
     fn close(self: Box<Self>) -> Result<()>;
 }
-
-

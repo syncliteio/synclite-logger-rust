@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use rusqlite::Connection;
 use logger_archiver::{Archiver, FsArchiver};
 use logger_core::record::ArgValue;
 use logger_db_sqlite::{SegmentReadyCallback, SqliteDevice, SqliteDeviceConfig};
 use logger_db_traits::DbDevice;
 use logger_shipper::LogShipper;
+use rusqlite::Connection;
 use tempfile::tempdir;
 
 #[test]
@@ -73,5 +73,3 @@ fn device_rolls_two_segments_and_both_are_shipped() {
     assert_eq!(c0, 4);
     assert_eq!(c1, 3);
 }
-
-

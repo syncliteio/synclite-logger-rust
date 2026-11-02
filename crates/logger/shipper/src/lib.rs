@@ -205,10 +205,7 @@ impl Drop for LogShipper {
 
 fn worker_loop(rx: mpsc::Receiver<Msg>, cfg: ShipperConfig) {
     let mut stage_dir = cfg.stage_dir.clone();
-    let mut latest_seq = stage_dir
-        .as_deref()
-        .and_then(scan_max_seq)
-        .unwrap_or(0);
+    let mut latest_seq = stage_dir.as_deref().and_then(scan_max_seq).unwrap_or(0);
     let mut shipped_seq: i64 = -1;
 
     loop {
@@ -273,11 +270,10 @@ fn is_segment_ready(path: &Path) -> bool {
     ) else {
         return true;
     };
-    let status: std::result::Result<String, rusqlite::Error> = conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'status'",
-        [],
-        |r| r.get(0),
-    );
+    let status: std::result::Result<String, rusqlite::Error> =
+        conn.query_row("SELECT value FROM metadata WHERE key = 'status'", [], |r| {
+            r.get(0)
+        });
     match status {
         Ok(s) if s == "NEW" => false,
         _ => true,
@@ -354,10 +350,10 @@ fn ship_with_retry(archiver: &dyn Archiver, path: &Path, retry: &RetryPolicy) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logger_archiver::FsArchiver;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use logger_archiver::FsArchiver;
     use tempfile::tempdir;
 
     #[test]
@@ -493,5 +489,3 @@ mod tests {
         assert_eq!(shipped_count.load(Ordering::SeqCst), 0);
     }
 }
-
-

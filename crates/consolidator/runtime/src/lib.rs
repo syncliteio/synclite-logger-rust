@@ -3,31 +3,134 @@
 //! This is the Rust-side entry point for translating consolidator behavior
 //! into the logger runtime. It is intentionally scoped to device-local state
 //! so multiple devices can run concurrently without a shared job workDir.
+//!
+//! Runtime integration execution reference (2026-10-26): researched worker_loop,
+//! native replay, schema seeding, state completion and snapshot's atomic marker.
+//! Scope: this file only; state/snapshot/Android are owned by other workers.
+//! No task/workflow paths or scenario skill root supplied. Atomic integration:
+//! serialize immutable snapshot -> local completion -> CDC under the device lock;
+//! retain push-only bootstrap hints and retry even under continuous notifications.
+//! Never substitute command entries for native CDC events after a loader failure.
+//! Progress: actual `cargo test -p consolidator-runtime --lib` ran 2026-10-26:
+//! 44 passed, 0 failed; three existing dead-code warnings. No workflow artifact
+//! paths were supplied, so execution evidence stays in this exclusively owned file.
+//! Review round 1 found a handover gap: replaying historical SQL to reconstruct a
+//! fresh replica must suppress CDC already covered by the remote checkpoint.
+//! Fixed after native replay, including LOCAL metadata SQL workers; real native
+//! replay regression verifies local reconstruction and no duplicate/rewind.
+//! Revalidation by BuildValidator: Cargo exit 0, 46 passed/0 failed/0 ignored;
+//! the same three pre-existing dead-code warnings remain, no suppressions added.
+//! Final IntegrityReviewer verdict: PASS, no unresolved correctness findings.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry as HashMapEntry;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use consolidator_core::{ApplyProgress, ConsolidatorLayout, DstIdempotentDataIngestionMethod, DstType, DestinationSyncMode, MetadataStore};
+use consolidator_core::{
+    ApplyProgress, ConsolidatorLayout, DestinationSyncMode, DstIdempotentDataIngestionMethod,
+    DstType, MetadataStore,
+};
 use consolidator_state::*;
-use duckdb::{params_from_iter as duck_params_from_iter, types::Value as DuckValue, Connection as DuckConnection};
+use duckdb::{
+    params_from_iter as duck_params_from_iter, types::Value as DuckValue,
+    Connection as DuckConnection,
+};
 use libloading::Library;
-use postgres::{Client as PgClient, NoTls};
-use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension};
 use logger_core::{Error, Result};
+use postgres::Client as PgClient;
+use rusqlite::{
+    params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
+};
 use synclite_observability::{tracer_debug, tracer_error, tracer_info, TraceLevel, Tracer};
 
 pub mod monitor;
+mod snapshot;
+
+// Error payloads from drivers can contain SQL values or connection credentials.
+// Device diagnostics identify the stage/path and a concise error summary, not
+// raw driver payload text.
+fn redact_trace_payload(payload: String) -> String {
+    let mut redacted = payload;
+    let keys = [
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "access_key",
+        "authorization",
+        "bearer",
+    ];
+    for key in keys {
+        let mut offset = 0usize;
+        while offset < redacted.len() {
+            let lower = redacted[offset..].to_ascii_lowercase();
+            let Some(pos) = lower.find(key) else {
+                break;
+            };
+            let idx = offset + pos;
+            let remaining = &redacted[idx..];
+            let segment = remaining.get(..key.len()).unwrap_or(remaining);
+            if segment.eq_ignore_ascii_case(key) {
+                let after = remaining.get(key.len()..).unwrap_or("");
+                if after.starts_with('=') || after.starts_with(':') {
+                    let value_start = idx + key.len() + 1;
+                    let mut value_end = value_start;
+                    while value_end < redacted.len() {
+                        let ch = redacted.as_bytes()[value_end] as char;
+                        if matches!(ch, ' ' | ';' | ',' | '\'' | '"' | ')' | ']' | '}') {
+                            break;
+                        }
+                        value_end += 1;
+                    }
+                    if value_end > value_start {
+                        redacted.replace_range(value_start..value_end, "[REDACTED]");
+                        offset = value_start + "[REDACTED]".len();
+                        continue;
+                    }
+                }
+            }
+            offset = idx + key.len();
+        }
+    }
+    redacted
+}
+
+fn summarize_error_for_trace(error: &impl std::fmt::Display) -> String {
+    let summary = redact_trace_payload(error.to_string().replace('\n', " ").trim().to_string());
+    if summary.is_empty() {
+        return "unknown error".to_string();
+    }
+    if summary.len() <= 220 {
+        return summary;
+    }
+    format!("{}...", &summary[..217])
+}
+
+fn trace_workflow_step(step: &str, message: impl std::fmt::Display) {
+    with_device_tracer(|t| {
+        tracer_debug!(t, "Consolidator", "[sequence] step={} message={}", step, message);
+    });
+}
+
+fn trace_worker_error(stage: &str, path: &Path, error: &impl std::fmt::Display) {
+    let summary = summarize_error_for_trace(error);
+    with_device_tracer(|t| tracer_error!(t, "DeviceConsolidator",
+        "[sequence] failed stage={} path={} reason={}",
+        stage, path.display(), summary));
+}
 
 thread_local! {
     /// Per-worker Java-parity device tracer (writes
@@ -153,8 +256,12 @@ impl CleanupProgress {
                 });
                 !peers.is_empty()
             });
-            registry.entry(group.clone()).or_default()
-                .entry(layout.dst_index).or_default().push(Arc::downgrade(&applied));
+            registry
+                .entry(group.clone())
+                .or_default()
+                .entry(layout.dst_index)
+                .or_default()
+                .push(Arc::downgrade(&applied));
         }
         Self { group, applied }
     }
@@ -231,11 +338,14 @@ impl DeviceProcessingLock {
                 }
                 Err(e) if is_sqlite_busy_err(&e) => return Ok(None),
                 Err(e) => {
-                    cdc_debug_eprintln!("[lock-debug] try_lock failed: {e:?} path={}", layout.device_work_dir.display());
+                    cdc_debug_eprintln!(
+                        "[lock-debug] try_lock failed: {e:?} path={}",
+                        layout.device_work_dir.display()
+                    );
                     return Err(Error::Config(format!(
                         "consolidator: failed to lock device work dir {}: {e}",
                         layout.device_work_dir.display()
-                    )))
+                    )));
                 }
             }
         }
@@ -353,7 +463,7 @@ impl DestinationSqlGenerator {
                 args: &cached.reusable_args,
             },
             DstType::Postgres => {
-                GeneratedSql::Text(render_sql_with_args(&cached.sql, &cached.reusable_args))
+                GeneratedSql::Text(render_sql_with_args(&cached.sql, &cached.reusable_args, DstType::Postgres))
             }
         }
     }
@@ -415,10 +525,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 fn is_system_table_name(name: &str) -> bool {
     let n = name.trim().trim_matches('"').to_ascii_uppercase();
-    n.starts_with("SYNCLITE_")
-        || n == "CHECKPOINT"
-        || n == "DASHBOARD"
-        || n == "DEVICE_STATUS"
+    n.starts_with("SYNCLITE_") || n == "CHECKPOINT" || n == "DASHBOARD" || n == "DEVICE_STATUS"
 }
 
 fn normalize_table_name(name: &str) -> String {
@@ -584,7 +691,8 @@ fn map_operation_using_mapper(layout: &ConsolidatorLayout, entry: &SegmentEntry)
         ApplyAction::Skip => ApplyAction::Skip,
         ApplyAction::Execute(mut mapped) => {
             mapped.mapper = mapper_for_entry(layout, entry);
-            if mapped.mapper == MapperKind::Consolidation && should_skip_consolidation_ddl(&mapped) {
+            if mapped.mapper == MapperKind::Consolidation && should_skip_consolidation_ddl(&mapped)
+            {
                 return ApplyAction::Skip;
             }
             // Java parity: per-destination FilterMapper + ValueMapper run BEFORE
@@ -608,7 +716,10 @@ fn map_operation_using_mapper(layout: &ConsolidatorLayout, entry: &SegmentEntry)
     }
 }
 
-fn qualify_replication_sql(layout: &ConsolidatorLayout, mut mapped: MappedOperation) -> MappedOperation {
+fn qualify_replication_sql(
+    layout: &ConsolidatorLayout,
+    mut mapped: MappedOperation,
+) -> MappedOperation {
     if mapped.is_system_table {
         return mapped;
     }
@@ -621,7 +732,10 @@ fn qualify_replication_sql(layout: &ConsolidatorLayout, mut mapped: MappedOperat
     if matches!(mapped.kind, DmlKind::Other) {
         let sql = mapped.sql.trim().to_string();
         let rewritten = rewrite_replication_ddl_sql(layout, &mapped, &sql);
-        return MappedOperation { sql: rewritten, ..mapped };
+        return MappedOperation {
+            sql: rewritten,
+            ..mapped
+        };
     }
     let Some(tname) = mapped.table_name.as_deref().filter(|s| !s.is_empty()) else {
         return mapped;
@@ -648,7 +762,10 @@ fn qualify_replication_sql(layout: &ConsolidatorLayout, mut mapped: MappedOperat
 ///
 /// System tables (synclite_*) and entries marked is_system_table are
 /// pass-through (Java skips filter/value mappers for internal bookkeeping).
-fn apply_filter_value_mappers(layout: &ConsolidatorLayout, mut mapped: MappedOperation) -> ApplyAction {
+fn apply_filter_value_mappers(
+    layout: &ConsolidatorLayout,
+    mut mapped: MappedOperation,
+) -> ApplyAction {
     if mapped.is_system_table {
         return ApplyAction::Execute(mapped);
     }
@@ -695,7 +812,10 @@ fn apply_filter_value_mappers(layout: &ConsolidatorLayout, mut mapped: MappedOpe
                 if new_cols.is_empty() {
                     return ApplyAction::Skip;
                 }
-                let placeholders = (0..new_args.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+                let placeholders = (0..new_args.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let qcols: Vec<String> = new_cols.iter().map(|c| quote_col(layout, c)).collect();
                 mapped.sql = format!(
                     "INSERT INTO {} ({}) VALUES ({})",
@@ -752,9 +872,22 @@ fn apply_filter_value_mappers(layout: &ConsolidatorLayout, mut mapped: MappedOpe
                 if new_set_cols.is_empty() || new_where_cols.is_empty() {
                     return ApplyAction::Skip;
                 }
-                let set_clause = new_set_cols.iter().map(|c| format!("{} = ?", quote_col(layout, c))).collect::<Vec<_>>().join(", ");
-                let where_clause = new_where_cols.iter().map(|c| format!("{} = ?", quote_col(layout, c))).collect::<Vec<_>>().join(" AND ");
-                mapped.sql = format!("UPDATE {} SET {} WHERE {}", qualify_table(layout, &dst_table), set_clause, where_clause);
+                let set_clause = new_set_cols
+                    .iter()
+                    .map(|c| format!("{} = ?", quote_col(layout, c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let where_clause = new_where_cols
+                    .iter()
+                    .map(|c| format!("{} = ?", quote_col(layout, c)))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                mapped.sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    qualify_table(layout, &dst_table),
+                    set_clause,
+                    where_clause
+                );
                 let mut new_args = new_set_args;
                 new_args.extend(new_where_args);
                 mapped.args = new_args;
@@ -790,8 +923,16 @@ fn apply_filter_value_mappers(layout: &ConsolidatorLayout, mut mapped: MappedOpe
                 if new_cols.is_empty() {
                     return ApplyAction::Skip;
                 }
-                let where_clause = new_cols.iter().map(|c| format!("{} = ?", quote_col(layout, c))).collect::<Vec<_>>().join(" AND ");
-                mapped.sql = format!("DELETE FROM {} WHERE {}", qualify_table(layout, &dst_table), where_clause);
+                let where_clause = new_cols
+                    .iter()
+                    .map(|c| format!("{} = ?", quote_col(layout, c)))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                mapped.sql = format!(
+                    "DELETE FROM {} WHERE {}",
+                    qualify_table(layout, &dst_table),
+                    where_clause
+                );
                 mapped.args = new_args;
                 mapped.table_name = Some(dst_table);
             } else if table_renamed {
@@ -806,7 +947,11 @@ fn apply_filter_value_mappers(layout: &ConsolidatorLayout, mut mapped: MappedOpe
             // properly quoted, schema-qualified, type-mapped SQL. We avoid
             // hand-formatting CREATE/ALTER here — those paths know about
             // identifier quoting, schema scope, and DataTypeMapper.
-            let op = mapped.op_type.as_deref().unwrap_or_default().to_ascii_uppercase();
+            let op = mapped
+                .op_type
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
             if op == "CREATETABLE" && !mapped.ddl_columns.is_empty() {
                 let mut filtered: Vec<CdcSchemaColumn> = Vec::new();
                 for c in &mapped.ddl_columns {
@@ -828,7 +973,11 @@ fn apply_filter_value_mappers(layout: &ConsolidatorLayout, mut mapped: MappedOpe
                 // rebuild from ddl_columns and ignore this string.
                 mapped.sql = format!("CREATE TABLE {} (...)", dst_table);
             } else if op == "ADDCOLUMN" {
-                if let Some(col) = mapped.ddl_columns.iter().find(|c| !c.column_name.is_empty()) {
+                if let Some(col) = mapped
+                    .ddl_columns
+                    .iter()
+                    .find(|c| !c.column_name.is_empty())
+                {
                     match filter.mapped_column_name(&src_table, &col.column_name) {
                         Some(new_name) => {
                             let renamed_col = !new_name.eq_ignore_ascii_case(&col.column_name);
@@ -1031,7 +1180,11 @@ fn parse_assignments_for_cols(clause: &str, sep: &str) -> Vec<String> {
                 .trim_matches('`')
                 .trim_matches('[')
                 .trim_matches(']');
-            if lhs.is_empty() { None } else { Some(lhs.to_string()) }
+            if lhs.is_empty() {
+                None
+            } else {
+                Some(lhs.to_string())
+            }
         })
         .collect()
 }
@@ -1131,7 +1284,11 @@ fn rename_table_in_sql(sql: &str, src_table: &str, dst_table: &str) -> String {
 }
 
 fn should_skip_consolidation_ddl(mapped: &MappedOperation) -> bool {
-    let op = mapped.op_type.as_deref().unwrap_or_default().to_ascii_uppercase();
+    let op = mapped
+        .op_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
     if op == "DROPTABLE" {
         return true;
     }
@@ -1149,7 +1306,10 @@ fn should_skip_consolidation_ddl(mapped: &MappedOperation) -> bool {
     false
 }
 
-fn apply_consolidation_mapping(layout: &ConsolidatorLayout, mapped: MappedOperation) -> MappedOperation {
+fn apply_consolidation_mapping(
+    layout: &ConsolidatorLayout,
+    mapped: MappedOperation,
+) -> MappedOperation {
     let device_id = SqlValue::Text(layout.device_id.clone());
     let device_name = SqlValue::Text(layout.device_name.clone());
     let ts_value = SqlValue::Text(current_update_timestamp());
@@ -1174,13 +1334,21 @@ fn apply_consolidation_mapping(layout: &ConsolidatorLayout, mapped: MappedOperat
     match mapped.kind {
         DmlKind::Insert => {
             let (prefix, values_clause) = split_values_clause(&sql).unwrap_or((sql.as_str(), ""));
-            let rewritten_sql = qualify_dml(rewrite_insert_sql(prefix, values_clause, mapped.is_system_table));
+            let rewritten_sql = qualify_dml(rewrite_insert_sql(
+                prefix,
+                values_clause,
+                mapped.is_system_table,
+            ));
             let mut args = Vec::with_capacity(mapped.args.len() + 3);
             args.push(device_id);
             args.push(device_name);
             args.push(ts_value);
             args.extend(mapped.args);
-            MappedOperation { sql: rewritten_sql, args, ..mapped }
+            MappedOperation {
+                sql: rewritten_sql,
+                args,
+                ..mapped
+            }
         }
         DmlKind::Update => {
             let rewritten_sql = qualify_dml(rewrite_update_sql(&sql, mapped.is_system_table));
@@ -1191,7 +1359,11 @@ fn apply_consolidation_mapping(layout: &ConsolidatorLayout, mapped: MappedOperat
             args.extend(mapped.args);
             args.push(SqlValue::Text(layout.device_id.clone()));
             args.push(SqlValue::Text(layout.device_name.clone()));
-            MappedOperation { sql: rewritten_sql, args, ..mapped }
+            MappedOperation {
+                sql: rewritten_sql,
+                args,
+                ..mapped
+            }
         }
         DmlKind::Delete => {
             let rewritten_sql = qualify_dml(rewrite_delete_sql(&sql));
@@ -1199,7 +1371,11 @@ fn apply_consolidation_mapping(layout: &ConsolidatorLayout, mapped: MappedOperat
             args.push(device_id);
             args.push(device_name);
             args.extend(mapped.args);
-            MappedOperation { sql: rewritten_sql, args, ..mapped }
+            MappedOperation {
+                sql: rewritten_sql,
+                args,
+                ..mapped
+            }
         }
         DmlKind::Other => {
             let rewritten_sql = rewrite_consolidation_ddl_sql(layout, &mapped, &sql);
@@ -1211,8 +1387,16 @@ fn apply_consolidation_mapping(layout: &ConsolidatorLayout, mapped: MappedOperat
     }
 }
 
-fn rewrite_consolidation_ddl_sql(layout: &ConsolidatorLayout, mapped: &MappedOperation, sql: &str) -> String {
-    let op = mapped.op_type.as_deref().unwrap_or_default().to_ascii_uppercase();
+fn rewrite_consolidation_ddl_sql(
+    layout: &ConsolidatorLayout,
+    mapped: &MappedOperation,
+    sql: &str,
+) -> String {
+    let op = mapped
+        .op_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
     let fallback_table = extract_table_name_for_operation(sql);
     let table_name = mapped
         .table_name
@@ -1226,11 +1410,10 @@ fn rewrite_consolidation_ddl_sql(layout: &ConsolidatorLayout, mapped: &MappedOpe
     // entries (store devices) now also carry metadata populated by
     // read_commandlog_entries (mirrors Java DeviceEventStreamer's
     // in-memory replica + PRAGMA table_info).
-    if op == "CREATETABLE"
-        && !table_name.is_empty()
-        && !mapped.ddl_columns.is_empty()
-    {
-        if let Some(create_sql) = build_create_table_with_metadata(layout, table_name, &mapped.ddl_columns) {
+    if op == "CREATETABLE" && !table_name.is_empty() && !mapped.ddl_columns.is_empty() {
+        if let Some(create_sql) =
+            build_create_table_with_metadata(layout, table_name, &mapped.ddl_columns)
+        {
             return create_sql;
         }
     }
@@ -1241,7 +1424,9 @@ fn rewrite_consolidation_ddl_sql(layout: &ConsolidatorLayout, mapped: &MappedOpe
             .iter()
             .find_map(|c| c.old_table_name.as_ref().map(|_| table_name.to_string()));
         if let Some(new_table) = parse_alter_rename_table_name(sql).or(inferred_new_table) {
-            if let Some(create_sql) = build_create_table_with_metadata(layout, &new_table, &mapped.ddl_columns) {
+            if let Some(create_sql) =
+                build_create_table_with_metadata(layout, &new_table, &mapped.ddl_columns)
+            {
                 return create_sql;
             }
             if !table_name.is_empty() {
@@ -1327,8 +1512,16 @@ fn rewrite_consolidation_ddl_sql(layout: &ConsolidatorLayout, mapped: &MappedOpe
 /// TABLE and ADD COLUMN, (b) quote identifiers per dst dialect, (c) schema-
 /// qualify table names, and (d) map source column types to dst-dialect types
 /// via DataTypeMapper.
-fn rewrite_replication_ddl_sql(layout: &ConsolidatorLayout, mapped: &MappedOperation, sql: &str) -> String {
-    let op = mapped.op_type.as_deref().unwrap_or_default().to_ascii_uppercase();
+fn rewrite_replication_ddl_sql(
+    layout: &ConsolidatorLayout,
+    mapped: &MappedOperation,
+    sql: &str,
+) -> String {
+    let op = mapped
+        .op_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
     let fallback_table = extract_table_name_for_operation(sql);
     let table_name = mapped
         .table_name
@@ -1337,13 +1530,19 @@ fn rewrite_replication_ddl_sql(layout: &ConsolidatorLayout, mapped: &MappedOpera
         .unwrap_or("");
 
     if op == "CREATETABLE" && !table_name.is_empty() && !mapped.ddl_columns.is_empty() {
-        if let Some(create_sql) = build_replication_create_table(layout, table_name, &mapped.ddl_columns) {
+        if let Some(create_sql) =
+            build_replication_create_table(layout, table_name, &mapped.ddl_columns)
+        {
             return create_sql;
         }
     }
 
     if op == "ADDCOLUMN" && !table_name.is_empty() {
-        if let Some(col) = mapped.ddl_columns.iter().find(|c| !c.column_name.is_empty()) {
+        if let Some(col) = mapped
+            .ddl_columns
+            .iter()
+            .find(|c| !c.column_name.is_empty())
+        {
             return build_add_column_sql(
                 layout,
                 table_name,
@@ -1448,8 +1647,14 @@ fn build_create_table_with_metadata(
     if init_mode.emits_create() {
         let mut defs = Vec::new();
         defs.push(format!("{} TEXT", quote_col(layout, "synclite_device_id")));
-        defs.push(format!("{} TEXT", quote_col(layout, "synclite_device_name")));
-        defs.push(format!("{} TEXT", quote_col(layout, "synclite_update_timestamp")));
+        defs.push(format!(
+            "{} TEXT",
+            quote_col(layout, "synclite_device_name")
+        ));
+        defs.push(format!(
+            "{} TEXT",
+            quote_col(layout, "synclite_update_timestamp")
+        ));
         for col in &sorted_cols {
             let name = col.column_name.trim();
             if name.is_empty() {
@@ -1515,7 +1720,8 @@ fn build_add_column_sql(
 
     match layout.dst_type {
         DstType::Sqlite => {
-            if mapped_type.eq_ignore_ascii_case("TEXT") || mapped_type.eq_ignore_ascii_case("text") {
+            if mapped_type.eq_ignore_ascii_case("TEXT") || mapped_type.eq_ignore_ascii_case("text")
+            {
                 format!("ALTER TABLE {qtable} ADD COLUMN {qcol}")
             } else {
                 format!("ALTER TABLE {qtable} ADD COLUMN {qcol} {mapped_type}")
@@ -1555,8 +1761,17 @@ fn quote_table(layout: &ConsolidatorLayout, name: &str) -> String {
 /// collide with stale objects in `public` (Postgres) or default schema (MySQL).
 fn pg_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
     if layout.dst_use_schema_scope_resolution {
-        if let Some(schema) = layout.dst_schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            return format!("{}.{}", quote_ident_raw(layout, schema), quote_ident_raw(layout, name));
+        if let Some(schema) = layout
+            .dst_schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return format!(
+                "{}.{}",
+                quote_ident_raw(layout, schema),
+                quote_ident_raw(layout, name)
+            );
         }
     }
     name.to_string()
@@ -1575,8 +1790,17 @@ fn quote_col(layout: &ConsolidatorLayout, name: &str) -> String {
 /// Used for the consolidator-owned bookkeeping tables.
 fn duck_meta_table(layout: &ConsolidatorLayout, name: &str) -> String {
     if layout.dst_use_schema_scope_resolution {
-        if let Some(schema) = layout.dst_schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            return format!("{}.{}", quote_ident_raw(layout, schema), quote_ident_raw(layout, name));
+        if let Some(schema) = layout
+            .dst_schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return format!(
+                "{}.{}",
+                quote_ident_raw(layout, schema),
+                quote_ident_raw(layout, name)
+            );
         }
     }
     quote_ident_raw(layout, name)
@@ -1611,13 +1835,23 @@ fn qualify_table(layout: &ConsolidatorLayout, table_name: &str) -> String {
     }
     let mut prefix = String::new();
     if db_allowed && layout.dst_use_catalog_scope_resolution {
-        if let Some(db) = layout.dst_database.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(db) = layout
+            .dst_database
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             prefix.push_str(&quote_table(layout, db));
             prefix.push('.');
         }
     }
     if schema_allowed && layout.dst_use_schema_scope_resolution {
-        if let Some(schema) = layout.dst_schema.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(schema) = layout
+            .dst_schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             prefix.push_str(&quote_table(layout, schema));
             prefix.push('.');
         }
@@ -1652,7 +1886,9 @@ fn rewrite_create_table_sql(sql: &str) -> String {
     let mut builder = String::new();
     builder.push_str(head);
     builder.push_str(" (");
-    builder.push_str("synclite_device_id TEXT, synclite_device_name TEXT, synclite_update_timestamp TEXT");
+    builder.push_str(
+        "synclite_device_id TEXT, synclite_device_name TEXT, synclite_update_timestamp TEXT",
+    );
     if !cols.is_empty() {
         builder.push_str(", ");
         builder.push_str(cols);
@@ -1743,7 +1979,8 @@ fn should_retry_apply_error(backend: DstType, err: &Error) -> bool {
     if msg.contains("syntax") || msg.contains("no such table") || msg.contains("no such column") {
         return false;
     }
-    if msg.contains("duplicate") || msg.contains("unique constraint") || msg.contains("primary key") {
+    if msg.contains("duplicate") || msg.contains("unique constraint") || msg.contains("primary key")
+    {
         return false;
     }
     if backend == DstType::Postgres && msg.contains("pg[235") {
@@ -1779,9 +2016,14 @@ enum Msg {
     Shutdown,
 }
 
+static CONSOLIDATOR_WORKERS: OnceLock<Mutex<HashMap<(PathBuf, i32), Weak<Consolidator>>>> = OnceLock::new();
+
 pub struct Consolidator {
     tx: Arc<Sender<Msg>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    layout: ConsolidatorLayout,
+    shutdown_requested: AtomicBool,
+    exited: Arc<AtomicBool>,
     // Set on shutdown so the worker abandons any in-progress /
     // subsequent destination I/O and exits promptly. Offline-first:
     // callers (initialize / Connection::close) must never block on an
@@ -1791,8 +2033,27 @@ pub struct Consolidator {
 
 impl Consolidator {
     pub fn spawn(layout: ConsolidatorLayout) -> Result<Arc<Self>> {
+        Self::spawn_or_reuse(layout).map(|(worker, _)| worker)
+    }
+
+    pub fn spawn_or_reuse(layout: ConsolidatorLayout) -> Result<(Arc<Self>, bool)> {
         std::fs::create_dir_all(&layout.work_dir)?;
         std::fs::create_dir_all(&layout.device_work_dir)?;
+        let key = (std::fs::canonicalize(&layout.device_work_dir)?, layout.dst_index);
+        let mut workers = CONSOLIDATOR_WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock().map_err(|_| Error::Internal("consolidator registry mutex poisoned".into()))?;
+        workers.retain(|_, worker| worker.strong_count() > 0);
+        if let Some(worker) = workers.get(&key).and_then(Weak::upgrade) {
+            if !worker.exited.load(Ordering::SeqCst) {
+                if worker.shutdown_requested.load(Ordering::SeqCst) {
+                    return Err(Error::Config("consolidator is still stopping; retry after it exits".into()));
+                }
+                if worker.layout != layout {
+                    return Err(Error::Config("a consolidator with different configuration already owns this device destination; stop it before reconfiguring".into()));
+                }
+                return Ok((worker, false));
+            }
+        }
         if let Some(parent) = layout.state_db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1805,20 +2066,50 @@ impl Consolidator {
         let worker_stopping = Arc::clone(&stopping);
         let (tx, rx) = mpsc::channel();
         let tx_keepalive = Arc::new(tx);
-        let tx_for_worker = Arc::clone(&tx_keepalive);
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
+        let worker = Arc::new(Self {
+            tx: tx_keepalive,
+            join: Mutex::new(None),
+            layout: layout.clone(),
+            shutdown_requested: AtomicBool::new(false),
+            exited,
+            stopping,
+        });
+        let worker_keepalive = Arc::clone(&worker);
         let join = thread::Builder::new()
             .name("synclite-consolidator".into())
             .spawn(move || {
-                let _worker_tx_keepalive = tx_for_worker;
+                struct ExitSignal(Arc<AtomicBool>);
+                impl Drop for ExitSignal {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _worker_keepalive = worker_keepalive;
+                let _exit_signal = ExitSignal(worker_exited);
                 worker_loop(rx, layout, worker_stopping)
             })
             .map_err(|e| Error::Internal(format!("spawn consolidator thread: {e}")))?;
 
-        Ok(Arc::new(Self {
-            tx: tx_keepalive,
-            join: Mutex::new(Some(join)),
-            stopping,
-        }))
+        *worker.join.lock().map_err(|_| Error::Internal("consolidator join mutex poisoned".into()))? = Some(join);
+        workers.insert(key, Arc::downgrade(&worker));
+        Ok((worker, true))
+    }
+
+    pub fn shutdown_device(device_id: &str, device_name: &str) -> Result<()> {
+        let workers: Vec<_> = CONSOLIDATOR_WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock().map_err(|_| Error::Internal("consolidator registry mutex poisoned".into()))?
+            .values().filter_map(Weak::upgrade)
+            .filter(|worker| worker.layout.device_id == device_id && worker.layout.device_name == device_name)
+            .collect();
+        for worker in &workers {
+            worker.shutdown();
+        }
+        if workers.iter().any(|worker| !worker.exited.load(Ordering::SeqCst)) {
+            return Err(Error::Config("consolidator is still stopping; retry reinitialization after it exits".into()));
+        }
+        Ok(())
     }
 
     pub fn notify_bootstrap_ready<P: Into<PathBuf>, Q: Into<PathBuf>>(
@@ -1869,6 +2160,7 @@ impl Consolidator {
     /// the stop flag is then raised and the joiner is detached so shutdown
     /// never waits indefinitely on an unreachable destination.
     pub fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Msg::Shutdown);
         let handle = match self.join.lock() {
             Ok(mut join) => join.take(),
@@ -1938,7 +2230,9 @@ fn collect_stage_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
 fn sort_stage_paths(paths: &mut Vec<PathBuf>) {
     paths.retain(|path| is_apply_candidate_segment(path));
     paths.sort_by(|a, b| {
-        parse_segment_seq(a).cmp(&parse_segment_seq(b)).then_with(|| a.cmp(b))
+        parse_segment_seq(a)
+            .cmp(&parse_segment_seq(b))
+            .then_with(|| a.cmp(b))
     });
     paths.dedup();
 }
@@ -1995,6 +2289,56 @@ fn migrate_legacy_state_db(layout: &ConsolidatorLayout) -> Result<()> {
     Ok(())
 }
 
+fn apply_bootstrap_snapshot(layout: &ConsolidatorLayout, backup: &Path) -> Result<()> {
+    if !layout.destination_apply_enabled {
+        return Ok(()); // Explicit state-only operation, not a production fallback.
+    }
+    // Completed Java checkpoints are data-plane evidence, unlike the legacy
+    // initialization_status metadata PROPERTY written by the old Rust stub.
+    let source = Connection::open_with_flags(backup, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_sql_err)?;
+    let baseline: i64 = if has_table(&source, "synclite_txn")? {
+        source.query_row("SELECT COALESCE(MAX(commit_id), 0) FROM synclite_txn", [], |r| r.get(0)).map_err(map_sql_err)?
+    } else { 0 };
+    if destination_snapshot_completed(layout, baseline)? {
+        with_device_tracer(|t| tracer_info!(t, "DeviceDstInitializer",
+            "Recovered completed device snapshot : {} on dst : {} (baseline={}; destination checkpoint preserved)",
+            backup.display(), layout.dst_index, baseline));
+        return Ok(());
+    }
+    snapshot::initialize_snapshot(layout, backup)
+}
+
+fn destination_snapshot_completed(layout: &ConsolidatorLayout, baseline: i64) -> Result<bool> {
+    let predicate = format!("synclite_device_id = {} AND synclite_device_name = {} AND initialization_status = 1 AND commit_id >= {baseline}",
+        sql_literal(&SqlValue::Text(layout.device_id.clone()), layout.dst_type),
+        sql_literal(&SqlValue::Text(layout.device_name.clone()), layout.dst_type));
+    match layout.dst_type {
+        DstType::Sqlite => {
+            if !Path::new(&layout.dst_connection_string).exists() { return Ok(false); }
+            let conn = Connection::open(&layout.dst_connection_string).map_err(map_sql_err)?;
+            if !has_table(&conn, "synclite_checkpoint")? { return Ok(false); }
+            let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM synclite_checkpoint WHERE {predicate}"), [], |r| r.get(0)).map_err(map_sql_err)?;
+            Ok(count > 0)
+        }
+        DstType::DuckDb => {
+            if !Path::new(&layout.dst_connection_string).exists() { return Ok(false); }
+            let conn = DuckConnection::open(&layout.dst_connection_string).map_err(map_duck_err)?;
+            let exists: i64 = conn.query_row("SELECT COUNT(*) FROM information_schema.tables WHERE table_name='synclite_checkpoint'", [], |r| r.get(0)).map_err(map_duck_err)?;
+            if exists == 0 { return Ok(false); }
+            let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {} WHERE {predicate}", duck_meta_table(layout, "synclite_checkpoint")), [], |r| r.get(0)).map_err(map_duck_err)?;
+            Ok(count > 0)
+        }
+        DstType::Postgres => {
+            let mut client = connect_postgres(layout)?;
+            let table = pg_meta_table(layout, "synclite_checkpoint");
+            let exists: bool = client.query_one("SELECT to_regclass($1) IS NOT NULL", &[&table]).map_err(map_pg_err)?.get(0);
+            if !exists { return Ok(false); }
+            let count: i64 = client.query_one(&format!("SELECT COUNT(*) FROM {} WHERE {predicate}", pg_meta_table(layout, "synclite_checkpoint")), &[]).map_err(map_pg_err)?.get(0);
+            Ok(count > 0)
+        }
+    }
+}
+
 fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Arc<AtomicBool>) {
     let cleanup_progress = CleanupProgress::register(&layout);
     // Java parity: open per-device trace file under the consolidator's per-device
@@ -2011,10 +2355,19 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
             tracer_info!(
                 tracer,
                 "Device",
-                "Device initialized with status : INITIALIZED (device={} dst={} workDir={})",
+                "Worker started/bootstrap pending (device={} dst={} workDir={})",
                 layout.device_name,
                 layout.dst_index,
                 layout.device_work_dir.display()
+            );
+            trace_workflow_step(
+                "startup",
+                format!(
+                    "device={} dst={} workDir={}",
+                    layout.device_name,
+                    layout.dst_index,
+                    layout.device_work_dir.display()
+                ),
             );
             DEVICE_TRACER.with(|cell| *cell.borrow_mut() = Some(tracer));
         }
@@ -2030,6 +2383,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
     let state_conn = match Connection::open(&layout.state_db_path) {
         Ok(conn) => conn,
         Err(e) => {
+            trace_worker_error("open state db", &layout.state_db_path, &e);
             tracing::error!(error = %e, path = %layout.state_db_path.display(), "failed to open consolidator state db");
             return;
         }
@@ -2037,6 +2391,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
     let stats_conn = match Connection::open(&layout.stats_db_path) {
         Ok(conn) => conn,
         Err(e) => {
+            trace_worker_error("open stats db", &layout.stats_db_path, &e);
             tracing::error!(error = %e, path = %layout.stats_db_path.display(), "failed to open consolidator stats db");
             return;
         }
@@ -2044,12 +2399,19 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
     let consolidator_stats_conn = match Connection::open(&layout.consolidator_stats_db_path) {
         Ok(conn) => conn,
         Err(e) => {
+            trace_worker_error("open global stats db", &layout.consolidator_stats_db_path, &e);
             tracing::error!(error = %e, path = %layout.consolidator_stats_db_path.display(), "failed to open consolidator global stats db");
             return;
         }
     };
 
-    let mut bootstrap_initialized = is_initialized(&state_conn).unwrap_or(false);
+    let mut bootstrap_initialized = match is_initialized(&state_conn) {
+        Ok(initialized) => initialized,
+        Err(e) => {
+            trace_worker_error("read local initialization", &layout.state_db_path, &e);
+            false
+        }
+    };
     // Java parity: every consolidator startup writes device identity into
     // synclite_device_metadata.db and reads consolidator init state from
     // the per-destination consolidator metadata store. This makes Java<->Rust
@@ -2062,33 +2424,39 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
     // Any that fail here are retried lazily by the apply path once the
     // destination becomes reachable.
     if !stopping.load(Ordering::SeqCst) {
-        if let Err(e) = consolidator_state::bootstrap_destination_metadata(&layout, layout.dst_index) {
+        trace_workflow_step("bootstrap", "begin metadata bootstrap");
+        if let Err(e) =
+            consolidator_state::bootstrap_destination_metadata(&layout, layout.dst_index)
+        {
+            trace_worker_error("bootstrap destination metadata", &layout.device_work_dir, &e);
             tracing::warn!(error = %e, "failed to bootstrap destination metadata tables");
         }
     }
     if !stopping.load(Ordering::SeqCst) {
         if let Err(e) = consolidator_state::seed_device_metadata(&layout) {
+            trace_worker_error("seed device metadata", &layout.device_work_dir, &e);
             tracing::warn!(error = %e, "failed to seed synclite_device_metadata.db");
         }
     }
     if !stopping.load(Ordering::SeqCst) {
         if let Err(e) = consolidator_state::seed_consolidator_identity(&layout, layout.dst_index) {
+            trace_worker_error("seed consolidator identity", &layout.device_work_dir, &e);
             tracing::warn!(error = %e, "failed to seed consolidator identity metadata");
         }
     }
     if !stopping.load(Ordering::SeqCst) {
-        if let Err(e) = consolidator_state::seed_consolidator_metadata_version(&layout, layout.dst_index) {
+        if let Err(e) =
+            consolidator_state::seed_consolidator_metadata_version(&layout, layout.dst_index)
+        {
+            trace_worker_error("seed metadata version", &layout.device_work_dir, &e);
             tracing::warn!(error = %e, "failed to seed consolidator metadata-schema version");
         }
     }
-    if !stopping.load(Ordering::SeqCst) {
-        match consolidator_state::get_consolidator_property_long(&layout, layout.dst_index, "initialization_status") {
-            Ok(Some(1)) => {
-                bootstrap_initialized = true;
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "failed to read consolidator initialization_status"),
-        }
+    // A legacy metadata property was published by the old snapshot stub.
+    // It is NOT proof of copied data and must never override local state.
+    if bootstrap_initialized {
+        trace_workflow_step("bootstrap", "recovered local completion state");
+        with_device_tracer(|t| tracer_info!(t, "Device", "Device status : INITIALIZED (local completion recovered)"));
     }
     // Fast-exit if shutdown was requested while we were bringing up the
     // destination metadata above.
@@ -2097,6 +2465,9 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
     }
     let mut pending_stage_paths: Vec<PathBuf> = Vec::new();
     let poll_interval = std::time::Duration::from_millis(layout.device_polling_interval_ms.max(1));
+    let mut shutdown_after_bootstrap = false;
+    let mut pending_bootstrap: Option<(PathBuf, PathBuf)> = None;
+    let mut last_bootstrap_attempt: Option<std::time::Instant> = None;
 
     loop {
         let mut msg: Option<Msg> = match rx.recv_timeout(poll_interval) {
@@ -2105,12 +2476,34 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
+        // A short-lived logger can close before the first polling tick. Its
+        // backup and metadata may already be staged, but the worker has not
+        // observed them yet. Bootstrap once before draining the final stage
+        // backlog; otherwise shutdown silently discards the only apply chance.
+        if matches!(msg, Some(Msg::Shutdown))
+            && !bootstrap_initialized
+            && !stopping.load(Ordering::SeqCst)
+        {
+            if let Some(stage_dir) = layout.stage_dir.as_deref() {
+                if let Some((backup_path, metadata_path)) = find_stage_bootstrap_pair(stage_dir) {
+                    msg = Some(Msg::BootstrapReady {
+                        backup_path,
+                        metadata_path,
+                    });
+                    shutdown_after_bootstrap = true;
+                }
+            }
+        }
+
         // Offline-first shutdown: if a stop was requested (possibly while
         // we were blocked applying to / connecting to the destination),
         // drain any staged segments that are already present and then exit.
         // This keeps close()/initialize from racing past the replay step while
         // still avoiding a long block on an unreachable destination.
-        if stopping.load(Ordering::SeqCst) || matches!(msg, Some(Msg::Shutdown)) {
+        if stopping.load(Ordering::SeqCst)
+            || (shutdown_after_bootstrap && !matches!(msg, Some(Msg::BootstrapReady { .. })))
+            || matches!(msg, Some(Msg::Shutdown))
+        {
             if let Some(Msg::StagePathReady(path)) = msg {
                 // In a push-only layout this hint may be the only way to
                 // locate an unmirrored stage backlog during the final drain.
@@ -2118,8 +2511,12 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
             }
             if bootstrap_initialized && !is_paused(&layout) {
                 if let Err(e) = flush_pending_stage_paths(
-                    &layout, &state_conn, &stats_conn, &consolidator_stats_conn,
-                    &cleanup_progress, &mut pending_stage_paths,
+                    &layout,
+                    &state_conn,
+                    &stats_conn,
+                    &consolidator_stats_conn,
+                    &cleanup_progress,
+                    &mut pending_stage_paths,
                 ) {
                     tracing::error!(error = %e, "shutdown: failed to apply pending stage path");
                 }
@@ -2129,7 +2526,32 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
 
         let paused = is_paused(&layout);
 
+        // Preserve the original immutable stage paths, including push-only
+        // layouts. Check on EVERY iteration so a busy notification stream does
+        // not starve bootstrap retries. Do not consume a segment hint to retry.
+        if let Some(Msg::BootstrapReady { backup_path, metadata_path }) = &msg {
+            pending_bootstrap = Some((backup_path.clone(), metadata_path.clone()));
+        }
+        if !bootstrap_initialized && !paused {
+            if pending_bootstrap.is_none() {
+                pending_bootstrap = layout.stage_dir.as_deref().and_then(find_stage_bootstrap_pair);
+            }
+            let due = last_bootstrap_attempt.map(|at| at.elapsed() >= poll_interval).unwrap_or(true);
+            if (due || matches!(msg, Some(Msg::BootstrapReady { .. }))) && pending_bootstrap.is_some() {
+                if let Some(Msg::StagePathReady(path)) = msg.take() {
+                    pending_stage_paths.push(path);
+                }
+                let (backup_path, metadata_path) = pending_bootstrap.as_ref().unwrap();
+                msg = Some(Msg::BootstrapReady { backup_path: backup_path.clone(), metadata_path: metadata_path.clone() });
+                last_bootstrap_attempt = Some(std::time::Instant::now());
+            }
+        }
+        if paused && matches!(msg, Some(Msg::BootstrapReady { .. })) {
+            continue;
+        }
+
         if msg.is_none() {
+            trace_workflow_step("stage-scan", format!("check backlog for {}", layout.device_name));
             // Periodic scan: walk the per-device stage directory and
             // re-apply any segment that hasn't been consumed yet.
             // `process_stage_path_ready` is idempotent against the
@@ -2168,8 +2590,12 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                 }
                 if msg.is_none() && bootstrap_initialized {
                     if let Err(e) = flush_pending_stage_paths(
-                        &layout, &state_conn, &stats_conn, &consolidator_stats_conn,
-                        &cleanup_progress, &mut pending_stage_paths,
+                        &layout,
+                        &state_conn,
+                        &stats_conn,
+                        &consolidator_stats_conn,
+                        &cleanup_progress,
+                        &mut pending_stage_paths,
                     ) {
                         tracing::error!(error = %e, "periodic stage scan: failed to apply segment");
                     }
@@ -2188,6 +2614,24 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                 backup_path,
                 metadata_path,
             } => {
+                trace_workflow_step(
+                    "bootstrap",
+                    format!(
+                        "processing snapshot backup={} metadata={}",
+                        backup_path.display(),
+                        metadata_path.display()
+                    ),
+                );
+                // Includes materialization: no concurrent destination may
+                // overwrite/use the shared live replica during bootstrap.
+                let _processing_lock = match DeviceProcessingLock::try_lock(&layout) {
+                    Ok(Some(lock)) => lock,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        trace_worker_error("bootstrap lock", &backup_path, &e);
+                        continue;
+                    }
+                };
                 // Java parity (Device.initReplicas): non-transactional device
                 // types (sqlite_store / duckdb_store / streaming) maintain one
                 // replica file per destination, copied from the shared backup
@@ -2201,6 +2645,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                     }
                     if !replica.exists() {
                         if let Err(e) = std::fs::copy(&backup_path, &replica) {
+                            trace_worker_error("copy work replica", &backup_path, &e);
                             tracing::error!(
                                 error = %e,
                                 src = %backup_path.display(),
@@ -2217,8 +2662,20 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
 
                 // The store-device replica already lives in the per-device
                 // work dir, so it doesn't need an extra mirror copy (which
-                // would `copy(p, p)` and fail on Windows).
-                let work_backup_path = if !layout.is_transactional_device() {
+                // would `copy(p, p)` and fail on Windows). Java still keeps
+                // the shared device backup next to the per-destination
+                // replicas in the device work dir, so mirror it once.
+                let _work_backup_path = if !layout.is_transactional_device() {
+                    let shared_name = backup_path
+                        .file_name()
+                        .map(|n| n.to_owned())
+                        .unwrap_or_default();
+                    if !layout.device_work_dir.join(&shared_name).exists() {
+                        if let Err(e) = mirror_stage_artifact_to_work(&layout, &backup_path) {
+                            trace_worker_error("mirror shared backup", &backup_path, &e);
+                            tracing::warn!(error = %e, path = %backup_path.display(), "failed to mirror staged shared backup into consolidator work dir");
+                        }
+                    }
                     bootstrap_backup_path.clone()
                 } else {
                     // Java parity: the device-shipped `.synclite.backup` is
@@ -2243,34 +2700,46 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                         match mirror_stage_artifact_to_work(&layout, &bootstrap_backup_path) {
                             Ok(p) => p,
                             Err(e) => {
+                                trace_worker_error("mirror backup", &bootstrap_backup_path, &e);
                                 tracing::error!(error = %e, path = %bootstrap_backup_path.display(), "failed to mirror staged backup into consolidator work dir");
                                 continue;
                             }
                         }
                     }
                 };
-                let work_metadata_path = match mirror_stage_artifact_to_work(&layout, &metadata_path) {
+                let work_metadata_path = match mirror_stage_artifact_to_work(
+                    &layout,
+                    &metadata_path,
+                ) {
                     Ok(p) => p,
                     Err(e) => {
+                        trace_worker_error("mirror metadata", &metadata_path, &e);
                         tracing::error!(error = %e, path = %metadata_path.display(), "failed to mirror staged metadata into consolidator work dir");
                         continue;
                     }
                 };
 
-                if let Err(e) = record_bootstrap(&state_conn, &stats_conn, &backup_path, &metadata_path) {
+                if let Err(e) =
+                    record_bootstrap(&state_conn, &stats_conn, &backup_path, &metadata_path)
+                {
+                    trace_worker_error("record bootstrap", &backup_path, &e);
                     tracing::error!(error = %e, "failed to persist consolidator bootstrap state");
                 }
 
                 if !bootstrap_initialized {
-                    // Java parity: DeviceDstInitializer.markTableInitializing —
-                    // persist `initialization_status=INITIALIZING` per-table
-                    // before applying so crash-recovery semantics match Java.
-                    if let Err(e) = consolidator_state::mark_tables_initializing(
-                        &layout,
-                        layout.dst_index,
-                        &work_backup_path,
-                    ) {
-                        tracing::warn!(error = %e, "failed to mark tables initializing");
+                    if layout.metadata_store == MetadataStore::Local {
+                        if let Err(e) = consolidator_state::mark_tables_initializing(
+                            &layout, layout.dst_index, &backup_path,
+                        ) {
+                            trace_worker_error("mark tables initializing", &backup_path, &e);
+                            continue;
+                        }
+                    }
+                    // NEVER use work_backup_path here: it is a shared LIVE
+                    // replica and may already contain another destination's CDC.
+                    if let Err(e) = apply_bootstrap_snapshot(&layout, &backup_path) {
+                        trace_worker_error("apply immutable snapshot", &backup_path, &e);
+                        continue;
                     }
                     // Java parity: ConsolidatorMetadataManager.upsertSchema —
                     // populate local `schema` table from PRAGMA table_info on
@@ -2279,44 +2748,42 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                     if let Err(e) = consolidator_state::record_initial_table_schemas(
                         &layout,
                         layout.dst_index,
-                        &work_backup_path,
+                        &backup_path,
                     ) {
-                        tracing::warn!(error = %e, "failed to persist initial per-column schemas");
+                        trace_worker_error("record initial schemas", &backup_path, &e);
+                        continue;
+                    }
+                    if layout.metadata_store == MetadataStore::Local {
+                        if let Err(e) = consolidator_state::record_initial_table_stats(
+                            &layout, layout.dst_index, &backup_path,
+                        ) {
+                            trace_worker_error("record initial stats", &backup_path, &e);
+                            continue;
+                        }
+                    }
+                    let snapshot_name = backup_path.file_name()
+                        .map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+                    if let Err(e) = consolidator_state::mark_initialization_complete(
+                        &layout, layout.dst_index, &snapshot_name,
+                    ) {
+                        trace_worker_error("mark initialization complete", &backup_path, &e);
+                        continue;
                     }
                     match initialize_from_backup(
                         &layout,
                         &state_conn,
                         &stats_conn,
                         &consolidator_stats_conn,
-                        &work_backup_path,
+                        &backup_path,
                         &work_metadata_path,
                     ) {
                         Ok(true) => {
                             bootstrap_initialized = true;
-                            // Java parity: mark this device initialized in the
-                            // consolidator metadata store (LOCAL file or
-                            // destination synclite_consolidator_metadata) so a
-                            // future Java consolidator startup sees init_status=1.
-                            let snapshot_name = backup_path
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            if let Err(e) = consolidator_state::mark_initialization_complete(
-                                &layout,
-                                layout.dst_index,
-                                &snapshot_name,
-                            ) {
-                                tracing::warn!(error = %e, "failed to mark initialization complete");
-                            }
-                            // Java parity: DeviceDstInitializer.markTableInitialized —
-                            // persist per-table initialization_status + initial_rows.
-                            if let Err(e) = consolidator_state::record_initial_table_stats(
-                                &layout,
-                                layout.dst_index,
-                                &work_backup_path,
-                            ) {
-                                tracing::warn!(error = %e, "failed to record initial per-table stats");
-                            }
+                            pending_bootstrap = None;
+                            trace_workflow_step("bootstrap", "snapshot applied; device initialized");
+                            with_device_tracer(|t| tracer_info!(t, "Device", "Device status : INITIALIZED (snapshot checkpoint ready)"));
+                            // Segment processing acquires the same lock.
+                            drop(_processing_lock);
                             if let Err(e) = flush_pending_stage_paths(
                                 &layout,
                                 &state_conn,
@@ -2329,21 +2796,29 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                             }
                         }
                         Ok(false) => {
+                            trace_workflow_step(
+                                "bootstrap",
+                                format!("waiting for immutable backup {}", backup_path.display()),
+                            );
+                            with_device_tracer(|t| tracer_info!(t, "Device", "Bootstrap pending: immutable backup {} is not yet available", backup_path.display()));
                             tracing::warn!(
                                 backup = %backup_path.display(),
                                 "consolidator bootstrap deferred; backup file not available yet"
                             );
                         }
                         Err(e) => {
+                            trace_worker_error("publish local initialization", &backup_path, &e);
                             tracing::error!(error = %e, "failed to initialize destination state from backup");
                         }
                     }
                 }
             }
             Msg::StagePathReady(path) => {
+                trace_workflow_step("stage-ready", format!("segment notification {}", path.display()));
                 pending_stage_paths.push(path.clone());
                 if !bootstrap_initialized {
                     if let Err(e) = record_event(&state_conn, "stage-path-deferred", &path) {
+                        trace_worker_error("record deferred stage event", &layout.state_db_path, &e);
                         tracing::error!(error = %e, path = %path.display(), "failed to persist deferred stage event");
                     }
                     continue;
@@ -2357,9 +2832,11 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                     // that call is tolerant of a missing stage file when
                     // the work copy already exists.
                     if let Err(e) = mirror_stage_artifact_to_work(&layout, &path) {
+                        trace_worker_error("mirror paused stage", &path, &e);
                         tracing::error!(error = %e, path = %path.display(), "failed to pre-mirror paused stage path");
                     }
                     if let Err(e) = record_event(&state_conn, "stage-path-paused", &path) {
+                        trace_worker_error("record paused stage event", &layout.state_db_path, &e);
                         tracing::error!(error = %e, path = %path.display(), "failed to persist paused stage event");
                     }
                     continue;
@@ -2374,25 +2851,15 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                     &mut pending_stage_paths,
                 ) {
                     tracing::error!(error = %e, path = %path.display(), "failed to persist consolidator stage event");
-                    // Mirror to the device trace file so users without
-                    // a tracing subscriber installed still see why a
-                    // segment failed to apply.
-                    with_device_tracer(|t| {
-                        tracer_error!(
-                            t,
-                            "DeviceConsolidator",
-                            "Failed to apply cdc log derived from staged segment {} on dst {}: {}",
-                            path.display(),
-                            layout.dst_index,
-                            e
-                        )
-                    });
+                    // The flush boundary logs the actual failed backlog head,
+                    // not this (possibly later) notification path.
                 }
             }
             Msg::Shutdown => break,
         }
     }
 
+    trace_workflow_step("shutdown", "job shutdown successfully");
     with_device_tracer(|t| tracer_info!(t, "Consolidator", "Job shutdown successfully."));
     DEVICE_TRACER.with(|cell| cell.borrow_mut().take());
 }
@@ -2408,19 +2875,37 @@ fn flush_pending_stage_paths(
     if is_paused(layout) {
         return Ok(());
     }
+    if !is_initialized(state_conn)? {
+        return Ok(());
+    }
     // Notifications are hints, not an ordering guarantee. Include retained
     // work after restart, even when its original stage copy no longer exists.
     // Discovery must finish before apply: an unreadable backlog cannot safely
     // be treated as empty while a later notification advances the checkpoint.
-    discover_pending_stage_paths(layout, pending_stage_paths)?;
+    discover_pending_stage_paths(layout, pending_stage_paths).map_err(|e| {
+        trace_worker_error("discover stage/work backlog", &layout.device_work_dir, &e);
+        e
+    })?;
     drain_ordered_stage_paths(pending_stage_paths, |path| {
-        process_stage_path_ready(
-            layout, state_conn, stats_conn, consolidator_stats_conn, cleanup_progress, path,
-        )
+        let result = process_stage_path_ready(
+            layout,
+            state_conn,
+            stats_conn,
+            consolidator_stats_conn,
+            cleanup_progress,
+            path,
+        );
+        if let Err(e) = &result {
+            trace_worker_error("apply staged segment", path, e);
+        }
+        result
     })
 }
 
-fn discover_pending_stage_paths(layout: &ConsolidatorLayout, pending: &mut Vec<PathBuf>) -> Result<()> {
+fn discover_pending_stage_paths(
+    layout: &ConsolidatorLayout,
+    pending: &mut Vec<PathBuf>,
+) -> Result<()> {
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -2449,16 +2934,20 @@ fn discover_pending_stage_paths(layout: &ConsolidatorLayout, pending: &mut Vec<P
         let mut notified: HashMap<PathBuf, u64> = HashMap::new();
         for path in pending.iter() {
             if let (Some(parent), Some(seq)) = (path.parent(), parse_segment_seq(path)) {
-                notified.entry(parent.to_path_buf())
-                    .and_modify(|last| *last = (*last).max(seq)).or_insert(seq);
+                notified
+                    .entry(parent.to_path_buf())
+                    .and_modify(|last| *last = (*last).max(seq))
+                    .or_insert(seq);
             }
         }
         for (parent, last) in notified {
             let mut older = Vec::new();
             collect(&parent, &mut older)?;
-            discovered.extend(older.into_iter().filter(|path| {
-                parse_segment_seq(path).is_some_and(|seq| seq <= last)
-            }));
+            discovered.extend(
+                older
+                    .into_iter()
+                    .filter(|path| parse_segment_seq(path).is_some_and(|seq| seq <= last)),
+            );
         }
     }
     collect(&layout.device_work_dir, &mut discovered)?;
@@ -2468,15 +2957,27 @@ fn discover_pending_stage_paths(layout: &ConsolidatorLayout, pending: &mut Vec<P
     // to work while still picking up late sidecars from the stage directory,
     // and cleanup must not confuse the work directory with the stage directory.
     let mut sources: HashMap<std::ffi::OsString, PathBuf> = HashMap::new();
-    for path in discovered.into_iter().filter(|path| is_apply_candidate_segment(path)) {
-        let name = path.file_name().expect("segment has a file name").to_owned();
+    for path in discovered
+        .into_iter()
+        .filter(|path| is_apply_candidate_segment(path))
+    {
+        let name = path
+            .file_name()
+            .expect("segment has a file name")
+            .to_owned();
         let source = if path.parent() == Some(layout.device_work_dir.as_path()) {
-            layout.stage_dir.as_ref().map(|dir| dir.join(&name)).unwrap_or(path)
+            layout
+                .stage_dir
+                .as_ref()
+                .map(|dir| dir.join(&name))
+                .unwrap_or(path)
         } else {
             path
         };
         match sources.entry(name) {
-            HashMapEntry::Vacant(entry) => { entry.insert(source); }
+            HashMapEntry::Vacant(entry) => {
+                entry.insert(source);
+            }
             HashMapEntry::Occupied(mut entry) => {
                 if entry.get().parent() == Some(layout.device_work_dir.as_path()) {
                     entry.insert(source);
@@ -2484,15 +2985,24 @@ fn discover_pending_stage_paths(layout: &ConsolidatorLayout, pending: &mut Vec<P
             }
         }
     }
-    let command_sequences: HashSet<u64> = sources.values()
-        .filter(|path| is_sqllog_path(path)).filter_map(|path| parse_segment_seq(path)).collect();
-    let mut paths: Vec<PathBuf> = sources.into_values().filter(|path| {
-        // For SQL devices the work cdclog is a derivative, not another input.
-        // Retrying it separately could bypass undecided command-log fate or
-        // mark progress before the command segment has completed successfully.
-        !is_sql_device(layout) || is_sqllog_path(path)
-            || !parse_segment_seq(path).map(|seq| command_sequences.contains(&seq)).unwrap_or(false)
-    }).collect();
+    let command_sequences: HashSet<u64> = sources
+        .values()
+        .filter(|path| is_sqllog_path(path))
+        .filter_map(|path| parse_segment_seq(path))
+        .collect();
+    let mut paths: Vec<PathBuf> = sources
+        .into_values()
+        .filter(|path| {
+            // For SQL devices the work cdclog is a derivative, not another input.
+            // Retrying it separately could bypass undecided command-log fate or
+            // mark progress before the command segment has completed successfully.
+            !is_sql_device(layout)
+                || is_sqllog_path(path)
+                || !parse_segment_seq(path)
+                    .map(|seq| command_sequences.contains(&seq))
+                    .unwrap_or(false)
+        })
+        .collect();
     sort_stage_paths(&mut paths);
     *pending = paths;
     Ok(())
@@ -2547,11 +3057,15 @@ fn process_stage_path_ready(
     }
 
     cdc_debug_eprintln!("[stage-debug] process {}", stage_path.display());
+    trace_workflow_step("stage-process", format!("processing {}", stage_path.display()));
 
     let _device_processing_lock = match DeviceProcessingLock::try_lock(layout)? {
         Some(lock) => lock,
         None => {
-            cdc_debug_eprintln!("[stage-debug] deferred device lock {}", stage_path.display());
+            cdc_debug_eprintln!(
+                "[stage-debug] deferred device lock {}",
+                stage_path.display()
+            );
             record_event(state_conn, "stage-path-deferred-device-locked", stage_path)?;
             return Ok(StagePathOutcome::Deferred);
         }
@@ -2562,7 +3076,13 @@ fn process_stage_path_ready(
     // a missing file by itself must remain a retryable failure.
     if let Some(seq) = parse_segment_seq(stage_path).and_then(|seq| i64::try_from(seq).ok()) {
         let authorized = get_state_i64(state_conn, CLEANUP_AUTHORIZED_SEGMENT_KEY, -1)?;
-        if seq <= authorized.max(read_device_metadata_i64(layout, LAST_CLEANED_SEGMENT_KEY, -1)) {
+        if seq
+            <= authorized.max(read_device_metadata_i64(
+                layout,
+                LAST_CLEANED_SEGMENT_KEY,
+                -1,
+            ))
+        {
             return Ok(StagePathOutcome::Complete);
         }
     }
@@ -2571,8 +3091,14 @@ fn process_stage_path_ready(
     // stable copy that won't disappear if the shipper has already
     // cleaned the stage file (e.g. resume-from-pause path).
     let work_path = mirror_stage_artifact_to_work(layout, stage_path)?;
+    trace_workflow_step("stage-mirror", format!("mirrored to work path {}", work_path.display()));
 
-    cdc_debug_eprintln!("[stage-debug] work-path-type={} sql-device={} sqllog={}", layout.device_type, is_sql_device(layout), is_sqllog_path(&work_path));
+    cdc_debug_eprintln!(
+        "[stage-debug] work-path-type={} sql-device={} sqllog={}",
+        layout.device_type,
+        is_sql_device(layout),
+        is_sqllog_path(&work_path)
+    );
 
     // Idempotency: if the work copy is already marked APPLIED, the segment
     // (or the cdclog derived from it for SQL devices) has already been
@@ -2582,8 +3108,12 @@ fn process_stage_path_ready(
     // was applied earlier in the same job) can prune stale work artifacts.
     cdc_debug_eprintln!("[stage-debug] before-status-check {}", work_path.display());
     let already_applied = segment_metadata_status_is_applied(&work_path);
-    cdc_debug_eprintln!("[stage-debug] already-applied={already_applied} {}", work_path.display());
+    cdc_debug_eprintln!(
+        "[stage-debug] already-applied={already_applied} {}",
+        work_path.display()
+    );
     if already_applied {
+        trace_workflow_step("stage-skip", format!("already applied {}", work_path.display()));
         cdc_debug_eprintln!("[stage-debug] already applied {}", work_path.display());
         record_event(state_conn, "stage-path-already-applied", stage_path)?;
         cleanup_progress.record(layout, &work_path);
@@ -2620,8 +3150,14 @@ fn process_stage_path_ready(
         return Ok(StagePathOutcome::Deferred);
     }
 
-    cdc_debug_eprintln!("[stage-debug] before-apply branch sql_device={} store_or_streaming={} path={}", is_sql_device(layout), is_store_or_streaming_device(layout), work_path.display());
+    cdc_debug_eprintln!(
+        "[stage-debug] before-apply branch sql_device={} store_or_streaming={} path={}",
+        is_sql_device(layout),
+        is_store_or_streaming_device(layout),
+        work_path.display()
+    );
 
+    trace_workflow_step("stage-apply", format!("applying {}", work_path.display()));
     // APPLIED status is written ONLY into the work-dir copy of the segment,
     // never into the stage-dir copy. The stage-dir file is owned by the
     // shipper until it has been shipped to every configured archiver;
@@ -2639,14 +3175,28 @@ fn process_stage_path_ready(
         mark_segment_applied_best_effort(&work_path);
     } else if is_sql_device(layout) {
         let cdc_log_path = run_device_replicator(layout, &work_path)?;
-        record_stage_path(
-            layout,
-            state_conn,
-            stats_conn,
-            consolidator_stats_conn,
-            &cdc_log_path,
-            apply_staged_segment_with_retry,
-        )?;
+        // Handover can recover a completed destination with a fresh local work
+        // replica. Replay historical SQL to reconstruct that replica, but NEVER
+        // apply the resulting CDC again or rewind the destination checkpoint.
+        let resume = if layout.destination_apply_enabled {
+            read_destination_resume_checkpoint(layout)?
+        } else { None };
+        let covered = match parse_segment_seq(&cdc_log_path) {
+            Some(seq) => should_skip_segment_by_destination_checkpoint(resume, seq as i64, &cdc_log_path)?,
+            None => false,
+        };
+        if covered {
+            record_event(state_conn, "stage-path-reconstructed-destination-covered", &work_path)?;
+        } else {
+            record_stage_path(
+                layout,
+                state_conn,
+                stats_conn,
+                consolidator_stats_conn,
+                &cdc_log_path,
+                apply_staged_segment_with_retry,
+            )?;
+        }
         mark_segment_applied_best_effort(&cdc_log_path);
         mark_segment_applied_best_effort(&work_path);
     } else {
@@ -2682,20 +3232,25 @@ fn segment_metadata_status_is_applied(path: &Path) -> bool {
     let conn = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(c) => c,
         Err(err) => {
-            cdc_debug_eprintln!("[stage-debug] status-check open failed {}: {err:?}", path.display());
+            cdc_debug_eprintln!(
+                "[stage-debug] status-check open failed {}: {err:?}",
+                path.display()
+            );
             return false;
         }
     };
     let _ = conn.busy_timeout(Duration::from_millis(50));
-    let row: rusqlite::Result<String> = conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'status'",
-        [],
-        |r| r.get(0),
-    );
+    let row: rusqlite::Result<String> =
+        conn.query_row("SELECT value FROM metadata WHERE key = 'status'", [], |r| {
+            r.get(0)
+        });
     match row {
         Ok(v) => v == "APPLIED",
         Err(err) => {
-            cdc_debug_eprintln!("[stage-debug] status-check query failed {}: {err:?}", path.display());
+            cdc_debug_eprintln!(
+                "[stage-debug] status-check query failed {}: {err:?}",
+                path.display()
+            );
             false
         }
     }
@@ -2724,11 +3279,10 @@ fn read_device_metadata_i64(layout: &ConsolidatorLayout, key: &str, default: i64
             return default;
         }
     };
-    let row: rusqlite::Result<String> = conn.query_row(
-        "SELECT value FROM metadata WHERE key = ?1",
-        [key],
-        |r| r.get(0),
-    );
+    let row: rusqlite::Result<String> =
+        conn.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |r| {
+            r.get(0)
+        });
     match row {
         Ok(s) => s.parse::<i64>().unwrap_or(default),
         Err(rusqlite::Error::QueryReturnedNoRows) => default,
@@ -2756,9 +3310,9 @@ fn write_device_metadata_i64_best_effort(layout: &ConsolidatorLayout, key: &str,
             return;
         }
     };
-    if let Err(e) = conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);",
-    ) {
+    if let Err(e) =
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);")
+    {
         tracing::warn!(path = %path.display(), error = %e, key, value, "device metadata write: ensure-table failed");
         return;
     }
@@ -2778,10 +3332,12 @@ fn write_device_metadata_i64_best_effort(layout: &ConsolidatorLayout, key: &str,
     let value_str = value.to_string();
     let result = tx
         .execute("DELETE FROM metadata WHERE key = ?1", [key])
-        .and_then(|_| tx.execute(
-            "INSERT INTO metadata(key, value) VALUES(?1, ?2)",
-            rusqlite::params![key, value_str],
-        ))
+        .and_then(|_| {
+            tx.execute(
+                "INSERT INTO metadata(key, value) VALUES(?1, ?2)",
+                rusqlite::params![key, value_str],
+            )
+        })
         .and_then(|_| tx.commit());
     if let Err(e) = result {
         tracing::warn!(path = %path.display(), error = %e, key, value, "device metadata write: upsert failed");
@@ -2791,7 +3347,12 @@ fn write_device_metadata_i64_best_effort(layout: &ConsolidatorLayout, key: &str,
 fn mark_segment_applied_best_effort(path: &Path) {
     if !path.exists() {
         with_device_tracer(|t| {
-            tracer_info!(t, "LogSegment", "mark APPLIED skipped (missing): {}", path.display())
+            tracer_info!(
+                t,
+                "LogSegment",
+                "mark APPLIED skipped (missing): {}",
+                path.display()
+            )
         });
         return;
     }
@@ -2800,7 +3361,13 @@ fn mark_segment_applied_best_effort(path: &Path) {
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "mark APPLIED: open failed");
             with_device_tracer(|t| {
-                tracer_info!(t, "LogSegment", "mark APPLIED open failed: {} :: {}", path.display(), e)
+                tracer_info!(
+                    t,
+                    "LogSegment",
+                    "mark APPLIED open failed: {} :: {}",
+                    path.display(),
+                    e
+                )
             });
             return;
         }
@@ -2818,7 +3385,13 @@ fn mark_segment_applied_best_effort(path: &Path) {
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "mark APPLIED: write failed");
             with_device_tracer(|t| {
-                tracer_info!(t, "LogSegment", "mark APPLIED write failed: {} :: {}", path.display(), e)
+                tracer_info!(
+                    t,
+                    "LogSegment",
+                    "mark APPLIED write failed: {} :: {}",
+                    path.display(),
+                    e
+                )
             });
         }
     }
@@ -2894,7 +3467,10 @@ fn is_sql_device(layout: &ConsolidatorLayout) -> bool {
     )
 }
 
-fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Path) -> Result<PathBuf> {
+fn run_device_replicator(
+    layout: &ConsolidatorLayout,
+    work_command_log_path: &Path,
+) -> Result<PathBuf> {
     if !is_sqllog_path(work_command_log_path) {
         return Ok(work_command_log_path.to_path_buf());
     }
@@ -2911,7 +3487,22 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
     })?;
 
     let cdc_log_path = layout.device_work_dir.join(format!("{seg_seq}.cdclog"));
-    cdc_debug_eprintln!("[replicator-call] seg={seg_seq} cdc_path={} work_path={} device_work_dir={}", cdc_log_path.display(), work_command_log_path.display(), layout.device_work_dir.display());
+    trace_workflow_step(
+        "replicate",
+        format!("segment={} => cdclog {}", seg_seq, cdc_log_path.display()),
+    );
+    // Keep the final name invisible until the complete replay has closed.
+    // Native CDC writes several SQLite transactions per command-log segment;
+    // exposing that partial file lets readers observe incomplete row images
+    // and can make the writer fail with SQLITE_BUSY.
+    let cdc_log_tmp_path = layout.device_work_dir.join(format!("{seg_seq}.cdclog.tmp"));
+    let _ = std::fs::remove_file(&cdc_log_tmp_path);
+    cdc_debug_eprintln!(
+        "[replicator-call] seg={seg_seq} cdc_path={} work_path={} device_work_dir={}",
+        cdc_log_path.display(),
+        work_command_log_path.display(),
+        layout.device_work_dir.display()
+    );
 
     // Idempotency: if the cdclog for this segment was already produced by an
     // earlier worker_loop poll, skip the replay. Re-running the replay against
@@ -2930,13 +3521,21 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
 
     if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
         let exists = cdc_log_path.exists();
-        let pre_rows = existing_rows
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| if exists { "err".to_string() } else { "(no file)".to_string() });
+        let pre_rows = existing_rows.map(|n| n.to_string()).unwrap_or_else(|| {
+            if exists {
+                "err".to_string()
+            } else {
+                "(no file)".to_string()
+            }
+        });
         let line = format!("[replicator-call] seg={seg_seq} cdclog_exists={exists} pre_rows={pre_rows} cmdlog={}\n",
             work_command_log_path.display());
         eprintln!("{}", line.trim_end());
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("C:\\tmp\\rust_debug.log")
+        {
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
         }
@@ -2944,6 +3543,7 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
 
     if let Some(rows) = existing_rows {
         if rows > 0 {
+            trace_workflow_step("replicate", format!("skip duplicate cdclog for segment={} rows={}", seg_seq, rows));
             with_device_tracer(|t| {
                 tracer_info!(
                     t,
@@ -2957,7 +3557,11 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
             if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
                 let line = format!("[replicator-call] skip seg={seg_seq} rows={rows}\n");
                 eprintln!("{}", line.trim_end());
-                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                if let Ok(mut f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("C:\\tmp\\rust_debug.log")
+                {
                     use std::io::Write;
                     let _ = f.write_all(line.as_bytes());
                 }
@@ -2976,13 +3580,18 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
         work_command_log_path,
         seg_seq as i64,
         layout,
-        &cdc_log_path,
+        &cdc_log_tmp_path,
     )?;
 
     if !replay.writer_used {
-        cdc_debug_eprintln!("[debug-cdclog] writing legacy cdclog for {} entries={} events={}", cdc_log_path.display(), replay.entries.len(), replay.events.len());
+        cdc_debug_eprintln!(
+            "[debug-cdclog] writing legacy cdclog for {} entries={} events={}",
+            cdc_log_path.display(),
+            replay.entries.len(),
+            replay.events.len()
+        );
         if let Err(err) = write_cdclog_segment(
-            &cdc_log_path,
+            &cdc_log_tmp_path,
             &replay.entries,
             Some(&replay.events),
             &replica_path,
@@ -2991,7 +3600,15 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
             return Err(err);
         }
     }
-    cdc_debug_eprintln!("[debug-cdclog] final exists={} size={}", cdc_log_path.exists(), cdc_log_path.metadata().map(|m| m.len().to_string()).unwrap_or_else(|_| "<err>".into()));
+    std::fs::rename(&cdc_log_tmp_path, &cdc_log_path)?;
+    cdc_debug_eprintln!(
+        "[debug-cdclog] final exists={} size={}",
+        cdc_log_path.exists(),
+        cdc_log_path
+            .metadata()
+            .map(|m| m.len().to_string())
+            .unwrap_or_else(|_| "<err>".into())
+    );
     with_device_tracer(|t| {
         tracer_info!(
             t,
@@ -3000,7 +3617,11 @@ fn run_device_replicator(layout: &ConsolidatorLayout, work_command_log_path: &Pa
             replay.entries.len(),
             work_command_log_path.display(),
             cdc_log_path.display(),
-            if replay.writer_used { "native" } else { "legacy" }
+            if replay.writer_used {
+                "native"
+            } else {
+                "legacy"
+            }
         )
     });
     Ok(cdc_log_path)
@@ -3014,7 +3635,9 @@ fn resolve_replicator_replica_path(layout: &ConsolidatorLayout) -> Result<PathBu
         return Ok(preferred);
     }
 
-    let legacy = layout.device_work_dir.join("synclite_replicator_replica.db");
+    let legacy = layout
+        .device_work_dir
+        .join("synclite_replicator_replica.db");
     if legacy.exists() {
         if !preferred.exists() {
             std::fs::copy(&legacy, &preferred).map_err(|e| {
@@ -3090,7 +3713,30 @@ fn replay_segment_with_native_cdc(
     layout: &ConsolidatorLayout,
     cdc_log_path: &Path,
 ) -> Result<ReplayOutput> {
-    let seg_conn = Connection::open(segment_path).map_err(map_sql_err)?;
+    replay_segment_with_cdc_loader(replica_path, segment_path, command_log_segment_seq,
+        layout, cdc_log_path, NativeCdc::load)
+}
+
+fn replay_segment_with_cdc_loader(
+    replica_path: &Path,
+    segment_path: &Path,
+    command_log_segment_seq: i64,
+    layout: &ConsolidatorLayout,
+    cdc_log_path: &Path,
+    load: impl FnOnce() -> Result<NativeCdc>,
+) -> Result<ReplayOutput> {
+    // Resolve the native ABI before creating/opening replay outputs or mutating
+    // the schema cache. Missing native CDC must never become an empty artifact.
+    trace_workflow_step("replay", format!("segment={} loading native CDC replay for {}", command_log_segment_seq, segment_path.display()));
+    let native = load().map_err(|e| {
+        trace_worker_error("load native CDC", segment_path, &e);
+        // This payload is produced exclusively by our library/symbol loader:
+        // candidate filenames and OS loader errors, never DB SQL/credentials.
+        with_device_tracer(|t| tracer_error!(t, "DeviceReplicator",
+            "Native CDC load failed for {}: {}", segment_path.display(), e));
+        e
+    })?;
+    let seg_conn = Connection::open_with_flags(segment_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_sql_err)?;
     // Java parity (`DeviceSyncProcessor.inMemoryReplicaConn`): acquire the
     // worker-owned schema replica. Held for the duration of this replay so
     // the outer segment read + every REPLAY_TXN sidecar share state, and
@@ -3100,11 +3746,20 @@ fn replay_segment_with_native_cdc(
     let read_result = read_segment_entries_with_replica(&seg_conn, schema_replica);
     let (_first_commit, mut entries) = match read_result {
         Ok(v) => {
-            cdc_debug_eprintln!("[replay-debug] seg={} raw_entries={} path={}", command_log_segment_seq, v.1.len(), segment_path.display());
+            cdc_debug_eprintln!(
+                "[replay-debug] seg={} raw_entries={} path={}",
+                command_log_segment_seq,
+                v.1.len(),
+                segment_path.display()
+            );
             v
         }
         Err(err) => {
-            cdc_debug_eprintln!("[replay-debug] seg={} read_failed={err:?} path={}", command_log_segment_seq, segment_path.display());
+            cdc_debug_eprintln!(
+                "[replay-debug] seg={} read_failed={err:?} path={}",
+                command_log_segment_seq,
+                segment_path.display()
+            );
             return Err(err);
         }
     };
@@ -3126,7 +3781,11 @@ fn replay_segment_with_native_cdc(
                 resume.commit_id,
                 resume.cdc_log_segment_sequence_number);
             eprintln!("{}", line.trim_end());
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+            if let Ok(mut f) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("C:\\tmp\\rust_debug.log")
+            {
                 use std::io::Write;
                 let _ = f.write_all(line.as_bytes());
             }
@@ -3152,24 +3811,49 @@ fn replay_segment_with_native_cdc(
     }
 
     let raw_entries_len = entries.len();
-    cdc_debug_eprintln!("[replay-debug] seg={} raw_entries_len={} before_commit_filter path={}", command_log_segment_seq, raw_entries_len, segment_path.display());
+    cdc_debug_eprintln!(
+        "[replay-debug] seg={} raw_entries_len={} before_commit_filter path={}",
+        command_log_segment_seq,
+        raw_entries_len,
+        segment_path.display()
+    );
     entries = retain_committed_entries(entries);
     let committed_len = entries.len();
-    cdc_debug_eprintln!("[replay-debug] seg={} committed_entries={} path={}", command_log_segment_seq, committed_len, segment_path.display());
-    entries = expand_replay_txn_entries(entries, segment_path, command_log_segment_seq, schema_replica)?;
+    cdc_debug_eprintln!(
+        "[replay-debug] seg={} committed_entries={} path={}",
+        command_log_segment_seq,
+        committed_len,
+        segment_path.display()
+    );
+    entries = expand_replay_txn_entries(
+        entries,
+        segment_path,
+        command_log_segment_seq,
+        schema_replica,
+    )?;
     let expanded_len = entries.len();
-    cdc_debug_eprintln!("[replay-debug] seg={} expanded_entries={} path={}", command_log_segment_seq, expanded_len, segment_path.display());
+    cdc_debug_eprintln!(
+        "[replay-debug] seg={} expanded_entries={} path={}",
+        command_log_segment_seq,
+        expanded_len,
+        segment_path.display()
+    );
     let debug_callback = env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1");
     if debug_callback {
         let line = format!("[replay-entries] seg={command_log_segment_seq} raw={raw_entries_len} committed={committed_len} expanded={expanded_len} segment={}\n",
             segment_path.display());
         eprintln!("{}", line.trim_end());
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("C:\\tmp\\rust_debug.log")
+        {
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
         }
     }
     if entries.is_empty() {
+        trace_workflow_step("replay", format!("segment={} produced no committed rows; skip CDC replay", command_log_segment_seq));
         return Ok(ReplayOutput {
             entries: Vec::new(),
             events: Vec::new(),
@@ -3177,20 +3861,30 @@ fn replay_segment_with_native_cdc(
         });
     }
 
-    match NativeCdc::load() {
-        Ok(native) => {
+    trace_workflow_step("replay", format!("segment={} replaying {} committed entries into {}", command_log_segment_seq, entries.len(), cdc_log_path.display()));
+
+    {
             cdc_debug_eprintln!("[synclite-rust] native CDC library loaded");
             // Java parity: try to bring up a NativeCdcLogWriter so the cdclog
             // file is written via prepared statements + bindNativeValue. Fall
             // back to event-buffering + post-replay assembly if the writer
             // cannot be created (e.g. file permission or native error).
-            cdc_debug_eprintln!("[synclite-rust] native CDC writer init attempt for {}", cdc_log_path.display());
+            cdc_debug_eprintln!(
+                "[synclite-rust] native CDC writer init attempt for {}",
+                cdc_log_path.display()
+            );
             let writer_attempt = NativeCdcLogWriter::new(native.stmt_api(), cdc_log_path);
             match writer_attempt {
                 Ok(writer) => {
-                    cdc_debug_eprintln!("[synclite-rust] native CDC writer created for {}", cdc_log_path.display());
+                    cdc_debug_eprintln!(
+                        "[synclite-rust] native CDC writer created for {}",
+                        cdc_log_path.display()
+                    );
                     let writer_mutex = Mutex::new(writer);
-                    cdc_debug_eprintln!("[synclite-rust] native CDC replay starting for {}", cdc_log_path.display());
+                    cdc_debug_eprintln!(
+                        "[synclite-rust] native CDC replay starting for {}",
+                        cdc_log_path.display()
+                    );
                     let replay_res = native.replay(
                         replica_path,
                         &entries,
@@ -3200,31 +3894,51 @@ fn replay_segment_with_native_cdc(
                         Some(&writer_mutex),
                     );
                     // Always finalize the writer regardless of replay outcome.
-                    let writer = writer_mutex.into_inner().map_err(|_| {
-                        Error::Internal("cdclog writer mutex poisoned".into())
-                    })?;
+                    let writer = writer_mutex
+                        .into_inner()
+                        .map_err(|_| Error::Internal("cdclog writer mutex poisoned".into()))?;
                     let close_res = writer.close();
-                    cdc_debug_eprintln!("[synclite-rust] native CDC replay finished for {}", cdc_log_path.display());
+                    cdc_debug_eprintln!(
+                        "[synclite-rust] native CDC replay finished for {}",
+                        cdc_log_path.display()
+                    );
                     let events = match replay_res {
                         Ok(events) => events,
                         Err(err) => {
+                            trace_worker_error("native CDC replay", segment_path, &err);
                             cdc_debug_eprintln!("[synclite-rust] native replay failed: {err:?}");
                             return Err(err);
                         }
                     };
                     if let Err(err) = close_res {
+                        trace_worker_error("close native CDC writer", cdc_log_path, &err);
                         cdc_debug_eprintln!("[synclite-rust] native writer close failed: {err:?}");
                         return Err(err);
                     }
-                    cdc_debug_eprintln!("[synclite-rust] native CDC writer closed for {}", cdc_log_path.display());
+                    cdc_debug_eprintln!(
+                        "[synclite-rust] native CDC writer closed for {}",
+                        cdc_log_path.display()
+                    );
                     if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
                         let n = Connection::open(cdc_log_path)
-                            .and_then(|c| c.query_row("SELECT COUNT(*) FROM cdclog", [], |r| r.get::<_, i64>(0)))
+                            .and_then(|c| {
+                                c.query_row("SELECT COUNT(*) FROM cdclog", [], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                            })
                             .map(|n| n.to_string())
                             .unwrap_or_else(|e| format!("err: {e}"));
-                        let line = format!("[cdclog-after-close] cdclog rows={} ({})\n", n, cdc_log_path.display());
+                        let line = format!(
+                            "[cdclog-after-close] cdclog rows={} ({})\n",
+                            n,
+                            cdc_log_path.display()
+                        );
                         eprintln!("{}", line.trim_end());
-                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                        if let Ok(mut f) = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("C:\\tmp\\rust_debug.log")
+                        {
                             use std::io::Write;
                             let _ = f.write_all(line.as_bytes());
                         }
@@ -3236,11 +3950,14 @@ fn replay_segment_with_native_cdc(
                     })
                 }
                 Err(writer_err) => {
-                    cdc_debug_eprintln!("[synclite-rust] native CDC writer init failed: {writer_err:?}");
+                    cdc_debug_eprintln!(
+                        "[synclite-rust] native CDC writer init failed: {writer_err:?}"
+                    );
                     tracing::warn!(
                         error = %writer_err,
                         "NativeCdcLogWriter init failed; falling back to legacy cdclog writer"
                     );
+                    trace_worker_error("initialize native CDC writer (captured-event fallback)", cdc_log_path, &writer_err);
                     let events = match native.replay(
                         replica_path,
                         &entries,
@@ -3251,7 +3968,10 @@ fn replay_segment_with_native_cdc(
                     ) {
                         Ok(events) => events,
                         Err(err) => {
-                            cdc_debug_eprintln!("[synclite-rust] native replay fallback failed: {err:?}");
+                            trace_worker_error("native CDC captured-event replay", segment_path, &err);
+                            cdc_debug_eprintln!(
+                                "[synclite-rust] native replay fallback failed: {err:?}"
+                            );
                             return Err(err);
                         }
                     };
@@ -3262,19 +3982,6 @@ fn replay_segment_with_native_cdc(
                     })
                 }
             }
-        }
-        Err(load_err) => {
-            cdc_debug_eprintln!("[synclite-rust] native CDC library load failed: {load_err:?}");
-            tracing::warn!(
-                error = %load_err,
-                "libsynclitecdc not loaded; SQL replicator replay skipped and segment will use compatibility CDC artifact"
-            );
-            Ok(ReplayOutput {
-                entries,
-                events: Vec::new(),
-                writer_used: false,
-            })
-        }
     }
 }
 
@@ -3293,7 +4000,8 @@ fn expand_replay_txn_entries(
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         if entry.sql.trim_start().eq_ignore_ascii_case("REPLAY_TXN") {
-            let sidecar = replay_txn_sidecar_path(segment_path, segment_seq as u64, entry.commit_id as u64);
+            let sidecar =
+                replay_txn_sidecar_path(segment_path, segment_seq as u64, entry.commit_id as u64);
             if !sidecar.exists() {
                 return Err(Error::Config(format!(
                     "consolidator: missing txn sidecar for REPLAY_TXN marker: {}",
@@ -3357,7 +4065,10 @@ fn retain_committed_entries(entries: Vec<SegmentEntry>) -> Vec<SegmentEntry> {
         .into_iter()
         .filter(|entry| {
             matches!(
-                fates.get(&entry.commit_id).copied().unwrap_or(TxnFate::Unknown),
+                fates
+                    .get(&entry.commit_id)
+                    .copied()
+                    .unwrap_or(TxnFate::Unknown),
                 TxnFate::Commit
             )
         })
@@ -3444,7 +4155,9 @@ fn read_replica_resume_checkpoint(replica_path: &Path) -> Result<Option<ReplicaR
     }
 }
 
-fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Option<DestinationResumeCheckpoint>> {
+fn read_destination_resume_checkpoint(
+    layout: &ConsolidatorLayout,
+) -> Result<Option<DestinationResumeCheckpoint>> {
     let sql = "SELECT cdc_log_segment_sequence_number, cdc_change_number \
                FROM synclite_checkpoint \
                WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 \
@@ -3511,8 +4224,7 @@ fn read_destination_resume_checkpoint(layout: &ConsolidatorLayout) -> Result<Opt
             }
         }
         DstType::Postgres => {
-            let conn_str = build_postgres_connection_string(layout);
-            let mut client = PgClient::connect(&conn_str, NoTls).map_err(map_pg_err)?;
+            let mut client = connect_postgres(layout)?;
             // Brand-new destination: the consolidator-owned bookkeeping
             // tables (`synclite_checkpoint` et al.) only get CREATEd on
             // the first successful apply via `ensure_postgres_metadata_seeded`.
@@ -3625,7 +4337,11 @@ fn write_cdclog_segment(
         std::fs::remove_file(cdclog_path)?;
     }
 
-    cdc_debug_eprintln!("[debug-cdclog] writing {} with {} entries", cdclog_path.display(), entries.len());
+    cdc_debug_eprintln!(
+        "[debug-cdclog] writing {} with {} entries",
+        cdclog_path.display(),
+        entries.len()
+    );
 
     let conn = Connection::open(cdclog_path).map_err(map_sql_err)?;
     let max_entry_arg_cnt = entries.iter().map(|e| e.args.len()).max().unwrap_or(0);
@@ -3645,7 +4361,8 @@ fn write_cdclog_segment(
          );"
     );
 
-    conn.execute_batch(&create_cdclog_sql).map_err(map_sql_err)?;
+    conn.execute_batch(&create_cdclog_sql)
+        .map_err(map_sql_err)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS cdclog_schemas(\
          change_number INTEGER, database_name TEXT, schema_name TEXT, table_name TEXT,\
@@ -3946,7 +4663,8 @@ fn emit_cdclog_row(
     vals.push(SqlValue::Integer(args.len() as i64));
     vals.extend(args.iter().cloned());
 
-    conn.execute(&sql, params_from_iter(vals)).map_err(map_sql_err)?;
+    conn.execute(&sql, params_from_iter(vals))
+        .map_err(map_sql_err)?;
     Ok(())
 }
 
@@ -4067,7 +4785,11 @@ fn parse_alter_add_column_name(sql: &str) -> Option<String> {
         .trim_matches('[')
         .trim_matches(']')
         .trim_end_matches(';');
-    if col.is_empty() { None } else { Some(col.to_string()) }
+    if col.is_empty() {
+        None
+    } else {
+        Some(col.to_string())
+    }
 }
 
 fn parse_alter_drop_column_name(sql: &str) -> Option<String> {
@@ -4083,7 +4805,11 @@ fn parse_alter_drop_column_name(sql: &str) -> Option<String> {
         .trim_matches('[')
         .trim_matches(']')
         .trim_end_matches(';');
-    if col.is_empty() { None } else { Some(col.to_string()) }
+    if col.is_empty() {
+        None
+    } else {
+        Some(col.to_string())
+    }
 }
 
 fn parse_alter_rename_column_names(sql: &str) -> Option<(String, String)> {
@@ -4105,7 +4831,13 @@ fn parse_alter_rename_table_name(sql: &str) -> Option<String> {
     let upper = sql.to_ascii_uppercase();
     let idx = upper.find(" RENAME TO ")?;
     let rest = sql[idx + " RENAME TO ".len()..].trim();
-    let new_tbl = normalize_identifier_name(&rest.split_whitespace().next().unwrap_or("").trim_end_matches(';'));
+    let new_tbl = normalize_identifier_name(
+        &rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';'),
+    );
     let new_tbl = new_tbl.split('.').last().unwrap_or(&new_tbl);
     if new_tbl.is_empty() {
         None
@@ -4130,17 +4862,40 @@ fn build_callback_sql(ev: &CdcEvent, fallback_sql: &str, columns: &[String]) -> 
     }
     if ev.op_type.eq_ignore_ascii_case("UPDATE") && arg_len % 2 == 0 && arg_len > 0 {
         let n = arg_len / 2;
-        let cols = if columns.len() >= n { &columns[..n] } else { &[] };
+        let cols = if columns.len() >= n {
+            &columns[..n]
+        } else {
+            &[]
+        };
         if !cols.is_empty() {
-            let set_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(", ");
-            let where_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(" AND ");
-            return format!("UPDATE {} SET {} WHERE {}", ev.table_name, set_clause, where_clause);
+            let set_clause = cols
+                .iter()
+                .map(|c| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let where_clause = cols
+                .iter()
+                .map(|c| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            return format!(
+                "UPDATE {} SET {} WHERE {}",
+                ev.table_name, set_clause, where_clause
+            );
         }
     }
     if ev.op_type.eq_ignore_ascii_case("DELETE") && arg_len > 0 {
-        let cols = if columns.len() >= arg_len { &columns[..arg_len] } else { &[] };
+        let cols = if columns.len() >= arg_len {
+            &columns[..arg_len]
+        } else {
+            &[]
+        };
         if !cols.is_empty() {
-            let where_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(" AND ");
+            let where_clause = cols
+                .iter()
+                .map(|c| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             return format!("DELETE FROM {} WHERE {}", ev.table_name, where_clause);
         }
     }
@@ -4583,8 +5338,16 @@ unsafe extern "C" fn native_change_callback(
             commit_id,
             op_type: op,
             table_name: table,
-            before_count: if before_count > 0 { before_count as usize } else { 0 },
-            after_count: if after_count > 0 { after_count as usize } else { 0 },
+            before_count: if before_count > 0 {
+                before_count as usize
+            } else {
+                0
+            },
+            after_count: if after_count > 0 {
+                after_count as usize
+            } else {
+                0
+            },
             args,
         }),
         Err(_) => return 1,
@@ -4617,17 +5380,37 @@ fn build_callback_sql_from_pointers(
         return format!("INSERT INTO {} VALUES ({})", table, placeholders);
     }
     if op_upper == "UPDATE" && before_len > 0 && after_len > 0 {
-        let cols = if columns.len() >= after_len { &columns[..after_len] } else { &[][..] };
+        let cols = if columns.len() >= after_len {
+            &columns[..after_len]
+        } else {
+            &[][..]
+        };
         if !cols.is_empty() {
-            let set_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(", ");
-            let where_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(" AND ");
+            let set_clause = cols
+                .iter()
+                .map(|c| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let where_clause = cols
+                .iter()
+                .map(|c| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             return format!("UPDATE {} SET {} WHERE {}", table, set_clause, where_clause);
         }
     }
     if op_upper == "DELETE" && before_len > 0 {
-        let cols = if columns.len() >= before_len { &columns[..before_len] } else { &[][..] };
+        let cols = if columns.len() >= before_len {
+            &columns[..before_len]
+        } else {
+            &[][..]
+        };
         if !cols.is_empty() {
-            let where_clause = cols.iter().map(|c| format!("{c} = ?")).collect::<Vec<_>>().join(" AND ");
+            let where_clause = cols
+                .iter()
+                .map(|c| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             return format!("DELETE FROM {} WHERE {}", table, where_clause);
         }
     }
@@ -4639,7 +5422,11 @@ fn cstr_to_string(ptr: *const c_char) -> Option<String> {
         return None;
     }
     // SAFETY: pointer is expected to reference a null-terminated UTF-8/bytes string.
-    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+    Some(
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn read_native_values(
@@ -4670,7 +5457,11 @@ fn read_native_values(
                 if txt.is_null() {
                     SqlValue::Null
                 } else {
-                    SqlValue::Text(unsafe { CStr::from_ptr(txt) }.to_string_lossy().into_owned())
+                    SqlValue::Text(
+                        unsafe { CStr::from_ptr(txt) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 }
             }
             4 => {
@@ -4680,9 +5471,8 @@ fn read_native_values(
                     SqlValue::Blob(Vec::new())
                 } else {
                     // SAFETY: value_blob returns pointer valid for callback duration.
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(blob_ptr as *const u8, len as usize)
-                    };
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(blob_ptr as *const u8, len as usize) };
                     SqlValue::Blob(bytes.to_vec())
                 }
             }
@@ -4702,37 +5492,63 @@ fn read_native_values(
 
 impl NativeCdc {
     fn load() -> Result<Self> {
-        for candidate in candidate_native_library_paths() {
+        Self::load_candidates(candidate_native_library_paths())
+    }
+
+    fn load_candidates(candidates: Vec<PathBuf>) -> Result<Self> {
+        let mut failures = Vec::new();
+        for candidate in &candidates {
             // SAFETY: Library is kept alive in the struct while symbols are used.
             let lib = unsafe { Library::new(&candidate) };
-            let Ok(lib) = lib else {
-                continue;
+            let lib = match lib {
+                Ok(lib) => lib,
+                Err(e) => {
+                    failures.push(format!("{}: {e}", candidate.display()));
+                    continue;
+                }
             };
 
+            let loaded: Result<Self> = (|| {
             // SAFETY: Symbol signatures match the C ABI contract in RustBindings.java.
             unsafe {
                 let open = *lib
-                    .get::<unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> c_int>(b"synclite_rs_open\0")
+                    .get::<unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> c_int>(
+                        b"synclite_rs_open\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_open: {e}")))?;
                 let close = *lib
                     .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_close\0")
                     .map_err(|e| Error::Internal(format!("load synclite_rs_close: {e}")))?;
                 let exec = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int>(b"synclite_rs_exec\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int>(
+                        b"synclite_rs_exec\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_exec: {e}")))?;
                 let errmsg = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void) -> *const c_char>(b"synclite_rs_errmsg\0")
+                    .get::<unsafe extern "C" fn(*mut c_void) -> *const c_char>(
+                        b"synclite_rs_errmsg\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_errmsg: {e}")))?;
                 let set_change_callback = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, Option<NativeChangeCallback>, *mut c_void) -> c_int>(
-                        b"synclite_rs_set_change_callback\0",
-                    )
-                    .map_err(|e| Error::Internal(format!("load synclite_rs_set_change_callback: {e}")))?;
+                    .get::<unsafe extern "C" fn(
+                        *mut c_void,
+                        Option<NativeChangeCallback>,
+                        *mut c_void,
+                    ) -> c_int>(b"synclite_rs_set_change_callback\0")
+                    .map_err(|e| {
+                        Error::Internal(format!("load synclite_rs_set_change_callback: {e}"))
+                    })?;
                 let clear_change_callback = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_clear_change_callback\0")
-                    .map_err(|e| Error::Internal(format!("load synclite_rs_clear_change_callback: {e}")))?;
+                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(
+                        b"synclite_rs_clear_change_callback\0",
+                    )
+                    .map_err(|e| {
+                        Error::Internal(format!("load synclite_rs_clear_change_callback: {e}"))
+                    })?;
                 let value_type = *lib
-                    .get::<unsafe extern "C" fn(*const c_void) -> c_int>(b"synclite_rs_value_type\0")
+                    .get::<unsafe extern "C" fn(*const c_void) -> c_int>(
+                        b"synclite_rs_value_type\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_value_type: {e}")))?;
                 let value_int = *lib
                     .get::<unsafe extern "C" fn(*const c_void) -> c_int>(b"synclite_rs_value_int\0")
@@ -4741,13 +5557,19 @@ impl NativeCdc {
                     .get::<unsafe extern "C" fn(*const c_void) -> i64>(b"synclite_rs_value_int64\0")
                     .map_err(|e| Error::Internal(format!("load synclite_rs_value_int64: {e}")))?;
                 let value_double = *lib
-                    .get::<unsafe extern "C" fn(*const c_void) -> f64>(b"synclite_rs_value_double\0")
+                    .get::<unsafe extern "C" fn(*const c_void) -> f64>(
+                        b"synclite_rs_value_double\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_value_double: {e}")))?;
                 let value_text = *lib
-                    .get::<unsafe extern "C" fn(*const c_void) -> *const c_char>(b"synclite_rs_value_text\0")
+                    .get::<unsafe extern "C" fn(*const c_void) -> *const c_char>(
+                        b"synclite_rs_value_text\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_value_text: {e}")))?;
                 let value_blob = *lib
-                    .get::<unsafe extern "C" fn(*const c_void, *mut c_int) -> *const c_void>(b"synclite_rs_value_blob\0")
+                    .get::<unsafe extern "C" fn(*const c_void, *mut c_int) -> *const c_void>(
+                        b"synclite_rs_value_blob\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_value_blob: {e}")))?;
 
                 // Prepared-statement / bind surface (Java-parity write path).
@@ -4761,31 +5583,49 @@ impl NativeCdc {
                     .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_reset\0")
                     .map_err(|e| Error::Internal(format!("load synclite_rs_reset: {e}")))?;
                 let clear_bindings = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_clear_bindings\0")
-                    .map_err(|e| Error::Internal(format!("load synclite_rs_clear_bindings: {e}")))?;
+                    .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(
+                        b"synclite_rs_clear_bindings\0",
+                    )
+                    .map_err(|e| {
+                        Error::Internal(format!("load synclite_rs_clear_bindings: {e}"))
+                    })?;
                 let step = *lib
                     .get::<unsafe extern "C" fn(*mut c_void) -> c_int>(b"synclite_rs_step\0")
                     .map_err(|e| Error::Internal(format!("load synclite_rs_step: {e}")))?;
                 let bind_int = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int>(b"synclite_rs_bind_int\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int>(
+                        b"synclite_rs_bind_int\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_bind_int: {e}")))?;
                 let bind_int64 = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int, i64) -> c_int>(b"synclite_rs_bind_int64\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, i64) -> c_int>(
+                        b"synclite_rs_bind_int64\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_bind_int64: {e}")))?;
                 let bind_double = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int, f64) -> c_int>(b"synclite_rs_bind_double\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, f64) -> c_int>(
+                        b"synclite_rs_bind_double\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_bind_double: {e}")))?;
                 let bind_text = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int>(b"synclite_rs_bind_text\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int>(
+                        b"synclite_rs_bind_text\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_bind_text: {e}")))?;
                 let bind_blob = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int) -> c_int>(b"synclite_rs_bind_blob\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int) -> c_int>(
+                        b"synclite_rs_bind_blob\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_bind_blob: {e}")))?;
                 let bind_null = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int) -> c_int>(b"synclite_rs_bind_null\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int) -> c_int>(
+                        b"synclite_rs_bind_null\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_bind_null: {e}")))?;
                 let bind_value = *lib
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_void) -> c_int>(b"synclite_rs_bind_value\0")
+                    .get::<unsafe extern "C" fn(*mut c_void, c_int, *const c_void) -> c_int>(
+                        b"synclite_rs_bind_value\0",
+                    )
                     .map_err(|e| Error::Internal(format!("load synclite_rs_bind_value: {e}")))?;
 
                 return Ok(Self {
@@ -4816,11 +5656,17 @@ impl NativeCdc {
                     bind_value,
                 });
             }
+            })();
+            match loaded {
+                Ok(native) => return Ok(native),
+                Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+            }
         }
 
-        Err(Error::Internal(
-            "failed to load libsynclitecdc (synclitecdc_x86_64/synclitecdc_x86)".to_string(),
-        ))
+        Err(Error::Internal(format!(
+            "native CDC unavailable; install the matching-ABI SyncLite CDC sidecar beside the runtime or set SYNCLITE_CDC_LIB_DIR. Candidates: {}",
+            failures.join("; ")
+        )))
     }
 
     fn replay(
@@ -4847,16 +5693,16 @@ impl NativeCdc {
 
         self.exec_sql(
             db,
-                            "CREATE TABLE IF NOT EXISTS replay_checkpoint(\
+            "CREATE TABLE IF NOT EXISTS replay_checkpoint(\
                              commandlog_segment_sequence_number LONG NOT NULL,\
                              commit_id LONG NOT NULL,\
                              cdc_log_segment_sequence_number LONG NOT NULL\
                          )",
         )?;
 
-                // Older replicas may already have a 2-column replay_checkpoint.
-                // Add the CDC segment sequence column in place for restart correctness.
-                self.exec_sql_allow_duplicate_column(
+        // Older replicas may already have a 2-column replay_checkpoint.
+        // Add the CDC segment sequence column in place for restart correctness.
+        self.exec_sql_allow_duplicate_column(
                         db,
                         "ALTER TABLE replay_checkpoint ADD COLUMN cdc_log_segment_sequence_number LONG NOT NULL DEFAULT 0",
                 )?;
@@ -4870,11 +5716,18 @@ impl NativeCdc {
             match load_replica_table_columns(replica_path) {
                 Ok(m) => {
                     if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
-                        let summary: Vec<String> = m.iter().map(|(k, v)| format!("{}={}", k, v.len())).collect();
+                        let summary: Vec<String> = m
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", k, v.len()))
+                            .collect();
                         let line = format!("[replay-init-cols] seg={command_log_segment_seq} replica={} tables=[{}]\n",
                             replica_path.display(), summary.join(","));
                         eprintln!("{}", line.trim_end());
-                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                        if let Ok(mut f) = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("C:\\tmp\\rust_debug.log")
+                        {
                             use std::io::Write;
                             let _ = f.write_all(line.as_bytes());
                         }
@@ -4883,10 +5736,17 @@ impl NativeCdc {
                 }
                 Err(e) => {
                     if env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
-                        let line = format!("[replay-init-cols] seg={command_log_segment_seq} replica={} ERR={}\n",
-                            replica_path.display(), e);
+                        let line = format!(
+                            "[replay-init-cols] seg={command_log_segment_seq} replica={} ERR={}\n",
+                            replica_path.display(),
+                            e
+                        );
                         eprintln!("{}", line.trim_end());
-                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("C:\\tmp\\rust_debug.log") {
+                        if let Ok(mut f) = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("C:\\tmp\\rust_debug.log")
+                        {
                             use std::io::Write;
                             let _ = f.write_all(line.as_bytes());
                         }
@@ -4919,7 +5779,9 @@ impl NativeCdc {
         let ctx_ptr = Box::into_raw(ctx);
 
         // SAFETY: callback and context pointer are valid through replay.
-        let set_rc = unsafe { (self.set_change_callback)(db, Some(native_change_callback), ctx_ptr as *mut c_void) };
+        let set_rc = unsafe {
+            (self.set_change_callback)(db, Some(native_change_callback), ctx_ptr as *mut c_void)
+        };
         if set_rc != 0 {
             // SAFETY: ctx_ptr came from Box::into_raw above.
             let _ = unsafe { Box::from_raw(ctx_ptr) };
@@ -4941,17 +5803,16 @@ impl NativeCdc {
         // SAFETY: clear callback before dropping ctx.
         let clear_rc = unsafe { (self.clear_change_callback)(db) };
         if clear_rc != 0 {
-            tracing::warn!(rc = clear_rc, "synclite_rs_clear_change_callback returned non-zero");
+            tracing::warn!(
+                rc = clear_rc,
+                "synclite_rs_clear_change_callback returned non-zero"
+            );
         }
 
         // SAFETY: transfer ownership back and extract events.
         let ctx_box = unsafe { Box::from_raw(ctx_ptr) };
         let events = ctx_box.events.lock().map(|v| v.clone()).unwrap_or_default();
-        let callback_invocations = ctx_box
-            .callback_invocations
-            .lock()
-            .map(|v| *v)
-            .unwrap_or(0);
+        let callback_invocations = ctx_box.callback_invocations.lock().map(|v| *v).unwrap_or(0);
         let callback_ops = ctx_box
             .callback_ops
             .lock()
@@ -4985,7 +5846,9 @@ impl NativeCdc {
         }
         if let Ok(last_error) = ctx_box.last_error.lock() {
             if let Some(msg) = &*last_error {
-                return Err(Error::Internal(format!("native CDC callback failed: {msg}")));
+                return Err(Error::Internal(format!(
+                    "native CDC callback failed: {msg}"
+                )));
             }
         }
         Ok(events)
@@ -5054,7 +5917,12 @@ impl NativeCdc {
                     let ctx_ref = unsafe { &*ctx_ptr };
                     apply_replay_checkpoint_update(entry.commit_id)?;
                     self.exec_sql(db, "COMMIT")?;
-                    self.emit_txn_marker_via_writer(ctx_ref, "COMMITTRAN", "COMMIT", entry.commit_id)?;
+                    self.emit_txn_marker_via_writer(
+                        ctx_ref,
+                        "COMMITTRAN",
+                        "COMMIT",
+                        entry.commit_id,
+                    )?;
                     self.flush_writer_via_ctx(ctx_ref)?;
                     in_txn = false;
                 }
@@ -5099,15 +5967,22 @@ impl NativeCdc {
             if !ctx_ref.writer_ptr.is_null()
                 && !matches!(
                     op_type,
-                    "INSERT" | "UPDATE" | "DELETE"
-                        | "BEGINTRAN" | "COMMITTRAN" | "ROLLBACKTRAN" | "CHECKPOINTTRAN"
+                    "INSERT"
+                        | "UPDATE"
+                        | "DELETE"
+                        | "BEGINTRAN"
+                        | "COMMITTRAN"
+                        | "ROLLBACKTRAN"
+                        | "CHECKPOINTTRAN"
                         | "NOOP"
                 )
             {
                 self.emit_ddl_via_writer(ctx_ref, op_type, table_name.as_deref(), entry)?;
             }
 
-            let rendered = render_sql_with_args(&entry.sql, &entry.args);
+            // Replay always targets the native SQLite replica, even when
+            // the final destination is PostgreSQL or DuckDB.
+            let rendered = render_sql_with_args(&entry.sql, &entry.args, DstType::Sqlite);
             if !in_txn {
                 self.exec_sql(db, "BEGIN TRANSACTION")?;
                 in_txn = true;
@@ -5328,7 +6203,6 @@ impl NativeCdc {
         Ok(())
     }
 
-
     fn replay_staged_txn_sidecar(
         &self,
         db: *mut c_void,
@@ -5338,7 +6212,11 @@ impl NativeCdc {
         layout: &ConsolidatorLayout,
         ctx_ptr: *mut ReplayContext,
     ) -> Result<()> {
-        let sidecar = replay_txn_sidecar_path(segment_path, command_log_segment_seq as u64, commit_id as u64);
+        let sidecar = replay_txn_sidecar_path(
+            segment_path,
+            command_log_segment_seq as u64,
+            commit_id as u64,
+        );
         if !sidecar.exists() {
             return Err(Error::Config(format!(
                 "consolidator: missing txn sidecar for REPLAY_TXN marker: {}",
@@ -5391,15 +6269,20 @@ impl NativeCdc {
             if !ctx_ref.writer_ptr.is_null()
                 && !matches!(
                     op_type,
-                    "INSERT" | "UPDATE" | "DELETE"
-                        | "BEGINTRAN" | "COMMITTRAN" | "ROLLBACKTRAN" | "CHECKPOINTTRAN"
+                    "INSERT"
+                        | "UPDATE"
+                        | "DELETE"
+                        | "BEGINTRAN"
+                        | "COMMITTRAN"
+                        | "ROLLBACKTRAN"
+                        | "CHECKPOINTTRAN"
                         | "NOOP"
                 )
             {
                 self.emit_ddl_via_writer(ctx_ref, op_type, table_name.as_deref(), &entry)?;
             }
 
-            let rendered = render_sql_with_args(&entry.sql, &entry.args);
+            let rendered = render_sql_with_args(&entry.sql, &entry.args, DstType::Sqlite);
             self.exec_sql(db, &rendered)?;
         }
 
@@ -5412,7 +6295,8 @@ impl NativeCdc {
         // "SqlExecutor" since the Rust path uses the `postgres`/`rusqlite`
         // crates rather than JDBC.
         with_device_tracer(|t| tracer_debug!(t, "SqlExecutor", "SQL : {}", sql));
-        let c_sql = CString::new(sql).map_err(|e| Error::Internal(format!("sql contains NUL: {e}")))?;
+        let c_sql =
+            CString::new(sql).map_err(|e| Error::Internal(format!("sql contains NUL: {e}")))?;
         // SAFETY: db handle and SQL pointer are valid for call duration.
         let rc = unsafe { (self.exec)(db, c_sql.as_ptr()) };
         if rc == 0 {
@@ -5426,7 +6310,8 @@ impl NativeCdc {
     }
 
     fn exec_sql_allow_duplicate_column(&self, db: *mut c_void, sql: &str) -> Result<()> {
-        let c_sql = CString::new(sql).map_err(|e| Error::Internal(format!("sql contains NUL: {e}")))?;
+        let c_sql =
+            CString::new(sql).map_err(|e| Error::Internal(format!("sql contains NUL: {e}")))?;
         // SAFETY: db handle and SQL pointer are valid for call duration.
         let rc = unsafe { (self.exec)(db, c_sql.as_ptr()) };
         if rc == 0 {
@@ -5450,7 +6335,9 @@ impl NativeCdc {
             return String::new();
         }
         // SAFETY: pointer is expected to remain valid long enough for conversion.
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn stmt_api(&self) -> NativeStmtApi {
@@ -5576,7 +6463,8 @@ impl NativeCdcLogWriter {
              )",
         )?;
         writer.exec_sql("CREATE TABLE IF NOT EXISTS metadata(key TEXT, value TEXT)")?;
-        writer.exec_sql("CREATE INDEX IF NOT EXISTS commit_id_cdclog_index ON cdclog(commit_id)")?;
+        writer
+            .exec_sql("CREATE INDEX IF NOT EXISTS commit_id_cdclog_index ON cdclog(commit_id)")?;
         writer.exec_sql(
             "CREATE INDEX IF NOT EXISTS change_number_cdclog_schemas_index \
              ON cdclog_schemas(change_number)",
@@ -5618,7 +6506,8 @@ impl NativeCdcLogWriter {
         for i in (start_inclusive + 1)..=end_exclusive {
             let sql = format!("ALTER TABLE cdclog ADD COLUMN arg{i} BLOB");
             // Tolerate duplicates if a partial earlier run added the column.
-            let c = CString::new(sql.clone()).map_err(|e| Error::Internal(format!("ALTER NUL: {e}")))?;
+            let c = CString::new(sql.clone())
+                .map_err(|e| Error::Internal(format!("ALTER NUL: {e}")))?;
             let rc = unsafe { (self.api.exec)(self.db, c.as_ptr()) };
             if rc != SQLITE_OK {
                 let msg = self.errmsg().to_ascii_lowercase();
@@ -5653,11 +6542,13 @@ impl NativeCdcLogWriter {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!("INSERT INTO cdclog({cols}) VALUES ({placeholders})");
-        let sql_c = CString::new(sql.clone()).map_err(|e| Error::Internal(format!("prepare NUL: {e}")))?;
+        let sql_c =
+            CString::new(sql.clone()).map_err(|e| Error::Internal(format!("prepare NUL: {e}")))?;
 
         let mut stmt: *mut c_void = std::ptr::null_mut();
         // SAFETY: prepare writes new statement pointer.
-        let rc = unsafe { (self.api.prepare)(self.db, sql_c.as_ptr(), &mut stmt as *mut *mut c_void) };
+        let rc =
+            unsafe { (self.api.prepare)(self.db, sql_c.as_ptr(), &mut stmt as *mut *mut c_void) };
         if rc != SQLITE_OK || stmt.is_null() {
             return Err(Error::Internal(format!(
                 "cdclog prepare insert rc={rc}: {}",
@@ -5712,7 +6603,11 @@ impl NativeCdcLogWriter {
         if !self.in_txn {
             let r = self.exec_sql("BEGIN TRANSACTION");
             if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
-                eprintln!("[cdclog-writer] BEGIN ({}) -> {:?}", self.cdclog_path.display(), r.as_ref().map(|_| "ok"));
+                eprintln!(
+                    "[cdclog-writer] BEGIN ({}) -> {:?}",
+                    self.cdclog_path.display(),
+                    r.as_ref().map(|_| "ok")
+                );
             }
             r?;
             self.in_txn = true;
@@ -5724,7 +6619,11 @@ impl NativeCdcLogWriter {
         if self.in_txn {
             let r = self.exec_sql("COMMIT");
             if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
-                eprintln!("[cdclog-writer] COMMIT ({}) -> {:?}", self.cdclog_path.display(), r.as_ref().map(|_| "ok"));
+                eprintln!(
+                    "[cdclog-writer] COMMIT ({}) -> {:?}",
+                    self.cdclog_path.display(),
+                    r.as_ref().map(|_| "ok")
+                );
             }
             r?;
             self.in_txn = false;
@@ -5778,7 +6677,10 @@ impl NativeCdcLogWriter {
         // SAFETY: stmt is owned by writer.
         let rc = unsafe { (self.api.step)(stmt) };
         if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
-            eprintln!("[cdclog-writer] step_insert rc={rc} ({})", self.cdclog_path.display());
+            eprintln!(
+                "[cdclog-writer] step_insert rc={rc} ({})",
+                self.cdclog_path.display()
+            );
         }
         if rc != SQLITE_DONE && rc != SQLITE_OK {
             return Err(Error::Internal(format!(
@@ -5803,11 +6705,22 @@ impl NativeCdcLogWriter {
         column_schemas: &[CdcLogSchemaCol<'_>],
     ) -> Result<()> {
         self.begin_tran()?;
-        self.bind_metadata(commit_id, database, schema, table, op, sql_text, change_number, 0)?;
+        self.bind_metadata(
+            commit_id,
+            database,
+            schema,
+            table,
+            op,
+            sql_text,
+            change_number,
+            0,
+        )?;
         // All arg slots NULL for DDL.
         for i in 1..=self.arg_capacity {
             // SAFETY: bind_null with valid index.
-            let _ = unsafe { (self.api.bind_null)(self.insert_stmt, (Self::METADATA_BIND_COUNT + i) as c_int) };
+            let _ = unsafe {
+                (self.api.bind_null)(self.insert_stmt, (Self::METADATA_BIND_COUNT + i) as c_int)
+            };
         }
         self.step_insert()?;
 
@@ -5966,7 +6879,11 @@ impl NativeCdcLogWriter {
         // Best-effort: commit any open txn before tearing down statements.
         let r = self.commit_tran();
         if std::env::var("SYNCLITE_DEBUG_CDC_CALLBACK").ok().as_deref() == Some("1") {
-            eprintln!("[cdclog-writer] close commit -> {:?} ({})", r.as_ref().map(|_| "ok").map_err(|e| e.to_string()), self.cdclog_path.display());
+            eprintln!(
+                "[cdclog-writer] close commit -> {:?} ({})",
+                r.as_ref().map(|_| "ok").map_err(|e| e.to_string()),
+                self.cdclog_path.display()
+            );
         }
         let _ = r;
         if !self.insert_stmt.is_null() {
@@ -6053,15 +6970,36 @@ fn replay_txn_sidecar_path(segment_path: &Path, segment_seq: u64, commit_id: u64
 fn candidate_native_library_names() -> &'static [&'static str] {
     #[cfg(target_os = "windows")]
     {
-        &["synclitecdc_x86_64.dll", "synclitecdc_x86.dll", "synclitecdc_x86_64", "synclitecdc_x86"]
+        &[
+            "synclitecdc_x86_64.dll",
+            "synclitecdc_x86.dll",
+            "synclitecdc_x86_64",
+            "synclitecdc_x86",
+        ]
     }
     #[cfg(target_os = "linux")]
     {
-        &["libsynclitecdc_x86_64.so", "libsynclitecdc_x86.so", "synclitecdc_x86_64", "synclitecdc_x86"]
+        &[
+            "libsynclitecdc_x86_64.so",
+            "libsynclitecdc_x86.so",
+            "synclitecdc_x86_64",
+            "synclitecdc_x86",
+        ]
     }
     #[cfg(target_os = "macos")]
     {
-        &["libsynclitecdc_x86_64.dylib", "libsynclitecdc_x86.dylib", "synclitecdc_x86_64", "synclitecdc_x86"]
+        &[
+            "libsynclitecdc_x86_64.dylib",
+            "libsynclitecdc_x86.dylib",
+            "synclitecdc_x86_64",
+            "synclitecdc_x86",
+        ]
+    }
+    #[cfg(target_os = "android")]
+    {
+        // The AAR packages the same SONAME in each ABI's jni directory.
+        // Never use Android's stock libsqlite.so for the custom CDC ABI.
+        &["libsynclitecdc.so"]
     }
 }
 
@@ -6076,48 +7014,109 @@ fn candidate_native_library_paths() -> Vec<PathBuf> {
         }
     }
 
-    // Prefer Rust-workspace-local copied binaries when running from workspace roots.
-    for relative in ["native", "synclite-logger-rust/native", "../native", "../synclite-logger-rust/native"] {
-        let base = PathBuf::from(relative);
+    #[cfg(target_os = "android")]
+    {
+        // Android's application linker namespace knows nativeLibraryDir and
+        // APK!/lib/<abi> paths even when native libraries are not extracted.
+        // A bare SONAME lets dlopen resolve both; cwd/current_exe are not the
+        // application native-library directory (current_exe is often app_process).
         for name in names {
-            candidates.push(base.join(name));
+            candidates.push(PathBuf::from(name));
         }
+        return candidates;
     }
 
-    // Resolve from this crate location at compile-time.
-    // CARGO_MANIFEST_DIR => .../synclite-logger-rust/crates/consolidator/runtime
-    let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(workspace_root) = manifest_root.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-        let base = workspace_root.join("native");
-        for name in names {
-            candidates.push(base.join(name));
+    #[cfg(not(target_os = "android"))]
+    {
+        // Prefer Rust-workspace-local copied binaries when running from workspace roots.
+        for relative in [
+            "native",
+            "synclite-logger-rust/native",
+            "../native",
+            "../synclite-logger-rust/native",
+        ] {
+            let base = PathBuf::from(relative);
+            for name in names {
+                candidates.push(base.join(name));
+            }
         }
-    }
 
-    // Resolve relative to the test/binary executable path.
-    if let Ok(exe) = env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for relative in ["native", "../../native", "../../../native", "../../../../native"] {
-                let base = exe_dir.join(relative);
-                for name in names {
-                    candidates.push(base.join(name));
+        // Resolve from this crate location at compile-time.
+        // CARGO_MANIFEST_DIR => .../synclite-logger-rust/crates/consolidator/runtime
+        let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if let Some(workspace_root) = manifest_root
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            let base = workspace_root.join("native");
+            for name in names {
+                candidates.push(base.join(name));
+            }
+        }
+
+        // Resolve relative to the test/binary executable path.
+        if let Ok(exe) = env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                for relative in [
+                    "native",
+                    "../../native",
+                    "../../../native",
+                    "../../../../native",
+                ] {
+                    let base = exe_dir.join(relative);
+                    for name in names {
+                        candidates.push(base.join(name));
+                    }
                 }
             }
         }
-    }
 
-    for name in names {
-        candidates.push(PathBuf::from(name));
-    }
+        for name in names {
+            candidates.push(PathBuf::from(name));
+        }
 
-    candidates
+        candidates
+    }
 }
 
-fn mirror_stage_artifact_to_work(layout: &ConsolidatorLayout, stage_path: &Path) -> Result<PathBuf> {
+#[cfg(test)]
+mod native_library_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn custom_cdc_sonames_are_always_loader_candidates() {
+        let names = candidate_native_library_names();
+        assert!(!names.is_empty());
+        let paths = candidate_native_library_paths();
+        for name in names {
+            assert!(name.contains("synclitecdc"));
+            assert!(paths.contains(&PathBuf::from(name)));
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_uses_packaged_soname_not_desktop_or_stock_sqlite() {
+        assert_eq!(candidate_native_library_names(), &["libsynclitecdc.so"]);
+        let paths = candidate_native_library_paths();
+        assert_eq!(paths.last(), Some(&PathBuf::from("libsynclitecdc.so")));
+        // Only the explicit override (if present) may precede SONAME lookup.
+        assert!(paths.len() <= 2);
+    }
+}
+
+fn mirror_stage_artifact_to_work(
+    layout: &ConsolidatorLayout,
+    stage_path: &Path,
+) -> Result<PathBuf> {
     cdc_debug_eprintln!("[stage-debug] mirroring {}", stage_path.display());
-    let file_name = stage_path
-        .file_name()
-        .ok_or_else(|| Error::Config(format!("consolidator: invalid staged path {}", stage_path.display())))?;
+    let file_name = stage_path.file_name().ok_or_else(|| {
+        Error::Config(format!(
+            "consolidator: invalid staged path {}",
+            stage_path.display()
+        ))
+    })?;
 
     // The layout, not the name of the stage container, owns work placement.
     // Locking, replica replay, cleanup and restart discovery all use this dir.
@@ -6138,7 +7137,10 @@ fn mirror_stage_artifact_to_work(layout: &ConsolidatorLayout, stage_path: &Path)
     // authoritative. This handles the pause/resume race where the shipper
     // wins the cleanup before the consolidator drains a paused segment.
     if !stage_path.exists() && work_path.exists() {
-        cdc_debug_eprintln!("[stage-debug] using existing work copy {}", work_path.display());
+        cdc_debug_eprintln!(
+            "[stage-debug] using existing work copy {}",
+            work_path.display()
+        );
         // A final txn sidecar may arrive after the segment was removed from
         // stage. It must still reach the retained work copy on the next retry.
         if is_sqllog_path(stage_path) {
@@ -6154,10 +7156,17 @@ fn mirror_stage_artifact_to_work(layout: &ConsolidatorLayout, stage_path: &Path)
     // `on_shipped` callback notifies again after upload, and on restart
     // `catch_up_stage_dir` notifies any leftover stage files.
     if work_path.exists() && segment_metadata_status_is_applied(&work_path) {
-        cdc_debug_eprintln!("[stage-debug] work copy already applied {}", work_path.display());
+        cdc_debug_eprintln!(
+            "[stage-debug] work copy already applied {}",
+            work_path.display()
+        );
         return Ok(work_path);
     }
-    cdc_debug_eprintln!("[stage-debug] copying {} -> {}", stage_path.display(), work_path.display());
+    cdc_debug_eprintln!(
+        "[stage-debug] copying {} -> {}",
+        stage_path.display(),
+        work_path.display()
+    );
     std::fs::copy(stage_path, &work_path)?;
 
     // Java parity: if a sqllog segment is mirrored, mirror all matching
@@ -6237,7 +7246,8 @@ fn cleanup_processed_sqllog(
         return Ok(());
     }
 
-    let Some(applied_seq) = parse_segment_seq(work_path).or_else(|| parse_segment_seq(stage_path)) else {
+    let Some(applied_seq) = parse_segment_seq(work_path).or_else(|| parse_segment_seq(stage_path))
+    else {
         return Ok(());
     };
 
@@ -6290,12 +7300,20 @@ fn compute_min_applied_target(layout: &ConsolidatorLayout, progress: &CleanupPro
     if layout.all_dst_indexes.is_empty() {
         return -1;
     }
-    let Some(registry) = CLEANUP_PROGRESS.get() else { return -1 };
-    let Ok(registry) = registry.lock() else { return -1 };
-    let Some(peers) = registry.get(&progress.group) else { return -1 };
+    let Some(registry) = CLEANUP_PROGRESS.get() else {
+        return -1;
+    };
+    let Ok(registry) = registry.lock() else {
+        return -1;
+    };
+    let Some(peers) = registry.get(&progress.group) else {
+        return -1;
+    };
     let mut min_seq = progress.applied.load(Ordering::SeqCst);
     for dst in &layout.all_dst_indexes {
-        let Some(workers) = peers.get(dst) else { return -1 };
+        let Some(workers) = peers.get(dst) else {
+            return -1;
+        };
         let mut found = false;
         for worker in workers.iter().filter_map(Weak::upgrade) {
             found = true;
@@ -6454,8 +7472,13 @@ fn cleanup_stage_artifacts_up_to(
 }
 
 fn staged_segment_path_for_seq(reference_segment_path: &Path, seq: u64) -> PathBuf {
-    let parent = reference_segment_path.parent().unwrap_or_else(|| Path::new("."));
-    let extension = reference_segment_path.extension().and_then(|ext| ext.to_str()).unwrap_or("sqllog");
+    let parent = reference_segment_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let extension = reference_segment_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("sqllog");
     parent.join(format!("{seq}.{extension}"))
 }
 
@@ -6488,10 +7511,14 @@ fn is_apply_candidate_segment(path: &Path) -> bool {
 }
 
 fn last_txn_fate_decided(segment_path: &Path) -> Result<bool> {
-    let conn = Connection::open_with_flags(segment_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_sql_err)?;
-    conn.busy_timeout(Duration::from_millis(50)).map_err(map_sql_err)?;
+    let conn = Connection::open_with_flags(segment_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(map_sql_err)?;
+    conn.busy_timeout(Duration::from_millis(50))
+        .map_err(map_sql_err)?;
     let latest_commit: Option<i64> = conn
-        .query_row("SELECT MAX(commit_id) FROM commandlog", [], |row| row.get(0))
+        .query_row("SELECT MAX(commit_id) FROM commandlog", [], |row| {
+            row.get(0)
+        })
         .map_err(map_sql_err)?;
     let Some(commit_id) = latest_commit else {
         return Ok(true);
@@ -6540,7 +7567,8 @@ fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| std::io::Error::other("remove_file_with_retry: unknown failure")))
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::other("remove_file_with_retry: unknown failure")))
 }
 
 #[derive(Debug, Clone)]
@@ -6576,7 +7604,10 @@ struct CdcSchemaColumn {
     old_column_name: Option<String>,
 }
 
-fn read_segment_entries(seg_conn: &Connection, layout: &ConsolidatorLayout) -> Result<(i64, Vec<SegmentEntry>)> {
+fn read_segment_entries(
+    seg_conn: &Connection,
+    layout: &ConsolidatorLayout,
+) -> Result<(i64, Vec<SegmentEntry>)> {
     if has_table(seg_conn, "commandlog")? {
         return read_commandlog_entries(seg_conn, layout);
     }
@@ -6608,7 +7639,7 @@ fn apply_resume_filter(
     segment_path: &Path,
     layout: &ConsolidatorLayout,
 ) -> Result<()> {
-    if layout.metadata_store != MetadataStore::Destination {
+    if layout.metadata_store != MetadataStore::Destination && !is_sql_device(layout) {
         return Ok(());
     }
     let Some(segment_seq) = parse_segment_seq(segment_path).map(|v| v as i64) else {
@@ -6634,7 +7665,8 @@ fn read_segment_entries_with_resume_and_replica(
     layout: &ConsolidatorLayout,
     schema_replica: &mut Connection,
 ) -> Result<(i64, Vec<SegmentEntry>)> {
-    let (first_commit_id, mut entries) = read_segment_entries_with_replica(seg_conn, schema_replica)?;
+    let (first_commit_id, mut entries) =
+        read_segment_entries_with_replica(seg_conn, schema_replica)?;
     apply_resume_filter(&mut entries, segment_path, layout)?;
     Ok((first_commit_id, entries))
 }
@@ -6661,7 +7693,10 @@ fn has_table(conn: &Connection, table_name: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-fn read_commandlog_entries(seg_conn: &Connection, layout: &ConsolidatorLayout) -> Result<(i64, Vec<SegmentEntry>)> {
+fn read_commandlog_entries(
+    seg_conn: &Connection,
+    layout: &ConsolidatorLayout,
+) -> Result<(i64, Vec<SegmentEntry>)> {
     let mut schema_replica = seed_commandlog_schema_replica(layout)?;
     read_commandlog_entries_with_replica(seg_conn, &mut schema_replica)
 }
@@ -6678,7 +7713,9 @@ fn read_commandlog_entries_with_replica(
         .unwrap_or(0);
 
     let mut stmt = seg_conn
-        .prepare("SELECT change_number, commit_id, sql, arg_cnt FROM commandlog ORDER BY change_number")
+        .prepare(
+            "SELECT change_number, commit_id, sql, arg_cnt FROM commandlog ORDER BY change_number",
+        )
         .map_err(map_sql_err)?;
     let mut rows = stmt.query([]).map_err(map_sql_err)?;
     let mut last_sql: Option<String> = None;
@@ -6773,6 +7810,22 @@ fn seed_commandlog_schema_replica(layout: &ConsolidatorLayout) -> Result<Connect
 }
 
 fn load_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<Vec<(String, String)>> {
+    // The local working SQLite replica is authoritative and shared across
+    // destinations for transactional devices. An existing EMPTY replica is
+    // authoritative too: querying PostgreSQL here would add a remote dependency
+    // before native replay and may resurrect stale destination schema.
+    let path = if layout.is_transactional_device() {
+        resolve_replicator_replica_path(layout)?
+    } else {
+        layout.replica_path()
+    };
+    if path.is_file() {
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_sql_err)?;
+        let mut stmt = conn.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name").map_err(map_sql_err)?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(map_sql_err)?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(map_sql_err)?;
+        return Ok(rows);
+    }
     if layout.metadata_store == MetadataStore::Local {
         return load_local_seed_create_sql_rows(layout);
     }
@@ -6805,7 +7858,9 @@ fn load_local_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<Vec<(S
     Ok(rows)
 }
 
-fn load_destination_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<Vec<(String, String)>> {
+fn load_destination_seed_create_sql_rows(
+    layout: &ConsolidatorLayout,
+) -> Result<Vec<(String, String)>> {
     let query = "SELECT table_name, prop_value FROM synclite_consolidator_table_metadata \
         WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 AND prop_key = 'create_sql' \
         ORDER BY table_name";
@@ -6835,10 +7890,13 @@ fn load_destination_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<
             );
             let mut stmt = conn.prepare(&sql).map_err(map_duck_err)?;
             let mut rows = stmt
-                .query(duck_params_from_iter([
-                    DuckValue::Text(layout.device_id.clone()),
-                    DuckValue::Text(layout.device_name.clone()),
-                ].iter()))
+                .query(duck_params_from_iter(
+                    [
+                        DuckValue::Text(layout.device_id.clone()),
+                        DuckValue::Text(layout.device_name.clone()),
+                    ]
+                    .iter(),
+                ))
                 .map_err(map_duck_err)?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().map_err(map_duck_err)? {
@@ -6849,7 +7907,7 @@ fn load_destination_seed_create_sql_rows(layout: &ConsolidatorLayout) -> Result<
             Ok(out)
         }
         DstType::Postgres => {
-            let mut client = PgClient::connect(&layout.dst_connection_string, NoTls).map_err(map_pg_err)?;
+            let mut client = connect_postgres(layout)?;
             let meta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
             let sql = format!(
                 "SELECT table_name, prop_value FROM {meta} \
@@ -6879,7 +7937,13 @@ fn derive_commandlog_ddl_columns(
 ) -> Result<Vec<CdcSchemaColumn>> {
     let ddl_ops = matches!(
         op_type,
-        "CREATETABLE" | "ADDCOLUMN" | "ALTERCOLUMN" | "DROPCOLUMN" | "RENAMECOLUMN" | "RENAMETABLE" | "DROPTABLE"
+        "CREATETABLE"
+            | "ADDCOLUMN"
+            | "ALTERCOLUMN"
+            | "DROPCOLUMN"
+            | "RENAMECOLUMN"
+            | "RENAMETABLE"
+            | "DROPTABLE"
     );
     if !ddl_ops {
         return Ok(Vec::new());
@@ -6902,8 +7966,7 @@ fn derive_commandlog_ddl_columns(
     }
 
     let effective_table = if op_type == "RENAMETABLE" {
-        parse_alter_rename_table_name(sql)
-            .or_else(|| table_name.map(|t| t.to_string()))
+        parse_alter_rename_table_name(sql).or_else(|| table_name.map(|t| t.to_string()))
     } else {
         table_name.map(|t| t.to_string())
     };
@@ -6920,7 +7983,11 @@ fn derive_commandlog_ddl_columns(
     if op_type == "ADDCOLUMN" {
         if let Some(parsed) = parse_add_column_column(sql) {
             let name = parsed.column_name.to_ascii_lowercase();
-            if let Some(found) = cols.iter().find(|c| c.column_name.eq_ignore_ascii_case(&name)).cloned() {
+            if let Some(found) = cols
+                .iter()
+                .find(|c| c.column_name.eq_ignore_ascii_case(&name))
+                .cloned()
+            {
                 return Ok(vec![found]);
             }
         }
@@ -6928,7 +7995,10 @@ fn derive_commandlog_ddl_columns(
     Ok(cols)
 }
 
-fn fetch_schema_columns_from_replica(replica: &Connection, table_name: &str) -> Result<Vec<CdcSchemaColumn>> {
+fn fetch_schema_columns_from_replica(
+    replica: &Connection,
+    table_name: &str,
+) -> Result<Vec<CdcSchemaColumn>> {
     let sqlite_table = table_name
         .trim()
         .trim_matches('"')
@@ -7192,10 +8262,18 @@ fn read_cdclog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEntry>)
         let op_type: Option<String> = row.get(5).map_err(map_sql_err)?;
         let ddl_columns = if op_type
             .as_deref()
-            .map(|op| matches!(
-                op.to_ascii_uppercase().as_str(),
-                "CREATETABLE" | "ADDCOLUMN" | "DROPCOLUMN" | "RENAMECOLUMN" | "RENAMETABLE" | "ALTERCOLUMN" | "DROPTABLE"
-            ))
+            .map(|op| {
+                matches!(
+                    op.to_ascii_uppercase().as_str(),
+                    "CREATETABLE"
+                        | "ADDCOLUMN"
+                        | "DROPCOLUMN"
+                        | "RENAMECOLUMN"
+                        | "RENAMETABLE"
+                        | "ALTERCOLUMN"
+                        | "DROPTABLE"
+                )
+            })
             .unwrap_or(false)
         {
             read_cdclog_schema_columns(seg_conn, change_number)?
@@ -7257,7 +8335,10 @@ fn read_cdclog_entries(seg_conn: &Connection) -> Result<(i64, Vec<SegmentEntry>)
     Ok((first_commit_id, entries))
 }
 
-fn read_cdclog_schema_columns(seg_conn: &Connection, change_number: i64) -> Result<Vec<CdcSchemaColumn>> {
+fn read_cdclog_schema_columns(
+    seg_conn: &Connection,
+    change_number: i64,
+) -> Result<Vec<CdcSchemaColumn>> {
     let mut stmt = seg_conn
         .prepare(
             "SELECT column_index, column_name, column_type, column_primary_key, old_table_name, old_column_name \
@@ -7269,9 +8350,15 @@ fn read_cdclog_schema_columns(seg_conn: &Connection, change_number: i64) -> Resu
     while let Some(row) = rows.next().map_err(map_sql_err)? {
         let col = CdcSchemaColumn {
             column_index: row.get(0).map_err(map_sql_err)?,
-            column_name: row.get::<_, Option<String>>(1).map_err(map_sql_err)?.unwrap_or_default(),
+            column_name: row
+                .get::<_, Option<String>>(1)
+                .map_err(map_sql_err)?
+                .unwrap_or_default(),
             column_type: row.get(2).map_err(map_sql_err)?,
-            column_primary_key: row.get::<_, Option<i64>>(3).map_err(map_sql_err)?.unwrap_or(0),
+            column_primary_key: row
+                .get::<_, Option<i64>>(3)
+                .map_err(map_sql_err)?
+                .unwrap_or(0),
             old_table_name: row.get(4).map_err(map_sql_err)?,
             old_column_name: row.get(5).map_err(map_sql_err)?,
         };
@@ -7280,7 +8367,10 @@ fn read_cdclog_schema_columns(seg_conn: &Connection, change_number: i64) -> Resu
     Ok(cols)
 }
 
-fn apply_staged_segment_with_retry(layout: &ConsolidatorLayout, segment_path: &Path) -> Result<ApplyProgress> {
+fn apply_staged_segment_with_retry(
+    layout: &ConsolidatorLayout,
+    segment_path: &Path,
+) -> Result<ApplyProgress> {
     with_device_tracer(|t| {
         tracer_info!(
             t,
@@ -7346,7 +8436,8 @@ fn apply_staged_segment_with_retry(layout: &ConsolidatorLayout, segment_path: &P
             }
         }
     }
-    let err = last_err.unwrap_or_else(|| Error::Config("consolidator: unknown apply error".to_string()));
+    let err =
+        last_err.unwrap_or_else(|| Error::Config("consolidator: unknown apply error".to_string()));
     // `dst-skip-failed-log-files=true` is for poison-pill segments
     // (genuinely non-retriable errors: syntax, missing table/column,
     // unresolvable constraint, etc.) where advancing past the segment
@@ -7403,7 +8494,10 @@ fn apply_staged_segment_with_retry(layout: &ConsolidatorLayout, segment_path: &P
     Err(err)
 }
 
-fn apply_staged_segment_once(layout: &ConsolidatorLayout, segment_path: &Path) -> Result<ApplyProgress> {
+fn apply_staged_segment_once(
+    layout: &ConsolidatorLayout,
+    segment_path: &Path,
+) -> Result<ApplyProgress> {
     let seg_conn = Connection::open(segment_path).map_err(map_sql_err)?;
     // Java parity (`DeviceSyncProcessor.inMemoryReplicaConn`): the schema
     // replica is owned by the worker thread for the lifetime of the
@@ -7412,8 +8506,12 @@ fn apply_staged_segment_once(layout: &ConsolidatorLayout, segment_path: &Path) -
     // segment reuses the accumulated CREATE TABLE / ALTER TABLE state.
     let mut guard = acquire_schema_replica(layout)?;
     let schema_replica = guard.as_mut();
-    let (first_commit_id, entries) =
-        read_segment_entries_with_resume_and_replica(&seg_conn, segment_path, layout, schema_replica)?;
+    let (first_commit_id, entries) = read_segment_entries_with_resume_and_replica(
+        &seg_conn,
+        segment_path,
+        layout,
+        schema_replica,
+    )?;
     // DuckDB-family devices stage per-transaction records into a
     // `.sqllog.{commit}.txn` sidecar; the main segment only carries
     // BEGIN/COMMIT/REPLAY_TXN markers. The SQL-device path expands these
@@ -7454,7 +8552,9 @@ fn apply_staged_segment_once(layout: &ConsolidatorLayout, segment_path: &Path) -
         // Java parity: every successful segment apply updates
         // last_consolidated_cdc_log_segment_seq_num in the consolidator
         // metadata store (LOCAL file or destination synclite_consolidator_metadata).
-        if let Err(e) = consolidator_state::record_consolidated_cdc_seq(layout, layout.dst_index, seq as i64) {
+        if let Err(e) =
+            consolidator_state::record_consolidated_cdc_seq(layout, layout.dst_index, seq as i64)
+        {
             tracing::warn!(error = %e, seq, "failed to record consolidated cdc seq in metadata");
         }
     }
@@ -7479,7 +8579,9 @@ fn apply_to_sqlite_destination(
     if layout.metadata_store == MetadataStore::Destination {
         ensure_sqlite_metadata_seeded(&dst_conn, layout, first_commit_id)?;
     }
-    dst_conn.execute_batch("BEGIN IMMEDIATE;").map_err(map_sql_err)?;
+    dst_conn
+        .execute_batch("BEGIN IMMEDIATE;")
+        .map_err(map_sql_err)?;
 
     let mut progress = ApplyProgress {
         applied_change: -1,
@@ -7588,12 +8690,17 @@ fn apply_to_sqlite_destination(
             }
         } else {
             let exec_result = match sql_generator.generate(cached) {
-                GeneratedSql::Parameterized { sql, args } => dst_conn.execute(sql, params_from_iter(args.iter())),
+                GeneratedSql::Parameterized { sql, args } => {
+                    dst_conn.execute(sql, params_from_iter(args.iter()))
+                }
                 GeneratedSql::Text(_) => unreachable!("sqlite path must use parameterized SQL"),
             };
 
             if let Err(e) = exec_result {
-                if layout.dst_idempotent_data_ingestion && mapped.kind == DmlKind::Insert && is_sqlite_duplicate_err(&e) {
+                if layout.dst_idempotent_data_ingestion
+                    && mapped.kind == DmlKind::Insert
+                    && is_sqlite_duplicate_err(&e)
+                {
                     tracing::warn!(change_number = mapped.change_number, error = %e, "idempotent ingest ignored failed insert");
                 } else if layout.dst_set_unparsable_values_to_null
                     && matches!(mapped.kind, DmlKind::Insert | DmlKind::Update)
@@ -7776,14 +8883,18 @@ fn apply_to_duckdb_destination(
         } else {
             let exec_result = match sql_generator.generate(cached) {
                 GeneratedSql::Parameterized { sql, args } => {
-                    let duck_vals: Vec<DuckValue> = args.iter().map(sqlvalue_to_duckvalue).collect();
+                    let duck_vals: Vec<DuckValue> =
+                        args.iter().map(sqlvalue_to_duckvalue).collect();
                     duck_exec_with_params(&dst_conn, sql, &duck_vals)
                 }
                 GeneratedSql::Text(_) => unreachable!("duckdb path must use parameterized SQL"),
             };
 
             if let Err(e) = exec_result {
-                if layout.dst_idempotent_data_ingestion && mapped.kind == DmlKind::Insert && is_duckdb_duplicate_insert_err(&e) {
+                if layout.dst_idempotent_data_ingestion
+                    && mapped.kind == DmlKind::Insert
+                    && is_duckdb_duplicate_insert_err(&e)
+                {
                     tracing::warn!(change_number = mapped.change_number, error = %e, "idempotent ingest ignored failed insert");
                 } else if layout.dst_set_unparsable_values_to_null
                     && matches!(mapped.kind, DmlKind::Insert | DmlKind::Update)
@@ -7833,7 +8944,10 @@ fn apply_to_duckdb_destination(
     Ok(progress)
 }
 
-fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &ConsolidatorLayout) -> Result<()> {
+fn sync_sqlite_destination_metadata(
+    dest_conn: &Connection,
+    layout: &ConsolidatorLayout,
+) -> Result<()> {
     ensure_sqlite_metadata_init_status_column(dest_conn)?;
     dest_conn
         .execute(
@@ -7887,7 +9001,10 @@ fn sync_sqlite_destination_metadata(dest_conn: &Connection, layout: &Consolidato
     Ok(())
 }
 
-fn sync_sqlite_local_metadata_create_sql(dest_conn: &Connection, layout: &ConsolidatorLayout) -> Result<()> {
+fn sync_sqlite_local_metadata_create_sql(
+    dest_conn: &Connection,
+    layout: &ConsolidatorLayout,
+) -> Result<()> {
     let meta_path = layout.consolidator_metadata_path(layout.dst_index);
     let meta_conn = Connection::open(&meta_path).map_err(map_sql_err)?;
     meta_conn
@@ -7959,10 +9076,13 @@ fn ensure_sqlite_metadata_init_status_column(dest_conn: &Connection) -> Result<(
 /// an in-memory SQLite and reads back column shape via `PRAGMA table_info`,
 /// so name + type + NOT NULL + PRIMARY KEY are sufficient (matches Java's
 /// `buildCreateSqlFromColumns` shape).
-fn sync_duckdb_destination_metadata(dest_conn: &DuckConnection, layout: &ConsolidatorLayout) -> Result<()> {
+fn sync_duckdb_destination_metadata(
+    dest_conn: &DuckConnection,
+    layout: &ConsolidatorLayout,
+) -> Result<()> {
     let meta = duck_meta_table(layout, "synclite_checkpoint");
     let ctmeta = duck_meta_table(layout, "synclite_consolidator_table_metadata");
-    
+
     let upd_sql = format!(
         "UPDATE {} SET initialization_status = 1 WHERE synclite_device_id = ? AND synclite_device_name = ?",
         meta
@@ -8036,7 +9156,10 @@ fn sync_duckdb_destination_metadata(dest_conn: &DuckConnection, layout: &Consoli
     Ok(())
 }
 
-fn sync_duckdb_local_metadata_create_sql(dest_conn: &DuckConnection, layout: &ConsolidatorLayout) -> Result<()> {
+fn sync_duckdb_local_metadata_create_sql(
+    dest_conn: &DuckConnection,
+    layout: &ConsolidatorLayout,
+) -> Result<()> {
     let meta_path = layout.consolidator_metadata_path(layout.dst_index);
     let meta_conn = Connection::open(&meta_path).map_err(map_sql_err)?;
     meta_conn
@@ -8092,11 +9215,12 @@ fn build_create_sql_from_duckdb_columns(conn: &DuckConnection, table: &str) -> R
     while let Some(row) = rows.next().map_err(map_duck_err)? {
         let name: String = row.get(1).map_err(map_duck_err)?;
         let ty: String = row.get(2).map_err(map_duck_err)?;
-        let notnull: i64 = row.get(3).map_err(map_duck_err)?;
-        let pk: i64 = row.get(5).map_err(map_duck_err)?;
-        cols.push((name.clone(), ty, notnull != 0));
-        if pk > 0 {
-            pks.push((pk, name));
+        let notnull: bool = row.get(3).map_err(map_duck_err)?;
+        let pk: bool = row.get(5).map_err(map_duck_err)?;
+        cols.push((name.clone(), ty, notnull));
+        if pk {
+            let cid: i64 = row.get(0).map_err(map_duck_err)?;
+            pks.push((cid, name));
         }
     }
     pks.sort_by_key(|(o, _)| *o);
@@ -8129,7 +9253,10 @@ fn build_create_sql_from_duckdb_columns(conn: &DuckConnection, table: &str) -> R
 /// `sync_sqlite_destination_metadata` / `sync_duckdb_destination_metadata`.
 /// Synthesizes a SQLite-parseable CREATE TABLE from `information_schema.columns`
 /// + `pg_index` PK info.
-fn sync_postgres_destination_metadata(client: &mut PgClient, layout: &ConsolidatorLayout) -> Result<()> {
+fn sync_postgres_destination_metadata(
+    client: &mut PgClient,
+    layout: &ConsolidatorLayout,
+) -> Result<()> {
     let meta = pg_meta_table(layout, "synclite_checkpoint");
     let ctmeta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
 
@@ -8190,14 +9317,23 @@ fn sync_postgres_destination_metadata(client: &mut PgClient, layout: &Consolidat
         client
             .execute(
                 ins_sql.as_str(),
-                &[&layout.device_id, &layout.device_name, &ts, &tbl, &create_sql],
+                &[
+                    &layout.device_id,
+                    &layout.device_name,
+                    &ts,
+                    &tbl,
+                    &create_sql,
+                ],
             )
             .map_err(|e| map_pg_err_with_sql(e, &ins_sql))?;
     }
     Ok(())
 }
 
-fn sync_postgres_local_metadata_create_sql(client: &mut PgClient, layout: &ConsolidatorLayout) -> Result<()> {
+fn sync_postgres_local_metadata_create_sql(
+    client: &mut PgClient,
+    layout: &ConsolidatorLayout,
+) -> Result<()> {
     let meta_path = layout.consolidator_metadata_path(layout.dst_index);
     let meta_conn = Connection::open(&meta_path).map_err(map_sql_err)?;
     meta_conn
@@ -8332,8 +9468,7 @@ fn apply_to_postgres_destination(
         entries = entries.len(),
         "applying batch to Postgres destination"
     );
-    let conn_str = build_postgres_connection_string(layout);
-    let mut client = PgClient::connect(&conn_str, NoTls).map_err(map_pg_err)?;
+    let mut client = connect_postgres(layout)?;
     ensure_pg_dst_schema(&mut client, layout)?;
     if layout.metadata_store == MetadataStore::Destination {
         ensure_postgres_metadata_seeded(&mut client, layout, first_commit_id)?;
@@ -8423,15 +9558,21 @@ fn apply_to_postgres_destination(
                 &pks,
             );
             for (s, a) in stmts {
-                let rendered = render_sql_with_args(&s, &a);
+                let rendered = render_sql_with_args(&s, &a, DstType::Postgres);
                 pending_sql.push((rendered, true, mapped.change_number));
             }
         } else {
             let rendered_sql = match sql_generator.generate(cached) {
                 GeneratedSql::Text(sql) => sql,
-                GeneratedSql::Parameterized { .. } => unreachable!("postgres path must use rendered SQL"),
+                GeneratedSql::Parameterized { .. } => {
+                    unreachable!("postgres path must use rendered SQL")
+                }
             };
-            pending_sql.push((rendered_sql, mapped.kind == DmlKind::Insert, mapped.change_number));
+            pending_sql.push((
+                rendered_sql,
+                mapped.kind == DmlKind::Insert,
+                mapped.change_number,
+            ));
         }
 
         progress.applied_change = mapped.change_number;
@@ -8490,7 +9631,9 @@ fn flush_postgres_batch(
     // and retry per-statement. Without this, the failed batch leaves the
     // txn in aborted state and every per-statement retry below returns
     // 25P02, masking the real error.
-    client.batch_execute("SAVEPOINT synclite_flush_sp").map_err(map_pg_err)?;
+    client
+        .batch_execute("SAVEPOINT synclite_flush_sp")
+        .map_err(map_pg_err)?;
     match client.batch_execute(&batch_sql) {
         Ok(()) => {
             client
@@ -8510,9 +9653,7 @@ fn flush_postgres_batch(
     }
 
     for (sql, is_insert, change_number) in pending_sql.iter() {
-        with_device_tracer(|t| {
-            tracer_info!(t, "SqlExecutor", "PG DML : {}", sql)
-        });
+        with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG DML : {}", sql));
         client
             .batch_execute("SAVEPOINT synclite_flush_stmt_sp")
             .map_err(map_pg_err)?;
@@ -8532,7 +9673,10 @@ fn flush_postgres_batch(
 
                 let is_unique_violation = e.code().map(|c| c.code() == "23505").unwrap_or(false);
                 if layout.dst_idempotent_data_ingestion && *is_insert && is_unique_violation {
-                    tracing::warn!(change_number = change_number, "idempotent ingest ignored duplicate key insert");
+                    tracing::warn!(
+                        change_number = change_number,
+                        "idempotent ingest ignored duplicate key insert"
+                    );
                     continue;
                 }
                 // Java parity: dst-set-unparsable-values-to-null — when a value
@@ -8563,7 +9707,11 @@ fn flush_postgres_batch(
     Ok(())
 }
 
-fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLayout, initial_commit_id: i64) -> Result<()> {
+fn ensure_sqlite_metadata_seeded(
+    dest_conn: &Connection,
+    layout: &ConsolidatorLayout,
+    initial_commit_id: i64,
+) -> Result<()> {
     dest_conn
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS synclite_checkpoint(\n\
@@ -8612,7 +9760,12 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
                      commit_id, cdc_change_number,\n\
                      cdc_log_segment_sequence_number, initialization_status, txn_count\n\
                  ) VALUES(?1, ?2, ?3, ?4, -1, 0, 0, 0)",
-                params![layout.device_id, layout.device_name, current_update_timestamp(), initial_commit_id],
+                params![
+                    layout.device_id,
+                    layout.device_name,
+                    current_update_timestamp(),
+                    initial_commit_id
+                ],
             )
             .map_err(map_sql_err)?;
     }
@@ -8622,7 +9775,11 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
         .query_row(
             "SELECT COUNT(*) FROM synclite_consolidator_metadata \
              WHERE synclite_device_id = ?1 AND synclite_device_name = ?2 AND prop_key = ?3",
-            params![layout.device_id, layout.device_name, SYNCLITE_METADATA_VERSION_KEY],
+            params![
+                layout.device_id,
+                layout.device_name,
+                SYNCLITE_METADATA_VERSION_KEY
+            ],
             |row| row.get(0),
         )
         .map_err(map_sql_err)?;
@@ -8645,7 +9802,11 @@ fn ensure_sqlite_metadata_seeded(dest_conn: &Connection, layout: &ConsolidatorLa
     Ok(())
 }
 
-fn ensure_duckdb_metadata_seeded(dest_conn: &DuckConnection, layout: &ConsolidatorLayout, initial_commit_id: i64) -> Result<()> {
+fn ensure_duckdb_metadata_seeded(
+    dest_conn: &DuckConnection,
+    layout: &ConsolidatorLayout,
+    initial_commit_id: i64,
+) -> Result<()> {
     dest_conn
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS synclite_checkpoint(\n\
@@ -8764,8 +9925,11 @@ fn ensure_pg_dst_schema(client: &mut PgClient, layout: &ConsolidatorLayout) -> R
     else {
         return Ok(());
     };
-    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(layout, schema));
-    with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "Ensuring dst schema : {}", sql));
+    let sql = format!(
+        "CREATE SCHEMA IF NOT EXISTS {}",
+        quote_ident_raw(layout, schema)
+    );
+    with_device_tracer(|t| tracer_debug!(t, "SqlExecutor", "Ensuring dst schema : {}", sql));
     client
         .batch_execute(&sql)
         .map_err(|e| map_pg_err_with_sql(e, &sql))
@@ -8782,15 +9946,56 @@ fn ensure_duckdb_dst_schema(conn: &DuckConnection, layout: &ConsolidatorLayout) 
     else {
         return Ok(());
     };
-    let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident_raw(layout, schema));
+    let sql = format!(
+        "CREATE SCHEMA IF NOT EXISTS {}",
+        quote_ident_raw(layout, schema)
+    );
     with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "Ensuring dst schema : {}", sql));
     conn.execute_batch(&sql).map_err(map_duck_err)
 }
 
-fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorLayout, initial_commit_id: i64) -> Result<()> {
+fn postgres_checkpoint_migrations(meta: &str, columns: &HashMap<String, i64>) -> Result<Vec<String>> {
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut statements = Vec::new();
+    for column in ["commit_id", "cdc_change_number", "cdc_log_segment_sequence_number", "txn_count"] {
+        match columns.get(column) {
+            Some(20) => {}
+            Some(21 | 23) => statements.push(format!(
+                "ALTER TABLE {meta} ALTER COLUMN {column} TYPE BIGINT USING {column}::bigint;"
+            )),
+            _ => return Err(Error::Config(format!("incompatible PostgreSQL checkpoint column: {column}"))),
+        }
+    }
+    if !columns.contains_key("initialization_status") {
+        statements.push(format!("ALTER TABLE {meta} ADD COLUMN initialization_status INTEGER NOT NULL DEFAULT 0;"));
+    }
+    Ok(statements)
+}
+
+fn ensure_postgres_metadata_seeded(
+    client: &mut PgClient,
+    layout: &ConsolidatorLayout,
+    initial_commit_id: i64,
+) -> Result<()> {
     let meta = pg_meta_table(layout, "synclite_checkpoint");
     let cmeta = pg_meta_table(layout, "synclite_consolidator_metadata");
     let ctmeta = pg_meta_table(layout, "synclite_consolidator_table_metadata");
+    let tables = vec![meta.clone(), cmeta.clone(), ctmeta.clone()];
+    let catalog_sql = "SELECT requested.name, attribute.attname, attribute.atttypid::bigint
+        FROM unnest($1::text[]) AS requested(name)
+        LEFT JOIN pg_catalog.pg_attribute AS attribute
+          ON attribute.attrelid = pg_catalog.to_regclass(requested.name)
+         AND attribute.attnum > 0 AND NOT attribute.attisdropped";
+    let mut catalog: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    for row in client.query(catalog_sql, &[&tables]).map_err(map_pg_err)? {
+        let columns = catalog.entry(row.get::<_, String>(0)).or_default();
+        if let Some(column) = row.get::<_, Option<String>>(1) {
+            columns.insert(column, row.get(2));
+        }
+    }
+    let migrations = postgres_checkpoint_migrations(&meta, &catalog[&meta])?;
     let ddl = format!(
             "CREATE TABLE IF NOT EXISTS {meta}(\n\
                  synclite_device_id VARCHAR(36) NOT NULL,\n\
@@ -8821,28 +10026,18 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
                  prop_value TEXT,\n\
                  PRIMARY KEY(synclite_device_id, synclite_device_name, database_name, table_name, prop_key)\n\
              );");
-    with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG metadata DDL : {}", ddl));
-    client.batch_execute(&ddl).map_err(|e| map_pg_err_with_sql(e, &ddl))?;
-    // Idempotent column-type promotion: earlier builds may have created
-    // these bookkeeping tables with int4 columns. Rust binds i64 (Java
-    // BIGINT parity), so promote int4 -> int8 in place. ALTER COLUMN
-    // TYPE BIGINT is a no-op when the column is already BIGINT.
-    let promote_sql = format!(
-        "ALTER TABLE {meta} ALTER COLUMN commit_id TYPE BIGINT USING commit_id::bigint;\n\
-         ALTER TABLE {meta} ALTER COLUMN cdc_change_number TYPE BIGINT USING cdc_change_number::bigint;\n\
-         ALTER TABLE {meta} ALTER COLUMN cdc_log_segment_sequence_number TYPE BIGINT USING cdc_log_segment_sequence_number::bigint;\n\
-         ALTER TABLE {meta} ALTER COLUMN txn_count TYPE BIGINT USING txn_count::bigint;"
-    );
-    with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG metadata promote : {}", promote_sql));
-    if let Err(e) = client.batch_execute(&promote_sql) {
-        with_device_tracer(|t| tracer_info!(
-            t,
-            "SqlExecutor",
-            "PG metadata column promote failed (continuing): {}",
-            e
-        ));
-    } else {
-        with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG metadata promote OK on {}", meta));
+    if catalog.values().any(HashMap::is_empty) || !migrations.is_empty() {
+        let mut transaction = client.transaction().map_err(map_pg_err)?;
+        if catalog.values().any(HashMap::is_empty) {
+            with_device_tracer(|t| tracer_debug!(t, "SqlExecutor", "PG metadata DDL : {}", ddl));
+            transaction.batch_execute(&ddl).map_err(|e| map_pg_err_with_sql(e, &ddl))?;
+        }
+        for sql in &migrations {
+            with_device_tracer(|t| tracer_debug!(t, "SqlExecutor", "PG metadata migration : {}", sql));
+            transaction.batch_execute(sql).map_err(|e| map_pg_err_with_sql(e, sql))?;
+        }
+        transaction.commit().map_err(map_pg_err)?;
+        with_device_tracer(|t| tracer_info!(t, "ConsolidatorMetadataManager", "Destination metadata ready : dst={} migratedColumns={}", layout.dst_index, migrations.len()));
     }
     let count_sql = format!(
         "SELECT COUNT(*) FROM {meta} WHERE synclite_device_id = $1 AND synclite_device_name = $2"
@@ -8862,7 +10057,12 @@ fn ensure_postgres_metadata_seeded(client: &mut PgClient, layout: &ConsolidatorL
         client
             .execute(
                 insert_sql.as_str(),
-                &[&layout.device_id, &layout.device_name, &current_update_timestamp(), &initial_commit_id],
+                &[
+                    &layout.device_id,
+                    &layout.device_name,
+                    &current_update_timestamp(),
+                    &initial_commit_id,
+                ],
             )
             .map_err(|e| map_pg_err_with_sql(e, &insert_sql))?;
     }
@@ -8955,11 +10155,7 @@ fn is_duckdb_unparsable_err(e: &Error) -> bool {
 /// must execute as a pair. Each element shares the same args slice with
 /// pre-computed slice ranges — for safety we materialize new `Vec<SqlValue>`
 /// per statement.
-fn warn_missing_pk_once(
-    dst_type: DstType,
-    method: DstIdempotentDataIngestionMethod,
-    table: &str,
-) {
+fn warn_missing_pk_once(dst_type: DstType, method: DstIdempotentDataIngestionMethod, table: &str) {
     static MISSING_PK_WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let key = format!("{:?}::{}", dst_type, table.to_ascii_lowercase());
     let mut guard = match MISSING_PK_WARNED.lock() {
@@ -9007,7 +10203,13 @@ fn rewrite_insert_idempotent(
         return fallback();
     };
     if cols.len() != args.len() {
-        tracing::debug!(?dst_type, ?method, cols = cols.len(), args = args.len(), "idempotent ingest skipped: column/arg count mismatch");
+        tracing::debug!(
+            ?dst_type,
+            ?method,
+            cols = cols.len(),
+            args = args.len(),
+            "idempotent ingest skipped: column/arg count mismatch"
+        );
         return fallback();
     }
 
@@ -9061,9 +10263,8 @@ fn rewrite_insert_idempotent(
         // NATIVE_REPLACE — SQLite has `INSERT OR REPLACE`. DuckDB and PG
         // do not; Java falls back to DELETE_INSERT in that case.
         (DstType::Sqlite, DstIdempotentDataIngestionMethod::NativeReplace) => {
-            let sql = format!(
-                "INSERT OR REPLACE INTO {qtable} ({cols_csv}) VALUES ({placeholders})"
-            );
+            let sql =
+                format!("INSERT OR REPLACE INTO {qtable} ({cols_csv}) VALUES ({placeholders})");
             vec![(sql, args.to_vec())]
         }
         (DstType::DuckDb, DstIdempotentDataIngestionMethod::NativeReplace)
@@ -9224,15 +10425,15 @@ fn is_benign_ddl_err_msg(msg: &str) -> bool {
     let l = msg.to_ascii_lowercase();
     l.contains("duplicate column")
         || l.contains("already exists")
-    || l.contains("no such column")
-    || l.contains("unknown column")
-    || l.contains("can't drop")
-    || l.contains("does not exist")
-    || l.contains("doesn't exist")
-    || l.contains("column not found")
-    || l.contains("unknown table")
-    || l.contains("no such table")
-    || l.contains("table not found")
+        || l.contains("no such column")
+        || l.contains("unknown column")
+        || l.contains("can't drop")
+        || l.contains("does not exist")
+        || l.contains("doesn't exist")
+        || l.contains("column not found")
+        || l.contains("unknown table")
+        || l.contains("no such table")
+        || l.contains("table not found")
 }
 
 fn split_ddl_statements(sql: &str) -> impl Iterator<Item = &str> {
@@ -9306,7 +10507,12 @@ fn build_postgres_connection_string(layout: &ConsolidatorLayout) -> String {
     };
 
     if !pg_param_present(&lower, "user") {
-        if let Some(u) = layout.dst_user.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(u) = layout
+            .dst_user
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             append_param(&mut out, "user", u);
         }
     }
@@ -9378,7 +10584,9 @@ fn apply_ddl_batch_postgres(client: &mut PgClient, sql: &str) -> Result<()> {
     // benign error to keep the outer txn live.
     for stmt in split_ddl_statements(sql) {
         with_device_tracer(|t| tracer_info!(t, "SqlExecutor", "PG DDL : {}", stmt));
-        client.batch_execute("SAVEPOINT synclite_ddl_sp").map_err(map_pg_err)?;
+        client
+            .batch_execute("SAVEPOINT synclite_ddl_sp")
+            .map_err(map_pg_err)?;
         match client.batch_execute(stmt) {
             Ok(()) => {
                 client
@@ -9400,26 +10608,14 @@ fn apply_ddl_batch_postgres(client: &mut PgClient, sql: &str) -> Result<()> {
                         .map_err(map_pg_err)?;
                     tracing::warn!(stmt = %stmt, error = %msg, "consolidation DDL: ignored benign error");
                     with_device_tracer(|t| {
-                        tracer_info!(
-                            t,
-                            "SqlExecutor",
-                            "PG DDL benign-skip: {} :: {}",
-                            stmt,
-                            msg
-                        )
+                        tracer_info!(t, "SqlExecutor", "PG DDL benign-skip: {} :: {}", stmt, msg)
                     });
                     continue;
                 }
                 let _ = client.batch_execute("ROLLBACK TO SAVEPOINT synclite_ddl_sp");
                 let _ = client.batch_execute("RELEASE SAVEPOINT synclite_ddl_sp");
                 with_device_tracer(|t| {
-                    tracer_error!(
-                        t,
-                        "SqlExecutor",
-                        "PG DDL failed: {} :: {}",
-                        stmt,
-                        msg
-                    )
+                    tracer_error!(t, "SqlExecutor", "PG DDL failed: {} :: {}", stmt, msg)
                 });
                 return Err(map_pg_err(e));
             }
@@ -9428,12 +10624,12 @@ fn apply_ddl_batch_postgres(client: &mut PgClient, sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn render_sql_with_args(sql: &str, args: &[SqlValue]) -> String {
+fn render_sql_with_args(sql: &str, args: &[SqlValue], backend: DstType) -> String {
     let mut rendered = String::with_capacity(sql.len() + args.len() * 8);
     let mut arg_idx = 0usize;
     for ch in sql.chars() {
         if ch == '?' && arg_idx < args.len() {
-            rendered.push_str(&sql_literal(&args[arg_idx]));
+            rendered.push_str(&sql_literal(&args[arg_idx], backend));
             arg_idx += 1;
         } else {
             rendered.push(ch);
@@ -9442,7 +10638,7 @@ fn render_sql_with_args(sql: &str, args: &[SqlValue]) -> String {
     rendered
 }
 
-fn sql_literal(v: &SqlValue) -> String {
+fn sql_literal(v: &SqlValue, backend: DstType) -> String {
     match v {
         SqlValue::Null => "NULL".to_string(),
         SqlValue::Integer(i) => i.to_string(),
@@ -9453,14 +10649,26 @@ fn sql_literal(v: &SqlValue) -> String {
                 "NULL".to_string()
             }
         }
-        SqlValue::Text(t) => format!("'{}'", t.replace('\\', "\\\\").replace('\'', "''")),
+        SqlValue::Text(t) => {
+            let escaped = if backend == DstType::Sqlite {
+                // SQLite treats backslashes literally, not as escapes.
+                t.replace('\'', "''")
+            } else {
+                t.replace('\\', "\\\\").replace('\'', "''")
+            };
+            format!("'{}'", escaped)
+        }
         SqlValue::Blob(b) => {
             let mut hex = String::with_capacity(b.len() * 2);
             for byte in b {
                 use std::fmt::Write as _;
                 let _ = write!(hex, "{:02x}", byte);
             }
-            format!("decode('{}','hex')", hex)
+            if backend == DstType::Sqlite {
+                format!("X'{}'", hex)
+            } else {
+                format!("decode('{}','hex')", hex)
+            }
         }
     }
 }
@@ -9470,6 +10678,345 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub(super) struct RuntimeTestTracer {
+        previous: Option<Arc<Tracer>>,
+        path: PathBuf,
+    }
+
+    impl RuntimeTestTracer {
+        pub(super) fn new(root: &Path, level: TraceLevel) -> Self {
+            let tracer = Tracer::for_consolidator_device(root, level).unwrap();
+            let previous = DEVICE_TRACER.with(|cell| cell.replace(Some(tracer)));
+            Self { previous, path: root.join("synclite_device.trace") }
+        }
+
+        pub(super) fn read(&self) -> String {
+            fs::read_to_string(&self.path).unwrap()
+        }
+    }
+
+    impl Drop for RuntimeTestTracer {
+        fn drop(&mut self) {
+            DEVICE_TRACER.with(|cell| cell.replace(self.previous.take()));
+        }
+    }
+
+    #[test]
+    fn duckdb_schema_reconstruction_reads_boolean_flags() {
+        let conn = DuckConnection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(tenant INTEGER, id INTEGER, label VARCHAR NOT NULL, note VARCHAR,
+                                PRIMARY KEY(tenant, id));
+             CREATE TABLE unkeyed(value INTEGER, label VARCHAR NOT NULL);",
+        ).unwrap();
+
+        assert_eq!(
+            build_create_sql_from_duckdb_columns(&conn, "items").unwrap(),
+            "CREATE TABLE IF NOT EXISTS items (tenant INTEGER NOT NULL, id INTEGER NOT NULL, label VARCHAR NOT NULL, note VARCHAR, PRIMARY KEY(tenant, id))",
+        );
+        assert_eq!(
+            build_create_sql_from_duckdb_columns(&conn, "unkeyed").unwrap(),
+            "CREATE TABLE IF NOT EXISTS unkeyed (value INTEGER, label VARCHAR NOT NULL)",
+        );
+    }
+
+    #[test]
+    fn postgres_metadata_migration_plan_only_promotes_legacy_integers() {
+        let mut columns: HashMap<String, i64> = [
+            ("commit_id", 20), ("cdc_change_number", 20),
+            ("cdc_log_segment_sequence_number", 20), ("txn_count", 20),
+            ("initialization_status", 23),
+        ].into_iter().map(|(name, oid)| (name.into(), oid)).collect();
+        assert!(postgres_checkpoint_migrations("checkpoint", &columns).unwrap().is_empty());
+        columns.insert("commit_id".into(), 23);
+        columns.insert("txn_count".into(), 21);
+        assert_eq!(postgres_checkpoint_migrations("checkpoint", &columns).unwrap().len(), 2);
+        columns.insert("txn_count".into(), 25);
+        assert!(postgres_checkpoint_migrations("checkpoint", &columns).is_err());
+        columns.remove("txn_count");
+        assert!(postgres_checkpoint_migrations("checkpoint", &columns).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires SYNCLITE_TEST_POSTGRES_URL pointing to an isolated test server"]
+    fn postgres_metadata_and_snapshot_trace_regression() {
+        let root = RuntimeTestRoot::new("postgres-parity");
+        let mut layout = RuntimeTestDestination::new(&root.0, 1, "sqlite").layout;
+        layout.dst_type = DstType::Postgres;
+        layout.metadata_store = MetadataStore::Destination;
+        layout.dst_connection_string = env::var("SYNCLITE_TEST_POSTGRES_URL").expect("test PostgreSQL URL");
+        layout.dst_quote_object_names = true;
+        layout.dst_quote_column_names = true;
+        layout.dst_use_catalog_scope_resolution = false;
+        layout.dst_schema = Some(format!("synclite_parity_{}_{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let trace = RuntimeTestTracer::new(&root.0, TraceLevel::Debug);
+        let mut client = connect_postgres(&layout).unwrap();
+        ensure_pg_dst_schema(&mut client, &layout).unwrap();
+        ensure_postgres_metadata_seeded(&mut client, &layout, 0).unwrap();
+        let fresh = trace.read();
+        assert_eq!(fresh.matches("PG metadata DDL :").count(), 1);
+        assert!(!fresh.contains("PG metadata migration :"));
+        ensure_postgres_metadata_seeded(&mut client, &layout, 99).unwrap();
+        assert_eq!(trace.read().matches("PG metadata DDL :").count(), 1);
+        assert!(!trace.read().contains("PG metadata migration :"));
+        let checkpoint = pg_meta_table(&layout, "synclite_checkpoint");
+        client.batch_execute(&format!("UPDATE {checkpoint} SET commit_id=123, cdc_change_number=11, txn_count=7;
+            ALTER TABLE {checkpoint} ALTER COLUMN commit_id TYPE INTEGER;
+            ALTER TABLE {checkpoint} ALTER COLUMN cdc_change_number TYPE INTEGER;
+            ALTER TABLE {checkpoint} ALTER COLUMN cdc_log_segment_sequence_number TYPE INTEGER;
+            ALTER TABLE {checkpoint} ALTER COLUMN txn_count TYPE INTEGER;
+            CREATE VIEW {} AS SELECT txn_count FROM {checkpoint};", pg_meta_table(&layout, "migration_blocker"))).unwrap();
+        assert!(ensure_postgres_metadata_seeded(&mut client, &layout, 0).is_err());
+        let types: String = client.query_one(&format!("SELECT pg_typeof(commit_id)::text FROM {checkpoint}"), &[]).unwrap().get(0);
+        assert_eq!(types, "integer");
+        client.batch_execute(&format!("DROP VIEW {};", pg_meta_table(&layout, "migration_blocker"))).unwrap();
+        ensure_postgres_metadata_seeded(&mut client, &layout, 0).unwrap();
+        let checkpoint_row = client.query_one(&format!("SELECT commit_id, cdc_change_number, txn_count FROM {checkpoint}"), &[]).unwrap();
+        assert_eq!(checkpoint_row.get::<_, i64>(0), 123);
+        assert_eq!(checkpoint_row.get::<_, i64>(1), 11);
+        assert_eq!(checkpoint_row.get::<_, i64>(2), 7);
+        let migration_count = trace.read().matches("PG metadata migration :").count();
+        ensure_postgres_metadata_seeded(&mut client, &layout, 0).unwrap();
+        assert_eq!(trace.read().matches("PG metadata migration :").count(), migration_count);
+        let backup = root.0.join("source.backup");
+        Connection::open(&backup).unwrap().execute_batch("CREATE TABLE synclite_txn(commit_id INTEGER);
+            INSERT INTO synclite_txn VALUES(1793604764867);
+            CREATE TABLE events(id INTEGER PRIMARY KEY, label TEXT);
+            INSERT INTO events VALUES(1, 'first'), (2, 'second');").unwrap();
+        snapshot::initialize_snapshot(&layout, &backup).unwrap();
+        client.batch_execute(&format!("UPDATE {checkpoint} SET commit_id=1793604865413;")).unwrap();
+        snapshot::initialize_snapshot(&layout, &backup).unwrap();
+        assert_eq!(client.query_one(&format!("SELECT COUNT(*) FROM {}", pg_meta_table(&layout, "events")), &[]).unwrap().get::<_, i64>(0), 2);
+        assert_eq!(client.query_one(&format!("SELECT MAX(commit_id) FROM {checkpoint}"), &[]).unwrap().get::<_, i64>(0), 1793604865413);
+        let output = trace.read();
+        assert!(output.contains("tables=1 rows=2 recovered=false"));
+        assert!(output.contains("tables=0 rows=0 recovered=true"));
+        assert_eq!(output.matches("Copying initial data :").count(), 1);
+        assert!(!output.contains("continuing"));
+        println!("Trace analysis: fresh setup=1 DDL batch/0 ALTERs; repeat=0 DDL/0 ALTERs; failed legacy migration rolled back; checkpoint preserved; snapshot copied once and recovered without rewind.");
+        for line in output.lines().filter(|line| line.contains("DeviceDstInitializer") || line.contains("Destination metadata ready")) {
+            println!("{line}");
+        }
+        client.batch_execute(&format!("DROP SCHEMA {} CASCADE", quote_ident_raw(&layout, layout.dst_schema.as_ref().unwrap()))).unwrap();
+    }
+
+    #[test]
+    fn runtime_worker_reuse_preserves_background_ownership_and_checks_configuration() {
+        let root = RuntimeTestRoot::new("worker-reuse");
+        let destination = RuntimeTestDestination::new(&root.0, 1, "sqlite");
+        let mut layout = destination.layout.clone();
+        layout.destination_apply_enabled = false;
+        let (worker, created) = Consolidator::spawn_or_reuse(layout.clone()).unwrap();
+        assert!(created);
+        let retained = Arc::downgrade(&worker);
+        let (reused, created) = Consolidator::spawn_or_reuse(layout.clone()).unwrap();
+        assert!(!created);
+        assert!(Arc::ptr_eq(&worker, &reused));
+        drop(worker);
+        drop(reused);
+        assert!(retained.upgrade().is_some());
+        let (worker, created) = Consolidator::spawn_or_reuse(layout.clone()).unwrap();
+        assert!(!created);
+        let mut changed = layout.clone();
+        changed.dst_connection_string = "password=must-not-appear".into();
+        let error = Consolidator::spawn_or_reuse(changed).err().unwrap().to_string();
+        assert!(error.contains("different configuration"));
+        assert!(!error.contains("must-not-appear"));
+        worker.shutdown();
+        assert!(worker.exited.load(Ordering::SeqCst));
+        let (replacement, created) = Consolidator::spawn_or_reuse(layout).unwrap();
+        assert!(created);
+        assert!(!Arc::ptr_eq(&worker, &replacement));
+        replacement.shutdown();
+    }
+
+    #[test]
+    fn runtime_worker_registry_keeps_destinations_independent() {
+        let root = RuntimeTestRoot::new("worker-destinations");
+        let mut first = RuntimeTestDestination::new(&root.0, 1, "sqlite").layout;
+        let mut second = RuntimeTestDestination::new(&root.0, 2, "sqlite").layout;
+        first.destination_apply_enabled = false;
+        second.destination_apply_enabled = false;
+        let first = Consolidator::spawn(first).unwrap();
+        let second = Consolidator::spawn(second).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        first.shutdown();
+        assert!(!second.shutdown_requested.load(Ordering::SeqCst));
+        second.shutdown();
+    }
+
+    #[test]
+    fn runtime_bootstrap_retries_push_only_when_idle_and_busy_without_advancing_on_failure() {
+        for busy in [false, true] {
+            let root = RuntimeTestRoot::new(if busy { "bootstrap-busy" } else { "bootstrap-idle" });
+            let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite");
+            dst.layout.stage_dir = None;
+            dst.layout.device_polling_interval_ms = 10;
+            dst.state.execute("UPDATE synclite_checkpoint SET initialization_status=0", []).unwrap();
+            let stage = root.0.join("immutable");
+            fs::create_dir_all(&stage).unwrap();
+            let backup = stage.join("db.synclite.backup");
+            let metadata = stage.join("db.synclite.metadata");
+            fs::write(&metadata, b"metadata").unwrap();
+            Connection::open(&backup).unwrap().execute_batch(
+                "CREATE TABLE events(value INTEGER); INSERT INTO events VALUES(7); CREATE TABLE synclite_txn(commit_id INTEGER); INSERT INTO synclite_txn VALUES(0);"
+            ).unwrap();
+            // Existing work replica belongs to another destination's later CDC.
+            Connection::open(dst.layout.device_work_dir.join("db.synclite.backup")).unwrap().execute_batch(
+                "CREATE TABLE events(value INTEGER); INSERT INTO events VALUES(99);"
+            ).unwrap();
+            let layout = dst.layout.clone();
+            let (tx, rx) = mpsc::channel();
+            let worker = thread::spawn(move || worker_loop(rx, layout, Arc::new(AtomicBool::new(false))));
+            tx.send(Msg::BootstrapReady { backup_path: backup, metadata_path: metadata }).unwrap();
+            let trace = dst.layout.device_work_dir.join("synclite_device.trace");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let failed = loop {
+                if fs::read_to_string(&trace).unwrap_or_default().contains("stage=apply immutable snapshot") { break true; }
+                if std::time::Instant::now() >= deadline { break false; }
+                if busy { tx.send(Msg::StagePathReady(stage.join("2.sqllog"))).unwrap(); }
+                thread::sleep(Duration::from_millis(2));
+            };
+            let pending_initialized = is_initialized(&dst.state).unwrap();
+            let pending_seq = dst.checkpoint_seq();
+            // Repair destination availability; do NOT send another bootstrap.
+            fs::create_dir_all(Path::new(&dst.layout.dst_connection_string).parent().unwrap()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let initialized = loop {
+                if is_initialized(&dst.state).unwrap() { break true; }
+                if std::time::Instant::now() >= deadline { break false; }
+                if busy { tx.send(Msg::StagePathReady(stage.join("2.sqllog"))).unwrap(); }
+                thread::sleep(Duration::from_millis(2));
+            };
+            tx.send(Msg::Shutdown).unwrap();
+            worker.join().unwrap();
+            assert!(failed, "bootstrap failure must be visible in DEVICE_TRACER");
+            assert!(!pending_initialized);
+            assert_eq!(pending_seq, -1);
+            assert!(initialized, "bootstrap retry starved (busy={busy})");
+            assert_eq!(dst.rows(), vec![7], "must copy immutable stage, not live work replica");
+        }
+    }
+
+    #[test]
+    fn runtime_schema_seed_uses_working_replica_without_remote_metadata() {
+        let root = RuntimeTestRoot::new("local-schema");
+        let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite");
+        dst.layout.dst_type = DstType::Postgres;
+        dst.layout.metadata_store = MetadataStore::Destination;
+        dst.layout.dst_connection_string = "not a valid PostgreSQL connection string".into();
+        let path = dst.layout.device_work_dir.join("db.synclite.backup");
+        Connection::open(&path).unwrap().execute_batch("CREATE TABLE local_only(id INTEGER PRIMARY KEY, value BLOB)").unwrap();
+        let replica = seed_commandlog_schema_replica(&dst.layout).unwrap();
+        assert!(has_table(&replica, "local_only").unwrap());
+        Connection::open(&path).unwrap().execute_batch("DROP TABLE local_only").unwrap();
+        assert!(load_seed_create_sql_rows(&dst.layout).unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_missing_native_fails_before_creating_any_replay_artifact() {
+        let root = RuntimeTestRoot::new("missing-native");
+        let replica = root.0.join("replica.db");
+        let segment = root.0.join("1.sqllog");
+        let cdc = root.0.join("1.cdclog");
+        let missing = root.0.join("missing-custom-cdc-library");
+        let result = replay_segment_with_cdc_loader(&replica, &segment, 1, &layout_for_batch_tests(), &cdc,
+            || NativeCdc::load_candidates(vec![missing.clone()]));
+        let error = match result { Err(error) => error.to_string(), Ok(_) => panic!("missing native must fail closed") };
+        assert!(error.contains("SYNCLITE_CDC_LIB_DIR"));
+        assert!(error.contains(&missing.to_string_lossy().to_string()));
+        assert!(!replica.exists());
+        assert!(!segment.exists());
+        assert!(!cdc.exists());
+    }
+
+    #[test]
+    fn runtime_flush_requires_completed_local_bootstrap() {
+        let root = RuntimeTestRoot::new("bootstrap-gate");
+        let dst = RuntimeTestDestination::new(&root.0, 1, "other");
+        dst.recover();
+        dst.state.execute("UPDATE synclite_checkpoint SET initialization_status=0", []).unwrap();
+        let path = dst.stage(1, "cdclog");
+        write_test_segment(&path, 1, true, true);
+        let mut pending = vec![path.clone()];
+        dst.flush(&mut pending).unwrap();
+        assert_eq!(pending, vec![path]);
+        assert_eq!(dst.checkpoint_seq(), -1);
+        assert!(dst.rows().is_empty());
+    }
+
+    #[test]
+    fn runtime_trace_names_failed_head_not_later_notification_and_redacts_payload() {
+        let root = RuntimeTestRoot::new("failed-path-trace");
+        let dst = RuntimeTestDestination::new(&root.0, 1, "other");
+        let head = dst.stage(2, "cdclog");
+        let later = dst.stage(10, "cdclog");
+        write_test_segment(&head, 2, true, true);
+        write_test_segment(&later, 10, true, true);
+        let tracer = Tracer::for_consolidator_device(&dst.layout.device_work_dir, TraceLevel::Info).unwrap();
+        DEVICE_TRACER.with(|cell| *cell.borrow_mut() = Some(tracer));
+        let mut pending = vec![later.clone()];
+        let failed = dst.flush(&mut pending).is_err();
+        trace_worker_error("redaction probe", &head, &Error::Db("password=must-not-appear".into()));
+        DEVICE_TRACER.with(|cell| cell.borrow_mut().take());
+        let text = fs::read_to_string(dst.layout.device_work_dir.join("synclite_device.trace")).unwrap();
+        assert!(failed);
+        assert!(text.contains(&format!("stage=apply staged segment path={}", head.display())));
+        assert!(!text.contains(&format!("stage=apply staged segment path={}", later.display())));
+        assert!(!text.contains("must-not-appear"));
+        assert_eq!(pending.first(), Some(&head));
+    }
+
+    #[test]
+    fn runtime_completed_handover_reconstructs_replica_without_reapplying_old_cdc() {
+        for store in [MetadataStore::Local, MetadataStore::Destination] {
+            let root = RuntimeTestRoot::new("handover-reconstruct");
+            let mut dst = RuntimeTestDestination::new(&root.0, 1, "sqlite");
+            dst.layout.metadata_store = store;
+            fs::create_dir_all(Path::new(&dst.layout.dst_connection_string).parent().unwrap()).unwrap();
+            let backup = root.0.join("db.synclite.backup");
+            Connection::open(&backup).unwrap().execute_batch("CREATE TABLE events(value INTEGER); INSERT INTO events VALUES(7);").unwrap();
+            apply_bootstrap_snapshot(&dst.layout, &backup).unwrap();
+            let remote = Connection::open(&dst.layout.dst_connection_string).unwrap();
+            remote.execute_batch("INSERT INTO events VALUES(2),(10); UPDATE synclite_checkpoint SET commit_id=10, cdc_log_segment_sequence_number=10, cdc_change_number=2, initialization_status=1;").unwrap();
+            // Fresh local state/work from the immutable baseline, destination
+            // already advanced by a Java (or previous Rust) consolidator.
+            dst.state.execute("UPDATE synclite_checkpoint SET initialization_status=0", []).unwrap();
+            apply_bootstrap_snapshot(&dst.layout, &backup).unwrap();
+            assert_eq!(dst.rows(), vec![7, 2, 10]);
+            fs::copy(&backup, dst.layout.device_work_dir.join("db.synclite.backup")).unwrap();
+            dst.state.execute("UPDATE synclite_checkpoint SET initialization_status=1", []).unwrap();
+            let stage = dst.stage(2, "sqllog");
+            write_test_segment(&stage, 2, false, true);
+            dst.flush(&mut vec![stage]).unwrap();
+            let replica = Connection::open(dst.layout.device_work_dir.join("db.synclite.backup")).unwrap();
+            let count: i64 = replica.query_row("SELECT COUNT(*) FROM events WHERE value=2", [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1, "native replay must reconstruct historical SQL");
+            assert_eq!(dst.rows(), vec![7, 2, 10], "covered CDC must not be applied twice");
+            let checkpoint: i64 = remote.query_row("SELECT cdc_log_segment_sequence_number FROM synclite_checkpoint", [], |r| r.get(0)).unwrap();
+            assert_eq!(checkpoint, 10, "remote checkpoint must not rewind");
+        }
+    }
+
+    #[test]
+    fn runtime_device_trace_includes_sequence_and_error_context() {
+        for level in [TraceLevel::Info, TraceLevel::Debug] {
+            let root = RuntimeTestRoot::new("trace-sequence");
+            let dst = RuntimeTestDestination::new(&root.0, 1, "sqlite");
+            let trace = RuntimeTestTracer::new(&dst.layout.device_work_dir, level);
+            let path = dst.stage(7, "cdclog");
+            trace_workflow_step("bootstrap", "snapshot copied into working replica");
+            trace_worker_error("load native CDC", &path, &Error::Internal(
+                "native CDC unavailable; candidate=/tmp/libsynclitecdc.so; SYNCLITE_CDC_LIB_DIR missing".into(),
+            ));
+            let output = trace.read();
+            assert_eq!(output.contains("step=bootstrap"), level == TraceLevel::Debug);
+            assert!(output.contains("load native CDC"));
+            assert!(output.contains("native CDC unavailable"));
+        }
+    }
 
     fn layout_for_batch_tests() -> ConsolidatorLayout {
         let mut layout = ConsolidatorLayout::new(
@@ -9508,10 +11055,14 @@ mod tests {
     impl RuntimeTestRoot {
         fn new(label: &str) -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let root = std::env::temp_dir().join(format!(
                 "synclite-runtime-{label}-{}-{nonce}-{}",
-                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
             ));
             fs::create_dir_all(&root).unwrap();
             Self(root)
@@ -9540,10 +11091,26 @@ mod tests {
             let mut layout = ConsolidatorLayout::new(
                 root,
                 Some(root.join(format!("DB-{dst}"))),
-                "dev-id", "dev", device_type, "db", dst, true,
-                MetadataStore::Local, DstType::Sqlite, DestinationSyncMode::Replication,
-                root.join(format!("destination-{dst}")).join("dst.db").to_string_lossy().into_owned(),
-                1, 0, false, 11, 7, 5, true,
+                "dev-id",
+                "dev",
+                device_type,
+                "db",
+                dst,
+                true,
+                MetadataStore::Local,
+                DstType::Sqlite,
+                DestinationSyncMode::Replication,
+                root.join(format!("destination-{dst}"))
+                    .join("dst.db")
+                    .to_string_lossy()
+                    .into_owned(),
+                1,
+                0,
+                false,
+                11,
+                7,
+                5,
+                true,
             );
             layout.stage_dir = Some(root.join("stage").join("synclite-dev-dev-id"));
             Self::open(layout)
@@ -9558,30 +11125,47 @@ mod tests {
             initialize_device_stats_db(&layout).unwrap();
             initialize_consolidator_stats_db(&layout).unwrap();
             let state = Connection::open(&layout.state_db_path).unwrap();
-            state.execute_batch(
-                "INSERT INTO synclite_checkpoint(commit_id, cdc_change_number,
-                 cdc_log_segment_sequence_number, txn_count)
-                 SELECT 0, -1, -1, 0 WHERE NOT EXISTS(SELECT 1 FROM synclite_checkpoint);"
-            ).unwrap();
+            state
+                .execute_batch(
+                      "INSERT INTO synclite_checkpoint(commit_id, cdc_change_number,
+                          cdc_log_segment_sequence_number, txn_count, initialization_status)
+                          SELECT 0, -1, -1, 0, 1 WHERE NOT EXISTS(SELECT 1 FROM synclite_checkpoint);",
+                )
+                .unwrap();
             let stats = Connection::open(&layout.stats_db_path).unwrap();
             let global_stats = Connection::open(&layout.consolidator_stats_db_path).unwrap();
             let progress = CleanupProgress::register(&layout);
-            Self { layout, state, stats, global_stats, progress }
+            Self {
+                layout,
+                state,
+                stats,
+                global_stats,
+                progress,
+            }
         }
 
         fn recover(&self) {
             let path = Path::new(&self.layout.dst_connection_string);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            Connection::open(path).unwrap().execute_batch(
-                "CREATE TABLE IF NOT EXISTS events(value INTEGER NOT NULL);"
-            ).unwrap();
+            Connection::open(path)
+                .unwrap()
+                .execute_batch("CREATE TABLE IF NOT EXISTS events(value INTEGER NOT NULL);")
+                .unwrap();
             if self.layout.metadata_store == MetadataStore::Destination {
-                consolidator_state::bootstrap_destination_metadata(&self.layout, self.layout.dst_index).unwrap();
+                consolidator_state::bootstrap_destination_metadata(
+                    &self.layout,
+                    self.layout.dst_index,
+                )
+                .unwrap();
             }
         }
 
         fn stage(&self, seq: i64, extension: &str) -> PathBuf {
-            self.layout.stage_dir.as_ref().unwrap().join(format!("{seq}.{extension}"))
+            self.layout
+                .stage_dir
+                .as_ref()
+                .unwrap()
+                .join(format!("{seq}.{extension}"))
         }
 
         fn flush(&self, pending: &mut Vec<PathBuf>) -> Result<()> {
@@ -9589,24 +11173,36 @@ mod tests {
             // replica per worker thread. Do not share a test peer's replica.
             SCHEMA_REPLICA.with(|cell| cell.borrow_mut().take());
             flush_pending_stage_paths(
-                &self.layout, &self.state, &self.stats, &self.global_stats,
-                &self.progress, pending,
+                &self.layout,
+                &self.state,
+                &self.stats,
+                &self.global_stats,
+                &self.progress,
+                pending,
             )
         }
 
         fn rows(&self) -> Vec<i64> {
             let conn = Connection::open(&self.layout.dst_connection_string).unwrap();
-            let mut stmt = conn.prepare("SELECT value FROM events ORDER BY rowid").unwrap();
-            let rows = stmt.query_map([], |row| row.get(0)).unwrap()
-                .collect::<rusqlite::Result<Vec<i64>>>().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT value FROM events ORDER BY rowid")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<i64>>>()
+                .unwrap();
             rows
         }
 
         fn checkpoint_seq(&self) -> i64 {
-            self.state.query_row(
-                "SELECT cdc_log_segment_sequence_number FROM synclite_checkpoint",
-                [], |row| row.get(0),
-            ).unwrap()
+            self.state
+                .query_row(
+                    "SELECT cdc_log_segment_sequence_number FROM synclite_checkpoint",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
         }
     }
 
@@ -9618,22 +11214,31 @@ mod tests {
              arg_cnt INTEGER, arg1 INTEGER, table_name TEXT, op_type TEXT);
              CREATE TABLE metadata(key TEXT, value TEXT);
              INSERT INTO metadata VALUES('status', 'READY');"
-        )).unwrap();
-        conn.execute(&format!(
-            "INSERT INTO {table} VALUES(1, ?1, 'INSERT INTO events(value) VALUES(?)',
+        ))
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {table} VALUES(1, ?1, 'INSERT INTO events(value) VALUES(?)',
              1, ?1, 'events', 'INSERT')"
-        ), [seq]).unwrap();
+            ),
+            [seq],
+        )
+        .unwrap();
         if decided {
-            conn.execute(&format!(
-                "INSERT INTO {table} VALUES(2, ?1, 'COMMIT', 0, NULL, NULL, NULL)"
-            ), [seq]).unwrap();
+            conn.execute(
+                &format!("INSERT INTO {table} VALUES(2, ?1, 'COMMIT', 0, NULL, NULL, NULL)"),
+                [seq],
+            )
+            .unwrap();
         }
     }
 
     #[test]
     fn failed_apply_never_marks_applied_and_recovers_in_all_device_branches() {
         for (device_type, extension) in [
-            ("sqlite_store", "sqllog"), ("sqlite", "sqllog"), ("other", "cdclog"),
+            ("sqlite_store", "sqllog"),
+            ("sqlite", "sqllog"),
+            ("other", "cdclog"),
         ] {
             let root = RuntimeTestRoot::new(device_type);
             let dst = RuntimeTestDestination::new(&root.0, 1, device_type);
@@ -9697,23 +11302,42 @@ mod tests {
         // The lock is per device_work_dir, not per device_data_root. A second
         // worker/handover for the same work dir must defer; the other alias
         // must progress without weakening that cross-language exclusion.
-        assert_eq!(healthy.layout.device_data_root, failing.layout.device_data_root);
+        assert_eq!(
+            healthy.layout.device_data_root,
+            failing.layout.device_data_root
+        );
         assert_eq!(healthy.layout.device_id, failing.layout.device_id);
         assert_eq!(healthy.layout.device_name, failing.layout.device_name);
         assert_eq!(healthy.layout.stage_dir, failing.layout.stage_dir);
-        assert_ne!(healthy.layout.device_work_dir, failing.layout.device_work_dir);
-        let failed_lock = DeviceProcessingLock::try_lock(&failing.layout).unwrap().unwrap();
-        assert!(DeviceProcessingLock::try_lock(&failing.layout).unwrap().is_none());
+        assert_ne!(
+            healthy.layout.device_work_dir,
+            failing.layout.device_work_dir
+        );
+        let failed_lock = DeviceProcessingLock::try_lock(&failing.layout)
+            .unwrap()
+            .unwrap();
+        assert!(DeviceProcessingLock::try_lock(&failing.layout)
+            .unwrap()
+            .is_none());
         failing.flush(&mut failed_pending).unwrap();
         assert_eq!(failed_pending.len(), 3);
         assert_eq!(failing.checkpoint_seq(), -1);
-        healthy.flush(&mut vec![healthy.stage(100, "sqllog")]).unwrap();
+        healthy
+            .flush(&mut vec![healthy.stage(100, "sqllog")])
+            .unwrap();
         assert_eq!(healthy.rows(), vec![2, 10, 100]);
         assert_eq!(healthy.checkpoint_seq(), 100);
-        assert_eq!(compute_min_applied_target(&healthy.layout, &healthy.progress), -1);
+        assert_eq!(
+            compute_min_applied_target(&healthy.layout, &healthy.progress),
+            -1
+        );
         for seq in [2, 10, 100] {
             assert!(healthy.stage(seq, "sqllog").exists());
-            assert!(healthy.layout.device_work_dir.join(format!("{seq}.sqllog")).exists());
+            assert!(healthy
+                .layout
+                .device_work_dir
+                .join(format!("{seq}.sqllog"))
+                .exists());
         }
         drop(failed_lock);
 
@@ -9722,16 +11346,29 @@ mod tests {
         assert_eq!(failing.rows(), vec![2, 10, 100]);
         assert_eq!(failing.checkpoint_seq(), 100);
         assert!(failed_pending.is_empty());
-        assert_eq!(compute_min_applied_target(&healthy.layout, &healthy.progress), 99);
+        assert_eq!(
+            compute_min_applied_target(&healthy.layout, &healthy.progress),
+            99
+        );
         healthy.flush(&mut Vec::new()).unwrap();
         for seq in [2, 10] {
             assert!(!healthy.stage(seq, "sqllog").exists());
-            assert!(!healthy.layout.device_work_dir.join(format!("{seq}.sqllog")).exists());
-            assert!(!failing.layout.device_work_dir.join(format!("{seq}.sqllog")).exists());
+            assert!(!healthy
+                .layout
+                .device_work_dir
+                .join(format!("{seq}.sqllog"))
+                .exists());
+            assert!(!failing
+                .layout
+                .device_work_dir
+                .join(format!("{seq}.sqllog"))
+                .exists());
         }
         assert!(healthy.stage(100, "sqllog").exists());
         // Old messages surviving cleanup cannot permanently block the queue.
-        healthy.flush(&mut vec![healthy.stage(2, "sqllog")]).unwrap();
+        healthy
+            .flush(&mut vec![healthy.stage(2, "sqllog")])
+            .unwrap();
         assert_eq!(healthy.rows(), vec![2, 10, 100]);
     }
 
@@ -9750,12 +11387,22 @@ mod tests {
         }
         let mut pending = vec![failing.stage(10, "cdclog")];
         assert!(failing.flush(&mut pending).is_err());
-        assert_eq!(pending, vec![failing.stage(2, "cdclog"), failing.stage(10, "cdclog")]);
-        assert!(read_destination_resume_checkpoint(&failing.layout).unwrap().is_none());
+        assert_eq!(
+            pending,
+            vec![failing.stage(2, "cdclog"), failing.stage(10, "cdclog")]
+        );
+        assert!(read_destination_resume_checkpoint(&failing.layout)
+            .unwrap()
+            .is_none());
         healthy.flush(&mut Vec::new()).unwrap();
         assert_eq!(healthy.rows(), vec![2, 10]);
-        assert_eq!(read_destination_resume_checkpoint(&healthy.layout).unwrap().unwrap()
-            .cdc_log_segment_sequence_number, 10);
+        assert_eq!(
+            read_destination_resume_checkpoint(&healthy.layout)
+                .unwrap()
+                .unwrap()
+                .cdc_log_segment_sequence_number,
+            10
+        );
         assert!(healthy.stage(2, "cdclog").exists());
         assert!(healthy.layout.device_work_dir.join("2.cdclog").exists());
 
@@ -9763,8 +11410,13 @@ mod tests {
         failing.flush(&mut pending).unwrap();
         assert!(pending.is_empty());
         assert_eq!(failing.rows(), vec![2, 10]);
-        assert_eq!(read_destination_resume_checkpoint(&failing.layout).unwrap().unwrap()
-            .cdc_log_segment_sequence_number, 10);
+        assert_eq!(
+            read_destination_resume_checkpoint(&failing.layout)
+                .unwrap()
+                .unwrap()
+                .cdc_log_segment_sequence_number,
+            10
+        );
         healthy.flush(&mut Vec::new()).unwrap();
         assert!(!healthy.stage(2, "cdclog").exists());
         assert!(!healthy.layout.device_work_dir.join("2.cdclog").exists());
@@ -9774,28 +11426,42 @@ mod tests {
 
     #[test]
     fn ordered_queue_retains_failed_and_deferred_heads_without_stage_scan() {
-        let mut pending = [100, 2, 10, 1].map(|seq| PathBuf::from(format!("{seq}.sqllog"))).to_vec();
+        let mut pending = [100, 2, 10, 1]
+            .map(|seq| PathBuf::from(format!("{seq}.sqllog")))
+            .to_vec();
         let mut seen = Vec::new();
         assert!(drain_ordered_stage_paths(&mut pending, |path| {
             let seq = parse_segment_seq(path).unwrap();
             seen.push(seq);
-            if seq == 2 { Err(Error::Internal("offline".into())) }
-            else { Ok(StagePathOutcome::Complete) }
-        }).is_err());
+            if seq == 2 {
+                Err(Error::Internal("offline".into()))
+            } else {
+                Ok(StagePathOutcome::Complete)
+            }
+        })
+        .is_err());
         assert_eq!(seen, vec![1, 2]);
-        assert_eq!(pending.iter().map(|p| parse_segment_seq(p).unwrap()).collect::<Vec<_>>(), vec![2, 10, 100]);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|p| parse_segment_seq(p).unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 10, 100]
+        );
         seen.clear();
         drain_ordered_stage_paths(&mut pending, |path| {
             seen.push(parse_segment_seq(path).unwrap());
             Ok(StagePathOutcome::Deferred)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(seen, vec![2]);
         assert_eq!(pending.len(), 3);
         seen.clear();
         drain_ordered_stage_paths(&mut pending, |path| {
             seen.push(parse_segment_seq(path).unwrap());
             Ok(StagePathOutcome::Complete)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(seen, vec![2, 10, 100]);
         assert!(pending.is_empty());
     }
@@ -9815,10 +11481,13 @@ mod tests {
         assert!(dst.rows().is_empty());
         assert!(!dst.layout.device_work_dir.join("10.sqllog").exists());
 
-        Connection::open(dst.stage(2, "sqllog")).unwrap().execute_batch(
-            "INSERT INTO commandlog VALUES(2, 2, 'COMMIT', 0, NULL, NULL, NULL);"
-        ).unwrap();
-        let lock = DeviceProcessingLock::try_lock(&dst.layout).unwrap().unwrap();
+        Connection::open(dst.stage(2, "sqllog"))
+            .unwrap()
+            .execute_batch("INSERT INTO commandlog VALUES(2, 2, 'COMMIT', 0, NULL, NULL, NULL);")
+            .unwrap();
+        let lock = DeviceProcessingLock::try_lock(&dst.layout)
+            .unwrap()
+            .unwrap();
         dst.flush(&mut pending).unwrap();
         assert_eq!(pending.len(), 2);
         assert_eq!(dst.checkpoint_seq(), -1);
@@ -9854,7 +11523,9 @@ mod tests {
     #[test]
     fn restart_discovers_failed_work_before_later_stage_in_all_device_branches() {
         for (device_type, extension) in [
-            ("sqlite_store", "sqllog"), ("sqlite", "sqllog"), ("other", "cdclog"),
+            ("sqlite_store", "sqllog"),
+            ("sqlite", "sqllog"),
+            ("other", "cdclog"),
         ] {
             let root = RuntimeTestRoot::new("restart-work");
             let dst = RuntimeTestDestination::new(&root.0, 1, device_type);
@@ -9875,14 +11546,29 @@ mod tests {
             assert!(restarted.flush(&mut pending).is_err(), "{device_type}");
             assert_eq!(pending, vec![head.clone(), later.clone()], "{device_type}");
             assert_eq!(restarted.checkpoint_seq(), -1);
-            assert_eq!(compute_min_applied_target(&restarted.layout, &restarted.progress), -1);
+            assert_eq!(
+                compute_min_applied_target(&restarted.layout, &restarted.progress),
+                -1
+            );
             assert!(!segment_metadata_status_is_applied(
-                &restarted.layout.device_work_dir.join(head.file_name().unwrap())
+                &restarted
+                    .layout
+                    .device_work_dir
+                    .join(head.file_name().unwrap())
             ));
-            assert!(!restarted.layout.device_work_dir.join(later.file_name().unwrap()).exists());
+            assert!(!restarted
+                .layout
+                .device_work_dir
+                .join(later.file_name().unwrap())
+                .exists());
 
             if device_type == "sqlite" {
-                write_test_segment(&restarted.layout.device_work_dir.join("10.cdclog"), 10, true, true);
+                write_test_segment(
+                    &restarted.layout.device_work_dir.join("10.cdclog"),
+                    10,
+                    true,
+                    true,
+                );
             }
             restarted.recover();
             restarted.flush(&mut pending).unwrap();
@@ -9938,7 +11624,11 @@ mod tests {
             dst.recover();
             let stage = dst.stage(2, "sqllog");
             write_test_segment(&stage, 2, false, true);
-            let stats = if global_failure { &dst.global_stats } else { &dst.stats };
+            let stats = if global_failure {
+                &dst.global_stats
+            } else {
+                &dst.stats
+            };
             stats.execute_batch("PRAGMA query_only = ON").unwrap();
             dst.flush(&mut vec![stage.clone()]).unwrap();
             assert_eq!(dst.rows(), vec![2]);
@@ -9949,9 +11639,15 @@ mod tests {
             stats.execute_batch("PRAGMA query_only = OFF").unwrap();
             dst.flush(&mut vec![stage]).unwrap();
             assert_eq!(dst.rows(), vec![2]);
-            assert_eq!(dst.state.query_row(
-                "SELECT txn_count FROM synclite_checkpoint", [], |row| row.get::<_, i64>(0),
-            ).unwrap(), 1);
+            assert_eq!(
+                dst.state
+                    .query_row("SELECT txn_count FROM synclite_checkpoint", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ),)
+                    .unwrap(),
+                1
+            );
         }
     }
 
@@ -9984,7 +11680,10 @@ mod tests {
         assert!(pending.is_empty());
         assert_eq!(restarted.rows(), vec![2, 10]);
         assert_eq!(restarted.checkpoint_seq(), 10);
-        assert_eq!(get_state_i64(&restarted.state, LAST_STAGE_CLEANED_SEGMENT_KEY, -1).unwrap(), -1);
+        assert_eq!(
+            get_state_i64(&restarted.state, LAST_STAGE_CLEANED_SEGMENT_KEY, -1).unwrap(),
+            -1
+        );
         assert!(!work_head.exists());
     }
 
@@ -10009,7 +11708,10 @@ mod tests {
         assert!(restarted.rows().is_empty());
         assert_eq!(restarted.checkpoint_seq(), -1);
         assert!(!segment_metadata_status_is_applied(&work));
-        assert_eq!(compute_min_applied_target(&restarted.layout, &restarted.progress), -1);
+        assert_eq!(
+            compute_min_applied_target(&restarted.layout, &restarted.progress),
+            -1
+        );
     }
 
     #[test]
@@ -10021,9 +11723,10 @@ mod tests {
         fs::create_dir_all(&stage_dir).unwrap();
         let stage = stage_dir.join("2.sqllog");
         write_test_segment(&stage, 2, false, false);
-        Connection::open(&stage).unwrap().execute_batch(
-            "UPDATE commandlog SET sql = 'REPLAY_TXN', arg_cnt = 0;"
-        ).unwrap();
+        Connection::open(&stage)
+            .unwrap()
+            .execute_batch("UPDATE commandlog SET sql = 'REPLAY_TXN', arg_cnt = 0;")
+            .unwrap();
         let work = mirror_stage_artifact_to_work(&dst.layout, &stage).unwrap();
         assert_eq!(work, dst.layout.device_work_dir.join("2.sqllog"));
         assert!(!last_txn_fate_decided(&work).unwrap());
@@ -10035,7 +11738,10 @@ mod tests {
         assert!(last_txn_fate_decided(&work).unwrap());
         let work_sidecar = replay_txn_sidecar_path(&work, 2, 2);
         assert_eq!(fs::read(&work_sidecar).unwrap(), b"late txn payload");
-        assert_eq!(mirror_stage_artifact_to_work(&dst.layout, &work).unwrap(), work);
+        assert_eq!(
+            mirror_stage_artifact_to_work(&dst.layout, &work).unwrap(),
+            work
+        );
         assert_eq!(fs::read(&work).unwrap(), original);
         assert_eq!(fs::read(&work_sidecar).unwrap(), b"late txn payload");
     }
@@ -10069,7 +11775,11 @@ mod tests {
         let archive = dst.layout.device_work_dir.join("failed_logs_for_dst_1");
         fs::create_dir_all(&archive).unwrap();
         write_test_segment(&archive.join("2.sqllog"), 2, false, true);
-        fs::write(dst.layout.device_work_dir.join("10.sqllog.10.txn"), b"sidecar").unwrap();
+        fs::write(
+            dst.layout.device_work_dir.join("10.sqllog.10.txn"),
+            b"sidecar",
+        )
+        .unwrap();
         let mut pending = vec![stage.clone(), work, derivative, stage.clone()];
         discover_pending_stage_paths(&dst.layout, &mut pending).unwrap();
         assert_eq!(pending, vec![stage.clone()]);
@@ -10090,14 +11800,26 @@ mod tests {
         assert!(!dst.stage(2, "sqllog").exists());
         // Simulate a lost best-effort cleaner watermark; authorization was
         // already durable before any file removal and survives worker restart.
-        Connection::open(device_metadata_path(&dst.layout)).unwrap().execute(
-            "DELETE FROM metadata WHERE key = ?1", [LAST_CLEANED_SEGMENT_KEY],
-        ).unwrap();
+        Connection::open(device_metadata_path(&dst.layout))
+            .unwrap()
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                [LAST_CLEANED_SEGMENT_KEY],
+            )
+            .unwrap();
         let restarted = CleanupProgress::register(&dst.layout);
-        assert_eq!(process_stage_path_ready(
-            &dst.layout, &dst.state, &dst.stats, &dst.global_stats,
-            &restarted, &dst.stage(2, "sqllog"),
-        ).unwrap(), StagePathOutcome::Complete);
+        assert_eq!(
+            process_stage_path_ready(
+                &dst.layout,
+                &dst.state,
+                &dst.stats,
+                &dst.global_stats,
+                &restarted,
+                &dst.stage(2, "sqllog"),
+            )
+            .unwrap(),
+            StagePathOutcome::Complete
+        );
         assert_eq!(dst.rows(), vec![2, 10]);
     }
 
@@ -10135,9 +11857,15 @@ mod tests {
 
     #[test]
     fn classify_sql_kind_detects_dml_prefixes() {
-        assert_eq!(classify_sql_kind("INSERT INTO t VALUES (?)"), DmlKind::Insert);
+        assert_eq!(
+            classify_sql_kind("INSERT INTO t VALUES (?)"),
+            DmlKind::Insert
+        );
         assert_eq!(classify_sql_kind("  update t set a = ?"), DmlKind::Update);
-        assert_eq!(classify_sql_kind("\nDELETE FROM t WHERE id = ?"), DmlKind::Delete);
+        assert_eq!(
+            classify_sql_kind("\nDELETE FROM t WHERE id = ?"),
+            DmlKind::Delete
+        );
         assert_eq!(classify_sql_kind("CREATE TABLE t(x INT)"), DmlKind::Other);
     }
 
@@ -10158,10 +11886,34 @@ mod tests {
             SqlValue::Integer(42),
             SqlValue::Null,
         ];
-        let rendered = render_sql_with_args(sql, &args);
+        let rendered = render_sql_with_args(sql, &args, DstType::Postgres);
+        assert_eq!(rendered, "INSERT INTO t(a,b,c) VALUES('O''Hara',42,NULL)");
+    }
+
+    #[test]
+    fn render_sql_with_args_sqlite_roundtrips_binary_and_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t(payload BLOB, label TEXT)").unwrap();
+        let bytes = vec![0, 1, 39, 63, 92, 127, 128, 255];
+        let text = "O'Hara\\binary?";
+        for payload in [SqlValue::Blob(bytes.clone()), SqlValue::Blob(vec![]), SqlValue::Null] {
+            let args = vec![payload.clone(), SqlValue::Text(text.to_string())];
+            let sql = render_sql_with_args("INSERT INTO t VALUES (?, ?)", &args, DstType::Sqlite);
+            conn.execute_batch(&sql).unwrap();
+            let (actual, label): (SqlValue, String) = conn.query_row(
+                "SELECT payload, label FROM t ORDER BY rowid DESC LIMIT 1", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(actual, payload);
+            assert_eq!(label, text);
+        }
+    }
+
+    #[test]
+    fn render_sql_with_args_postgres_keeps_bytea_decode() {
         assert_eq!(
-            rendered,
-            "INSERT INTO t(a,b,c) VALUES('O''Hara',42,NULL)"
+            render_sql_with_args("INSERT INTO t VALUES (?)", &[SqlValue::Blob(vec![0, 128, 255])], DstType::Postgres),
+            "INSERT INTO t VALUES (decode('0080ff','hex'))"
         );
     }
 

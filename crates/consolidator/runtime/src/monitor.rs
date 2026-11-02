@@ -109,8 +109,11 @@ impl Monitor {
         let g_latency = make_gauge(&registry, "Latency", "Latency");
         // Java spells "Hearthbeat_Time" in the help string for
         // Job_Last_Heartbeat_Time; mirror it byte-for-byte.
-        let g_last_heartbeat_time =
-            make_gauge(&registry, "Job_Last_Heartbeat_Time", "Job_Last_Hearthbeat_Time");
+        let g_last_heartbeat_time = make_gauge(
+            &registry,
+            "Job_Last_Heartbeat_Time",
+            "Job_Last_Hearthbeat_Time",
+        );
         let g_last_job_start_time =
             make_gauge(&registry, "Job_Last_Start_Time", "Job_Last_Start_Time");
 
@@ -170,25 +173,31 @@ impl Monitor {
         self.failed_device_cnt.store(v, Ordering::Relaxed);
     }
     pub fn set_total_consolidated_table_cnt(&self, v: i64) {
-        self.total_consolidated_table_cnt.store(v, Ordering::Relaxed);
+        self.total_consolidated_table_cnt
+            .store(v, Ordering::Relaxed);
     }
     pub fn incr_total_cdc_log_segment_cnt(&self, v: i64) {
-        self.total_cdc_log_segment_cnt.fetch_add(v, Ordering::Relaxed);
+        self.total_cdc_log_segment_cnt
+            .fetch_add(v, Ordering::Relaxed);
     }
     pub fn incr_total_processed_oper_count(&self, v: i64) {
-        self.total_processed_oper_count.fetch_add(v, Ordering::Relaxed);
+        self.total_processed_oper_count
+            .fetch_add(v, Ordering::Relaxed);
     }
     pub fn incr_total_dst_txn_cnt(&self, v: i64) {
         self.total_dst_txn_cnt.fetch_add(v, Ordering::Relaxed);
     }
     pub fn incr_total_processed_log_size(&self, v: i64) {
-        self.total_processed_log_size.fetch_add(v, Ordering::Relaxed);
+        self.total_processed_log_size
+            .fetch_add(v, Ordering::Relaxed);
     }
     pub fn incr_initialization_cnt(&self, v: i64) {
-        self.total_initialization_cnt.fetch_add(v, Ordering::Relaxed);
+        self.total_initialization_cnt
+            .fetch_add(v, Ordering::Relaxed);
     }
     pub fn incr_resynchronization_cnt(&self, v: i64) {
-        self.total_resynchronization_cnt.fetch_add(v, Ordering::Relaxed);
+        self.total_resynchronization_cnt
+            .fetch_add(v, Ordering::Relaxed);
     }
     pub fn set_latency_ms(&self, v: i64) {
         self.latency_ms.store(v, Ordering::Relaxed);
@@ -199,24 +208,30 @@ impl Monitor {
     /// Copy counters into gauges. Mirrors `PrometheusDumper.dump()` lines
     /// 148-167 (without the network push, which is the caller's job).
     fn refresh_gauges(&self) {
-        self.g_detected.set(self.detected_device_cnt.load(Ordering::Relaxed) as f64);
-        self.g_registered.set(self.registered_device_cnt.load(Ordering::Relaxed) as f64);
-        self.g_initialized.set(self.initialized_device_cnt.load(Ordering::Relaxed) as f64);
-        self.g_failed.set(self.failed_device_cnt.load(Ordering::Relaxed) as f64);
+        self.g_detected
+            .set(self.detected_device_cnt.load(Ordering::Relaxed) as f64);
+        self.g_registered
+            .set(self.registered_device_cnt.load(Ordering::Relaxed) as f64);
+        self.g_initialized
+            .set(self.initialized_device_cnt.load(Ordering::Relaxed) as f64);
+        self.g_failed
+            .set(self.failed_device_cnt.load(Ordering::Relaxed) as f64);
         self.g_consolidated_tables
             .set(self.total_consolidated_table_cnt.load(Ordering::Relaxed) as f64);
         self.g_log_segments
             .set(self.total_cdc_log_segment_cnt.load(Ordering::Relaxed) as f64);
         self.g_processed_opers
             .set(self.total_processed_oper_count.load(Ordering::Relaxed) as f64);
-        self.g_processed_txns.set(self.total_dst_txn_cnt.load(Ordering::Relaxed) as f64);
+        self.g_processed_txns
+            .set(self.total_dst_txn_cnt.load(Ordering::Relaxed) as f64);
         self.g_processed_log_size
             .set(self.total_processed_log_size.load(Ordering::Relaxed) as f64);
         self.g_initializations
             .set(self.total_initialization_cnt.load(Ordering::Relaxed) as f64);
         self.g_resynchronizations
             .set(self.total_resynchronization_cnt.load(Ordering::Relaxed) as f64);
-        self.g_latency.set(self.latency_ms.load(Ordering::Relaxed) as f64);
+        self.g_latency
+            .set(self.latency_ms.load(Ordering::Relaxed) as f64);
         self.g_last_heartbeat_time.set(now_millis() as f64);
         self.g_last_job_start_time
             .set(JOB_START_TIME_MS.get().copied().unwrap_or(0) as f64);
@@ -257,7 +272,11 @@ pub fn start_prometheus_publisher(gateway_url: String, interval_secs: u64) {
     if PUBLISHER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let interval = Duration::from_secs(if interval_secs == 0 { 60 } else { interval_secs });
+    let interval = Duration::from_secs(if interval_secs == 0 {
+        60
+    } else {
+        interval_secs
+    });
     let m = monitor();
     thread::Builder::new()
         .name("synclite-prometheus".to_string())
@@ -274,7 +293,9 @@ pub fn start_prometheus_publisher(gateway_url: String, interval_secs: u64) {
 
 fn make_gauge(registry: &Registry, name: &str, help: &str) -> Gauge {
     let g = Gauge::new(name, help).expect("valid gauge");
-    registry.register(Box::new(g.clone())).expect("register gauge");
+    registry
+        .register(Box::new(g.clone()))
+        .expect("register gauge");
     g
 }
 
@@ -328,7 +349,10 @@ fn send_http_post(
         None => (rest, "/"),
     };
     let mut iter = host_port.rsplitn(2, ':');
-    let port = iter.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(9091);
+    let port = iter
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(9091);
     let host = iter.next().unwrap_or(host_port);
 
     let mut stream =
@@ -347,7 +371,9 @@ fn send_http_post(
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("write headers: {e}"))?;
-    stream.write_all(body).map_err(|e| format!("write body: {e}"))?;
+    stream
+        .write_all(body)
+        .map_err(|e| format!("write body: {e}"))?;
 
     let mut resp = String::new();
     stream
@@ -360,7 +386,10 @@ fn send_http_post(
         .map(|l| l.contains(" 200 ") || l.contains(" 202 "))
         .unwrap_or(false);
     if !status_ok {
-        return Err(format!("push-gateway rejected: {}", resp.lines().next().unwrap_or("")));
+        return Err(format!(
+            "push-gateway rejected: {}",
+            resp.lines().next().unwrap_or("")
+        ));
     }
     Ok(())
 }

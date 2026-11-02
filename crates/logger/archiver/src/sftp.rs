@@ -191,16 +191,16 @@ async fn ship_async(cfg: &SftpConfig, src: &Path, remote_final: &str) -> Result<
         ..Default::default()
     });
 
-    let connect = client::connect(
-        ssh_cfg,
-        (cfg.host.as_str(), cfg.port),
-        AcceptAllHandler,
-    );
-    let mut session: Handle<AcceptAllHandler> =
-        tokio::time::timeout(cfg.connect_timeout, connect)
-            .await
-            .map_err(|_| Error::Archiver(format!("sftp connect to {}:{} timed out", cfg.host, cfg.port)))?
-            .map_err(|e| Error::Archiver(format!("sftp connect: {e}")))?;
+    let connect = client::connect(ssh_cfg, (cfg.host.as_str(), cfg.port), AcceptAllHandler);
+    let mut session: Handle<AcceptAllHandler> = tokio::time::timeout(cfg.connect_timeout, connect)
+        .await
+        .map_err(|_| {
+            Error::Archiver(format!(
+                "sftp connect to {}:{} timed out",
+                cfg.host, cfg.port
+            ))
+        })?
+        .map_err(|e| Error::Archiver(format!("sftp connect: {e}")))?;
 
     // Authenticate.
     let authed = match &cfg.auth {
@@ -210,12 +210,7 @@ async fn ship_async(cfg: &SftpConfig, src: &Path, remote_final: &str) -> Result<
             .map_err(|e| Error::Archiver(format!("sftp auth (password): {e}")))?,
         SftpAuth::PrivateKeyFile { path, passphrase } => {
             let key = russh_keys::load_secret_key(path, passphrase.as_deref())
-                .map_err(|e| {
-                    Error::Archiver(format!(
-                        "sftp load key {}: {e}",
-                        path.display()
-                    ))
-                })?;
+                .map_err(|e| Error::Archiver(format!("sftp load key {}: {e}", path.display())))?;
             session
                 .authenticate_publickey(&cfg.username, Arc::new(key))
                 .await
@@ -271,14 +266,14 @@ async fn ship_async(cfg: &SftpConfig, src: &Path, remote_final: &str) -> Result<
     // Rename into final position. On some servers `rename` fails if the
     // target exists, so remove it first (best-effort).
     let _ = sftp.remove_file(remote_final).await;
-    sftp.rename(&tmp_path, remote_final).await.map_err(|e| {
-        Error::Archiver(format!(
-            "sftp rename {tmp_path} -> {remote_final}: {e}"
-        ))
-    })?;
+    sftp.rename(&tmp_path, remote_final)
+        .await
+        .map_err(|e| Error::Archiver(format!("sftp rename {tmp_path} -> {remote_final}: {e}")))?;
 
     // Close the channel cleanly. Errors here are best-effort.
-    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+    let _ = session
+        .disconnect(russh::Disconnect::ByApplication, "", "")
+        .await;
     // Touch ChannelMsg to avoid unused-import lint when feature combinations
     // strip the underlying message types.
     let _ = std::mem::size_of::<ChannelMsg>();
@@ -339,5 +334,3 @@ mod tests {
         assert_eq!(p, "/srv/logs/commandlog-3.db");
     }
 }
-
-

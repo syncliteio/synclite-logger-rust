@@ -13,6 +13,11 @@ description = "JNI bindings that bridge Java SyncLite APIs to the Rust runtime."
 name = "synclite_jni"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Kept as a compatibility alias; DuckDB is always compiled in by synclite.
+duckdb = ["synclite/duckdb", "consolidator-runtime/duckdb"]
+
 [dependencies]
 consolidator-core.workspace = true
 consolidator-runtime.workspace = true

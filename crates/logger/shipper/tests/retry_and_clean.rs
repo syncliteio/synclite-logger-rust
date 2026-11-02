@@ -114,5 +114,3 @@ fn permanent_failure_does_not_clean_local_segment() {
     // The local segment must remain so the user can retry later.
     assert!(seg.exists(), "segment was wrongly cleaned despite failures");
 }
-
-

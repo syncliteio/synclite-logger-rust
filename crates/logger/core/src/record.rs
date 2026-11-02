@@ -42,4 +42,3 @@ pub enum ArgValue {
     /// Raw bytes (BLOB).
     Blob(Vec<u8>),
 }
-

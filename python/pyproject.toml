@@ -16,6 +16,15 @@ classifiers = [
     "Programming Language :: Rust",
 ]
 
+[project.optional-dependencies]
+sqlalchemy = ["SQLAlchemy>=2.0,<3"]
+sqlalchemy-duckdb = ["SQLAlchemy>=2.0,<3", "duckdb-engine>=0.17,<0.18"]
+test = ["pytest>=7", "SQLAlchemy>=2.0,<3", "duckdb-engine>=0.17,<0.18"]
+
+[project.entry-points."sqlalchemy.dialects"]
+"sqlite.synclite" = "synclite.sqlalchemy.sqlite:SQLiteDialect_syncLite"
+"duckdb.synclite" = "synclite.sqlalchemy.duckdb:DuckDBDialect_syncLite"
+
 [project.urls]
 Homepage = "https://www.synclite.io"
 Repository = "https://github.com/synclite/synclite"

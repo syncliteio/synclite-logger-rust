@@ -10,9 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
+use logger_core::{Error, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use logger_core::{Error, Result};
 
 /// Standard well-known metadata keys.
 pub mod keys {
@@ -49,7 +49,10 @@ impl MetadataManager {
         .map_err(db_err)?;
         conn.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES(?1, ?2)",
-            params![keys::SYNCLITE_METADATA_VERSION, SYNCLITE_METADATA_VERSION.to_string()],
+            params![
+                keys::SYNCLITE_METADATA_VERSION,
+                SYNCLITE_METADATA_VERSION.to_string()
+            ],
         )
         .map_err(db_err)?;
         Ok(Self {
@@ -140,5 +143,3 @@ mod tests {
         format!("{n:x}")
     }
 }
-
-

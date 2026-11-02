@@ -2,10 +2,10 @@
 //! Asserts the produced log segment captures every mutation, excludes
 //! SELECTs, and is marked `READY_TO_APPLY`.
 
-use rusqlite::Connection;
 use logger_core::record::ArgValue;
 use logger_db_sqlite::{SqliteDevice, SqliteDeviceConfig};
 use logger_db_traits::DbDevice;
+use rusqlite::Connection;
 use tempfile::tempdir;
 
 #[test]
@@ -21,16 +21,24 @@ fn write_workload_produces_ready_segment() {
     device
         .execute(
             "INSERT INTO memories(k, v) VALUES (?, ?)",
-            &[ArgValue::Text("ctx1".into()), ArgValue::Text("hello".into())],
+            &[
+                ArgValue::Text("ctx1".into()),
+                ArgValue::Text("hello".into()),
+            ],
         )
         .unwrap();
     device
         .execute(
             "INSERT INTO memories(k, v) VALUES (?, ?)",
-            &[ArgValue::Text("ctx2".into()), ArgValue::Text("world".into())],
+            &[
+                ArgValue::Text("ctx2".into()),
+                ArgValue::Text("world".into()),
+            ],
         )
         .unwrap();
-    let rows = device.query("SELECT v FROM memories ORDER BY k", &[]).unwrap();
+    let rows = device
+        .query("SELECT v FROM memories ORDER BY k", &[])
+        .unwrap();
     assert_eq!(rows.len(), 2);
 
     device.commit().unwrap();
@@ -68,5 +76,3 @@ fn write_workload_produces_ready_segment() {
         .unwrap();
     assert_eq!((a1.as_str(), a2.as_str()), ("ctx2", "world"));
 }
-
-

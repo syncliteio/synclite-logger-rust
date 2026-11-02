@@ -184,9 +184,9 @@ impl DataTypeMapper {
         }
         let normalized = normalize_type_for_switch(src);
         match normalized.as_str() {
-            "smallserial" | "serial" | "bigserial" | "integer" | "int" | "tinyint"
-            | "smallint" | "mediumint" | "bigint" | "int2" | "int4" | "int8" | "long"
-            | "byteint" | "unsigned" => self.best_effort_integer(),
+            "smallserial" | "serial" | "bigserial" | "integer" | "int" | "tinyint" | "smallint"
+            | "mediumint" | "bigint" | "int2" | "int4" | "int8" | "long" | "byteint"
+            | "unsigned" => self.best_effort_integer(),
 
             "bit" | "varbit" => self.best_effort_bit_string(src),
 

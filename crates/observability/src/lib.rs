@@ -111,11 +111,17 @@ pub struct RotationPolicy {
 impl RotationPolicy {
     /// Java logger default: 10 KB / 10 backups (`SyncLite.initTracer`).
     pub const fn logger_default() -> Self {
-        Self { max_bytes: 10 * 1024, max_backups: 10 }
+        Self {
+            max_bytes: 10 * 1024,
+            max_backups: 10,
+        }
     }
     /// Java consolidator default: 10 MB / 10 backups (`RollingFileAppender` defaults).
     pub const fn consolidator_default() -> Self {
-        Self { max_bytes: 10 * 1024 * 1024, max_backups: 10 }
+        Self {
+            max_bytes: 10 * 1024 * 1024,
+            max_backups: 10,
+        }
     }
 }
 
@@ -229,9 +235,10 @@ impl Tracer {
         if !self.is_enabled(event_level) {
             return;
         }
-        let ts = OffsetDateTime::now_local()
-            .unwrap_or_else(|_| OffsetDateTime::now_utc());
-        let ts_str = ts.format(&TS_FMT).unwrap_or_else(|_| String::from("0000-00-00 00:00:00,000"));
+        let ts = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let ts_str = ts
+            .format(&TS_FMT)
+            .unwrap_or_else(|_| String::from("0000-00-00 00:00:00,000"));
         let category = short_category(target);
 
         // Build the line in a single String, then write under the mutex to
@@ -405,13 +412,24 @@ mod tests {
             .name("worker-7".into())
             .spawn({
                 let t = tracer.clone();
-                move || t.info("com.synclite.consolidator.device.Device", format_args!("started"))
+                move || {
+                    t.info(
+                        "com.synclite.consolidator.device.Device",
+                        format_args!("started"),
+                    )
+                }
             })
             .unwrap();
         handle.join().unwrap();
         let content = fs::read_to_string(tracer.path()).unwrap();
-        assert!(content.contains("[Device]"), "expected [Device] category: {content:?}");
-        assert!(content.contains("[worker-7]"), "expected [worker-7] thread: {content:?}");
+        assert!(
+            content.contains("[Device]"),
+            "expected [Device] category: {content:?}"
+        );
+        assert!(
+            content.contains("[worker-7]"),
+            "expected [worker-7] thread: {content:?}"
+        );
         assert!(content.contains("started"));
     }
 
@@ -425,7 +443,10 @@ mod tests {
         tracer.error("SQLLogger", format_args!("kept"));
         let content = fs::read_to_string(tracer.path()).unwrap();
         assert!(content.contains("kept"));
-        assert!(!content.contains("ignored"), "level-filtered events leaked: {content}");
+        assert!(
+            !content.contains("ignored"),
+            "level-filtered events leaked: {content}"
+        );
     }
 
     #[test]
@@ -434,7 +455,10 @@ mod tests {
         let trace_file = tmp.path().join("rot.trace");
         let tracer = Tracer::open(
             trace_file.clone(),
-            RotationPolicy { max_bytes: 200, max_backups: 3 },
+            RotationPolicy {
+                max_bytes: 200,
+                max_backups: 3,
+            },
             TraceLevel::Debug,
             FormatVariant::LoggerStyle,
         )
@@ -448,8 +472,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(entries.iter().any(|n| n.starts_with("rot.trace.")),
-            "expected rotated file, got: {entries:?}");
+        assert!(
+            entries.iter().any(|n| n.starts_with("rot.trace.")),
+            "expected rotated file, got: {entries:?}"
+        );
     }
 
     fn regex_lite_match(s: &str) -> bool {

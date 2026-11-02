@@ -2,13 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ::duckdb::{params, params_from_iter as duck_params_from_iter, types::Value as RawDuckValue, Connection as RawDuckDbConnection, DropBehavior};
+use ::duckdb::{
+    params, params_from_iter as duck_params_from_iter, types::Value as RawDuckValue,
+    Connection as RawDuckDbConnection, DropBehavior,
+};
 use ::rusqlite::Connection as RawSqliteConnection;
+use logger_core::record::ArgValue;
+use logger_core::{DeviceType, Result};
 use synclite::duckdb;
 use synclite::rusqlite;
 use synclite::Logger;
-use logger_core::record::ArgValue;
-use logger_core::{DeviceType, Result};
 
 fn main() -> Result<()> {
     let root = demo_root();
@@ -110,10 +113,7 @@ fn run_sqlite_demo(root: &Path) -> Result<()> {
     {
         let mut stmt = conn.prepare("INSERT INTO t_bulk (id, name) VALUES (?, ?)")?;
         for i in 1..=5 {
-            stmt.add_batch(&[
-                ArgValue::Int(i),
-                ArgValue::Text(format!("sqlite-user-{i}")),
-            ]);
+            stmt.add_batch(&[ArgValue::Int(i), ArgValue::Text(format!("sqlite-user-{i}"))]);
         }
         stmt.execute_batch()?;
     }
@@ -202,10 +202,7 @@ fn run_duckdb_demo(root: &Path) -> Result<()> {
     {
         let mut stmt = conn.prepare("INSERT INTO t_bulk (id, name) VALUES (?, ?)")?;
         for i in 1..=5 {
-            stmt.add_batch(&[
-                ArgValue::Int(i),
-                ArgValue::Text(format!("duckdb-user-{i}")),
-            ]);
+            stmt.add_batch(&[ArgValue::Int(i), ArgValue::Text(format!("duckdb-user-{i}"))]);
         }
         stmt.execute_batch()?;
     }
@@ -326,12 +323,11 @@ fn run_sqlite_bulk_demo(root: &Path) -> Result<()> {
     let elapsed = started.elapsed();
     conn.close()?;
 
-    let stage_subdir = find_stage_subdir(&stage_dir, device_name)
-        .expect("sqlite bulk stage subdir not found");
+    let stage_subdir =
+        find_stage_subdir(&stage_dir, device_name).expect("sqlite bulk stage subdir not found");
     let insert_txns = count_distinct_insert_commits(&stage_subdir, "t_bulk_1m");
     assert_eq!(
-        insert_txns,
-        batches as usize,
+        insert_txns, batches as usize,
         "expected exactly {batches} INSERT transactions (one per batch), found {insert_txns}"
     );
 
@@ -451,12 +447,11 @@ fn run_duckdb_bulk_demo(root: &Path) -> Result<()> {
     let elapsed = started.elapsed();
     conn.close()?;
 
-    let stage_subdir = find_stage_subdir(&stage_dir, device_name)
-        .expect("duckdb bulk stage subdir not found");
+    let stage_subdir =
+        find_stage_subdir(&stage_dir, device_name).expect("duckdb bulk stage subdir not found");
     let insert_txns = count_distinct_insert_commits(&stage_subdir, "t_bulk_1m");
     assert_eq!(
-        insert_txns,
-        batches as usize,
+        insert_txns, batches as usize,
         "expected exactly {batches} INSERT transactions (one per batch), found {insert_txns}"
     );
 
@@ -469,7 +464,8 @@ fn run_duckdb_bulk_demo(root: &Path) -> Result<()> {
 
 fn run_raw_duckdb_bulk_demo(root: &Path) -> Result<()> {
     let db_path = root.join("duckdb_raw_bulk_1m.duckdb");
-    let conn = RawDuckDbConnection::open(&db_path).map_err(|e| logger_core::Error::Db(e.to_string()))?;
+    let conn =
+        RawDuckDbConnection::open(&db_path).map_err(|e| logger_core::Error::Db(e.to_string()))?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS t_bulk_1m (id INTEGER, name TEXT)",
@@ -509,7 +505,9 @@ fn run_raw_duckdb_bulk_demo(root: &Path) -> Result<()> {
         conn.execute("COMMIT", [])
             .map_err(|e| logger_core::Error::Db(e.to_string()))?;
         chunk_no += 1;
-        println!("Raw DuckDB bulk progress: batch {chunk_no}/{batches}, inserted {end}/{total_rows}");
+        println!(
+            "Raw DuckDB bulk progress: batch {chunk_no}/{batches}, inserted {end}/{total_rows}"
+        );
         next_id = end + 1;
     }
 
@@ -559,7 +557,9 @@ fn run_raw_duckdb_appender_bulk_demo(root: &Path) -> Result<()> {
             }
         }
         chunk_no += 1;
-        println!("Raw DuckDB appender progress: batch {chunk_no}/{batches}, inserted {end}/{total_rows}");
+        println!(
+            "Raw DuckDB appender progress: batch {chunk_no}/{batches}, inserted {end}/{total_rows}"
+        );
         next_id = end + 1;
     }
 
@@ -593,8 +593,8 @@ fn write_conf(
 
 fn print_artifacts(label: &str, root: &Path, device_name: &str, db_path: &Path, stage_dir: &Path) {
     let device_home: PathBuf = format!("{}.synclite", db_path.display()).into();
-    let stage_subdir = find_stage_subdir(stage_dir, device_name)
-        .unwrap_or_else(|| PathBuf::from("<not-found>"));
+    let stage_subdir =
+        find_stage_subdir(stage_dir, device_name).unwrap_or_else(|| PathBuf::from("<not-found>"));
 
     println!("\n=== {label} artifacts ===");
     println!("DB file: {}", db_path.display());
@@ -723,8 +723,3 @@ fn bulk_batches() -> i64 {
         .filter(|v| *v > 0)
         .unwrap_or(10)
 }
-
-
-
-
-
