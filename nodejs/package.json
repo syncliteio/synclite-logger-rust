@@ -1,6 +1,6 @@
 {
   "name": "synclite",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Node.js bindings for the SyncLite Rust runtime",
   "main": "synclite.js",
   "types": "synclite.d.ts",
@@ -17,9 +17,9 @@
     "README.md"
   ],
   "scripts": {
-    "build": "napi build --platform --release --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 . && node scripts/verify-loader-scope.js",
-    "build:linux:x64": "napi build --platform --release --zig --target x86_64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 . && node scripts/verify-loader-scope.js",
-    "build:linux:arm64": "napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 . && node scripts/verify-loader-scope.js",
+    "build": "napi build --platform --release --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_2_0 . && node scripts/verify-loader-scope.js",
+    "build:linux:x64": "napi build --platform --release --zig --target x86_64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_2_0 . && node scripts/verify-loader-scope.js",
+    "build:linux:arm64": "napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_2_0 . && node scripts/verify-loader-scope.js",
     "pack:offline": "node scripts/pack-offline.js",
     "pack:offline:all": "npm run pack:offline && npm run pack:offline -- win32-x64-msvc && npm run pack:offline -- linux-x64-gnu && npm run pack:offline -- linux-arm64-gnu"
   },
@@ -45,11 +45,8 @@
     "@napi-rs/cli": "^2.18.4"
   },
   "optionalDependencies": {
-    "@synclite/native-linux-arm64-gnu": "1.1.0",
-    "@synclite/native-linux-x64-gnu": "1.1.0",
-    "@synclite/native-win32-x64-msvc": "file:dist/synclite-native-win32-x64-msvc-1.1.0.tgz"
-  },
-  "dependencies": {
-    "synclite": "file:dist/synclite-1.1.0.tgz"
+    "@synclite/native-linux-arm64-gnu": "1.2.0",
+    "@synclite/native-linux-x64-gnu": "1.2.0",
+    "@synclite/native-win32-x64-msvc": "1.2.0"
   }
 }

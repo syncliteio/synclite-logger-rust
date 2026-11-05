@@ -13,7 +13,7 @@ dependency automatically:
 Install from npm:
 
 ```text
-npm install synclite@1.1.0
+npm install synclite@1.2.0
 ```
 
 No Rust toolchain or native rebuild is required on a supported platform.
@@ -53,16 +53,11 @@ the whole array first and initializes destinations sequentially. If a later
 destination cannot start, workers already started by that call are stopped
 before the initialization error is returned.
 
-For an extracted SyncLite platform/runtime release, run the platform-detecting
-installer from `sample-apps/nodejs/` instead:
-
-```text
-node install-synclite.js
-```
-
-It installs `lib/nodejs/synclite-1.1.0.tgz` and the matching
-`lib/nodejs/synclite-native-<platform>-1.1.0.tgz` without accessing an npm
-registry.
+Applications should install the main package from npm, not copy a native addon
+or install SDK build-output tarballs. The main and matching native packages
+must both be published at `1.2.0` before consumers can install that release.
+For air-gapped deployments, use a private npm registry populated with those
+same packages.
 
 ## Maintainers
 
@@ -74,12 +69,18 @@ npm run build
 ```
 
 This creates an `index.<platform>.node` file, such as
-`index.win32-x64-msvc.node`. Package the main loader and the three already-built
-native artifacts with:
+`index.win32-x64-msvc.node`. Package the main loader and the current host's
+native artifact with:
 
 ```text
-npm run pack:offline:all
+npm run pack:offline -- --host
 ```
 
+Linux packaging runs on Linux or WSL and requires `patchelf`. Each native
+package bundles its matching `libduckdb.so`; both binaries use `$ORIGIN`
+runpaths, so consumers do not need `LD_LIBRARY_PATH`. If the build uses
+`CARGO_TARGET_DIR`, pass the same value to the corresponding packaging command.
+The Maven Linux launcher does this separately for x64 and ARM64.
+
 Publish the three `@synclite/native-*` packages before publishing
-`synclite@1.1.0`, so its optional dependencies can resolve immediately.
+`synclite@1.2.0`, so its optional dependencies can resolve immediately.

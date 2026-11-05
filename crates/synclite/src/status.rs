@@ -1056,7 +1056,7 @@ mod tests {
         f.destination("-3");
         f.destination("-97");
         // This key alone can discover destination 1 and must not disappear
-        // on reload. The transient reinit key is object-init-mode, not this.
+        // on reload.
         f.set("dst-idempotent-data-ingestion-1", "true");
         for (base, value) in [
             ("dst-alias", "remote"),
@@ -1112,11 +1112,16 @@ mod tests {
             crate::read_persisted_initialize_extra(&f.layout.db_path).unwrap(),
             f.cfg.extra
         );
-        f.set("dst-object-init-mode-1", "OVERWRITE_OBJECT");
+        f.set("dst-object-init-mode-1", "TRY_CREATE_DELETE_DATA");
         f.persist();
-        assert!(!crate::read_persisted_initialize_extra(&f.layout.db_path)
-            .unwrap()
-            .contains_key("dst-object-init-mode-1"));
+        assert_eq!(crate::read_persisted_initialize_extra(&f.layout.db_path).unwrap()
+            .get("dst-object-init-mode-1").map(String::as_str), Some("TRY_CREATE_DELETE_DATA"));
+        std::fs::write(f.layout.device_home.join(crate::reinitialize::REINIT_SENTINEL), b"").unwrap();
+        crate::consume_reinit_sentinel(&f.layout.db_path, &mut f.cfg);
+        assert_eq!(f.cfg.extra["dst-object-init-mode-1"], "OVERWRITE_OBJECT");
+        f.persist();
+        assert_eq!(crate::read_persisted_initialize_extra(&f.layout.db_path).unwrap()
+            .get("dst-object-init-mode-1").map(String::as_str), Some("TRY_CREATE_DELETE_DATA"));
     }
 
     #[test]

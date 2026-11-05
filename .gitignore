@@ -4,3 +4,7 @@ Cargo.lock.bak
 .vscode/
 .idea/
 *.iml
+__pycache__/
+*.pyc
+*.pyo
+/python/dist/

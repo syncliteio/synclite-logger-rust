@@ -670,22 +670,10 @@ fn initialize_internal(
     // connect probe here adds nothing but a duplicate connection
     // attempt, so we deliberately don't do one.
 
-    // Persist destination + device config keys into the per-device
-    // metadata file BEFORE we ever bring up a Logger. This way any
-    // later `Connection::open(db_path)` reconstructs an identical
-    // config via `default_config_for_backend`, so the long-running
-    // consolidator that actually drains user writes has the right
-    // destination wired up.
-    persist_initialize_config_to_metadata(&normalized_db_path, &cfg)?;
-
     let registry = INITIALIZED_DEVICES.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = registry
         .lock()
         .map_err(|_| Error::Config("initialize registry mutex poisoned".to_string()))?;
-    if guard.contains(&normalized_db_path) {
-        return Ok(());
-    }
-
     let logger = Logger::open_with(cfg)?;
     logger.close()?;
     guard.insert(normalized_db_path);
@@ -1087,8 +1075,6 @@ impl Logger {
             // from a "device whose consolidator hasn't applied yet".
             // Direct Logger::open_with callers also need the full destination
             // configuration available to path-only status/await helpers.
-            persist_initialize_config_to_metadata(&db_path, &cfg)?;
-            Metadata::open_or_create(&layout.metadata_path)?.put_i64("sync_configured", 1)?;
             let dst_indices = parse_cfg_destination_indices(&cfg);
             let multi_destination = dst_indices.len() > 1;
             let all_dst_indexes: Vec<i32> = dst_indices.iter().map(|i| *i as i32).collect();
@@ -1229,6 +1215,9 @@ impl Logger {
                 // Java parity: `device-trace-level` (consolidator alias for the
                 // logger `trace-level` key). Already merged in the config parser.
                 consolidator_layout.trace_level = cfg.trace_level.clone();
+                consolidator_layout.device_polling_interval_ms = parse_cfg_u64_for_index(
+                    &cfg, &["device-polling-interval-ms"], dst_index, 2000,
+                );
                 // Pause sentinel: shared across all destinations for
                 // this device. Presence == sync paused.
                 consolidator_layout.pause_sentinel =
@@ -1461,6 +1450,7 @@ impl Logger {
             m.incr_initialized_device_cnt(startup.len() as i64);
             m.incr_initialization_cnt(startup.len() as i64);
 
+            persist_initialize_config_to_metadata(&db_path, &cfg)?;
             startup.finish()
         } else {
             Vec::new()
@@ -2405,8 +2395,13 @@ const PERSISTED_INIT_EXTRA_KEYS: &[&str] = &[
     "dst-delete-batch-size",
 ];
 
+const REINIT_ORIGINAL_OBJECT_MODE_KEY: &str = "_synclite-reinit-original-object-mode-1";
+
 fn is_persisted_init_extra_key(key: &str) -> bool {
-    PERSISTED_INIT_EXTRA_KEYS.contains(&key)
+    key.starts_with("dst-")
+        || key.starts_with("map-src-")
+        || matches!(key, "device-polling-interval-ms" | "device-trace-level" | "local-stage-directory")
+        || PERSISTED_INIT_EXTRA_KEYS.contains(&key)
         || key.rsplit_once('-').is_some_and(|(base, index)| {
             index.parse::<usize>().is_ok() && PERSISTED_INIT_EXTRA_KEYS.contains(&base)
         })
@@ -2477,6 +2472,15 @@ fn persist_initialize_config_to_metadata(db_path: &Path, cfg: &SyncLiteConfig) -
     // With no destination, preserve the old merge behavior and sync marker.
     for (key, value) in &cfg.extra {
         if is_persisted_init_extra_key(key) {
+            let value = if key == "dst-object-init-mode-1" {
+                match cfg.extra.get(REINIT_ORIGINAL_OBJECT_MODE_KEY) {
+                    Some(original) if original.is_empty() => continue,
+                    Some(original) => original,
+                    None => value,
+                }
+            } else {
+                value
+            };
             tx.execute(
                 "INSERT INTO metadata(key, value) VALUES(?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2484,6 +2488,22 @@ fn persist_initialize_config_to_metadata(db_path: &Path, cfg: &SyncLiteConfig) -
             )
             .map_err(map_err)?;
         }
+    }
+    if let Some(stage) = &cfg.local_stage_dir {
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES('local-stage-directory', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [stage.to_string_lossy().as_ref()],
+        )
+        .map_err(map_err)?;
+    }
+    if let Some(level) = &cfg.trace_level {
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES('device-trace-level', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [level],
+        )
+        .map_err(map_err)?;
     }
     if explicit_destination {
         tx.execute(
@@ -2504,6 +2524,12 @@ fn hydrate_initialize_config_from_metadata(db_path: &Path, cfg: &mut SyncLiteCon
         return;
     };
     for (key, value) in extra {
+        if key == "device-trace-level" && cfg.trace_level.is_none() {
+            cfg.trace_level = Some(value.clone());
+        }
+        if key == "local-stage-directory" {
+            cfg.local_stage_dir = Some(PathBuf::from(&value));
+        }
         cfg.extra.entry(key).or_insert(value);
     }
 }
@@ -2523,6 +2549,8 @@ fn consume_reinit_sentinel(db_path: &Path, cfg: &mut SyncLiteConfig) {
     if !sentinel.exists() {
         return;
     }
+    let original_mode = cfg.extra.get("dst-object-init-mode-1").cloned().unwrap_or_default();
+    cfg.extra.insert(REINIT_ORIGINAL_OBJECT_MODE_KEY.into(), original_mode);
     cfg.extra.insert(
         "dst-object-init-mode-1".to_string(),
         "OVERWRITE_OBJECT".to_string(),
@@ -2842,6 +2870,164 @@ mod tests {
             dst_schema: None,
             dst_sync_mode: DstSyncMode::Consolidation,
         }
+    }
+
+    #[test]
+    fn reinit_snapshot_override_does_not_replace_configured_object_policy() {
+        for original in [None, Some("TRY_CREATE_DELETE_DATA"), Some("OVERWRITE_OBJECT")] {
+            let root = tempfile::tempdir().unwrap();
+            let db = root.path().join("source.db");
+            let layout = super::DeviceLayout::new(db.clone());
+            std::fs::create_dir_all(&layout.device_home).unwrap();
+            let mut cfg = SyncLiteConfig::default();
+            apply_destination_initialize_options(&mut cfg, Some(sqlite_destination("destination.db"))).unwrap();
+            if let Some(mode) = original {
+                cfg.extra.insert("dst-object-init-mode-1".into(), mode.into());
+            }
+            std::fs::write(layout.device_home.join(super::reinitialize::REINIT_SENTINEL), b"").unwrap();
+            super::consume_reinit_sentinel(&db, &mut cfg);
+            assert_eq!(cfg.extra.get("dst-object-init-mode-1").map(String::as_str), Some("OVERWRITE_OBJECT"));
+            super::persist_initialize_config_to_metadata(&db, &cfg).unwrap();
+            let persisted = super::read_persisted_initialize_extra(&db).unwrap();
+            assert_eq!(persisted.get("dst-object-init-mode-1").map(String::as_str), original);
+            assert!(!persisted.contains_key(super::REINIT_ORIGINAL_OBJECT_MODE_KEY));
+        }
+    }
+
+    #[test]
+    fn upgrade_110_metadata_preserves_device_and_continues_sync_without_guard_errors() {
+        for device_type in [logger_core::DeviceType::SQLITE, logger_core::DeviceType::DUCKDB] {
+            for mode in ["CONSOLIDATION", "REPLICATION"] {
+                check_110_metadata_upgrade(device_type, mode);
+            }
+        }
+    }
+
+    fn check_110_metadata_upgrade(device_type: logger_core::DeviceType, mode: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("source.db");
+        let destination_path = root.path().join("destination.db");
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let device_name = "LegacyUpgrade";
+        let layout = super::DeviceLayout::new(db.clone());
+        std::fs::create_dir_all(&layout.device_home).unwrap();
+        let source_sql = "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO items VALUES(1, 'before upgrade');";
+        if device_type == logger_core::DeviceType::SQLITE {
+            ::rusqlite::Connection::open(&db).unwrap().execute_batch(source_sql).unwrap();
+        } else {
+            ::duckdb::Connection::open(&db).unwrap().execute_batch(source_sql).unwrap();
+        }
+        let metadata = super::Metadata::open_or_create(&layout.metadata_path).unwrap();
+        for (key, value) in [
+            ("uuid", device_id.as_str()),
+            ("device_name", device_name),
+            ("database_name", "source.db"),
+            ("dst-type", "SQLITE"),
+            ("dst-sync-mode", mode),
+            ("metadata-store-1", "LOCAL"),
+            ("dst-oper-retry-count-1", "3"),
+            ("dst-oper-retry-interval-ms-1", "1000"),
+        ] {
+            metadata.put(key, value).unwrap();
+        }
+        metadata.put("device_type", &device_type.to_string()).unwrap();
+        metadata.put("dst-connection-string", &format!("jdbc:sqlite:{}", destination_path.display())).unwrap();
+        assert!(metadata.get("device-data-root").unwrap().is_none());
+        assert!(metadata.get("local-stage-directory").unwrap().is_none());
+        assert!(metadata.get("device-trace-level").unwrap().is_none());
+        let mut cfg = SyncLiteConfig::default();
+        cfg.local_stage_dir = Some(root.path().join("legacy-stage"));
+        cfg.trace_level = Some("DEBUG".into());
+        cfg.extra.insert(super::DEVICE_DATA_ROOT_KEY.into(), root.path().join("legacy-work").to_string_lossy().into_owned());
+        cfg.extra.insert("dst-object-init-mode-1".into(), "TRY_CREATE_DELETE_DATA".into());
+        super::initialize(device_type, device_name, &db,
+            None::<DestinationOptions>, super::SyncLiteOptions { config: Some(cfg.clone()), ..super::SyncLiteOptions::default() }).unwrap();
+        for id in [2, 3] {
+            let mut connection = super::Logger::open_with(super::default_config_for_backend(db.clone(), device_type.backend())).unwrap();
+            connection.execute("INSERT INTO items(id, name) VALUES (?, ?)",
+                &[logger_db_traits::Value::Int(id), logger_db_traits::Value::Text("after upgrade".into())]).unwrap();
+            connection.commit().unwrap();
+            connection.flush().unwrap();
+            connection.close().unwrap();
+            super::await_sync(&db, std::time::Duration::from_secs(20)).unwrap();
+        }
+        super::initialize(device_type, device_name, &db,
+            None::<DestinationOptions>, super::SyncLiteOptions { config: Some(cfg), ..super::SyncLiteOptions::default() }).unwrap();
+        super::Logger::open_with(super::default_config_for_backend(db.clone(), device_type.backend())).unwrap().close().unwrap();
+        assert_eq!(metadata.get("uuid").unwrap().as_deref(), Some(device_id.as_str()));
+        assert_eq!(metadata.get("device_name").unwrap().as_deref(), Some(device_name));
+        let source_count: i64 = if device_type == logger_core::DeviceType::SQLITE {
+            ::rusqlite::Connection::open(&db).unwrap()
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0)).unwrap()
+        } else {
+            ::duckdb::Connection::open(&db).unwrap()
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0)).unwrap()
+        };
+        let destination_count: i64 = ::rusqlite::Connection::open(&destination_path).unwrap()
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0)).unwrap();
+        assert_eq!(source_count, 3);
+        assert_eq!(destination_count, 3);
+        consolidator_runtime::Consolidator::shutdown_device(&device_id, device_name).unwrap();
+        let trace_path = root.path().join("legacy-work")
+            .join(format!("synclite-{device_name}-{device_id}")).join("synclite_device.trace");
+        let snapshots_before = std::fs::read_to_string(&trace_path).unwrap()
+            .matches("Starting to consolidate device snapshot :").count();
+        assert_eq!(snapshots_before, 1);
+        let mut connection = super::Logger::open_with(super::default_config_for_backend(db.clone(), device_type.backend())).unwrap();
+        connection.execute("INSERT INTO items(id, name) VALUES (4, 'after restart')", &[]).unwrap();
+        connection.commit().unwrap();
+        connection.flush().unwrap();
+        connection.close().unwrap();
+        super::await_sync(&db, std::time::Duration::from_secs(20)).unwrap();
+        consolidator_runtime::Consolidator::shutdown_device(&device_id, device_name).unwrap();
+        let destination_count: i64 = ::rusqlite::Connection::open(&destination_path).unwrap()
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0)).unwrap();
+        assert_eq!(destination_count, 4);
+        assert_eq!(metadata.get("uuid").unwrap().as_deref(), Some(device_id.as_str()));
+        let snapshots_after = std::fs::read_to_string(&trace_path).unwrap()
+            .matches("Starting to consolidate device snapshot :").count();
+        assert_eq!(snapshots_after, snapshots_before, "restart must recover, not re-seed the destination");
+    }
+
+    #[test]
+    fn initialize_runtime_updates_reopen_and_reject_invariants_without_overwriting_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("source.db");
+        let destination_path = root.path().join("destination.db");
+        let mut cfg = SyncLiteConfig::default();
+        cfg.local_stage_dir = Some(root.path().join("custom-stage"));
+        cfg.trace_level = Some("DEBUG".into());
+        cfg.extra.insert(super::DEVICE_DATA_ROOT_KEY.into(), root.path().join("work").to_string_lossy().into_owned());
+        cfg.extra.insert("dst-insert-batch-size".into(), "17".into());
+        cfg.extra.insert("device-polling-interval-ms".into(), "25".into());
+        let destination = sqlite_destination(&destination_path.to_string_lossy());
+        let options = |config| super::SyncLiteOptions {
+            config: Some(config),
+            ..super::SyncLiteOptions::default()
+        };
+        super::initialize(logger_core::DeviceType::SQLITE, "runtimeoptions", &db,
+            Some(destination.clone()), options(cfg.clone())).unwrap();
+        super::rusqlite::Connection::open(&db).unwrap().close().unwrap();
+        cfg.trace_level = Some("ERROR".into());
+        cfg.extra.insert("dst-insert-batch-size".into(), "23".into());
+        cfg.extra.insert("device-polling-interval-ms".into(), "10".into());
+        super::initialize(logger_core::DeviceType::SQLITE, "runtimeoptions", &db,
+            Some(destination.clone()), options(cfg.clone())).unwrap();
+        let persisted = super::read_persisted_initialize_extra(&db).unwrap();
+        assert_eq!(persisted.get("device-trace-level").map(String::as_str), Some("ERROR"));
+        assert_eq!(persisted.get("dst-insert-batch-size").map(String::as_str), Some("23"));
+        assert_eq!(persisted.get("device-polling-interval-ms").map(String::as_str), Some("10"));
+        super::rusqlite::Connection::open(&db).unwrap().close().unwrap();
+        let changed = sqlite_destination(&root.path().join("other.db").to_string_lossy());
+        let error = super::initialize(logger_core::DeviceType::SQLITE, "runtimeoptions", &db,
+            Some(changed), options(cfg)).unwrap_err().to_string();
+        assert!(error.contains("dst_connection_string"), "{error}");
+        assert_eq!(super::read_persisted_initialize_extra(&db).unwrap(), persisted);
+        super::rusqlite::Connection::open(&db).unwrap().close().unwrap();
+        let layout = super::DeviceLayout::new(db);
+        let metadata = super::Metadata::open_or_create(&layout.metadata_path).unwrap();
+        let device_id = metadata.get("uuid").unwrap().unwrap();
+        consolidator_runtime::Consolidator::shutdown_device(&device_id, "runtimeoptions").unwrap();
     }
 
     #[test]

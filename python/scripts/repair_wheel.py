@@ -45,6 +45,23 @@ def _tool_available(module: str) -> bool:
         return False
 
 
+def _native_dependency_dirs(deps_dir: str) -> list[Path]:
+    deps_path = Path(deps_dir)
+    directories = [deps_path]
+    outputs = sorted(
+        (deps_path.parent / "build").glob("libduckdb-sys-*/output"),
+        key=lambda output: output.stat().st_mtime,
+        reverse=True,
+    )
+    for output in outputs:
+        for line in output.read_text(encoding="utf-8").splitlines():
+            if line.startswith(("cargo:rustc-link-search=native=", "cargo::rustc-link-search=native=")):
+                directory = Path(line.partition("=native=")[2])
+                if directory.is_dir() and directory not in directories:
+                    directories.append(directory)
+    return directories
+
+
 def _bundle_native_dlls_in_wheel(wheel: str, deps_dir: str) -> str:
     with tempfile.TemporaryDirectory(prefix="synclite-wheel-stage-") as stage_dir:
         stage_path = Path(stage_dir)
@@ -64,12 +81,13 @@ def _bundle_native_dlls_in_wheel(wheel: str, deps_dir: str) -> str:
 
         dll_patterns = ["*.dll", "*.pyd", "*.so", "*.dylib"]
         copied = 0
-        for pattern in dll_patterns:
-            for source in sorted(Path(deps_dir).rglob(pattern)):
-                if source.is_file():
+        for directory in _native_dependency_dirs(deps_dir):
+            for pattern in dll_patterns:
+                for source in sorted(directory.rglob(pattern)):
                     target = libs_dir / source.name
-                    shutil.copy2(source, target)
-                    copied += 1
+                    if source.is_file() and not target.exists():
+                        shutil.copy2(source, target)
+                        copied += 1
 
         if copied == 0:
             raise RuntimeError(f"no native libraries found in {deps_dir}")
@@ -118,7 +136,7 @@ def main(argv: list[str]) -> int:
                 return 0
             rc = _run([
                 sys.executable, "-m", "delvewheel", "repair",
-                "--add-path", deps_dir,
+                "--add-path", os.pathsep.join(str(directory) for directory in _native_dependency_dirs(deps_dir)),
                 "--wheel-dir", out_dir,
                 wheel,
             ])

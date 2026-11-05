@@ -7,7 +7,7 @@
  *   node pack-offline.js win32-x64-msvc → Pack "@synclite/native-win32-x64-msvc" platform pkg
  *
  * Main package mode:
- *   Creates dist/synclite-1.1.0.tgz with optional dependencies on all supported platforms.
+ *   Creates dist/synclite-1.2.0.tgz with optional dependencies on all supported platforms.
  *   When installed, npm automatically installs the correct platform binary (if available).
  *   The index.js loader tries local .node file first, then falls back to optional dep packages.
  *
@@ -25,7 +25,7 @@ const dist = path.join(root, 'dist');
 fs.mkdirSync(dist, { recursive: true });
 
 const MAIN_PACKAGE_NAME = 'synclite';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const PLATFORM_PACKAGE_SCOPE = '@synclite';
 const PLATFORM_PACKAGE_NAME = 'native';
 
@@ -82,6 +82,7 @@ function getPlatformPackageJson(platformTag) {
       'index.d.ts',
       `index.${platformTag}.node`,
       '*.dll',
+      '*.so*',
       'scripts/ensure-dlls.js',
       'README.md',
     ],
@@ -122,11 +123,11 @@ function getMainPackageJson() {
       'README.md',
     ],
     scripts: {
-      build: 'napi build --platform --release --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 .',
+      build: 'napi build --platform --release --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_2_0 .',
       'build:linux:x64':
-        'napi build --platform --release --zig --target x86_64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 .',
+        'napi build --platform --release --zig --target x86_64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_2_0 .',
       'build:linux:arm64':
-        'napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_1_0 .',
+        'napi build --platform --release --zig --zig-link-only --target aarch64-unknown-linux-gnu --cargo-cwd ../crates/logger/bindings-node --cargo-name synclite_node_1_2_0 .',
       'pack:offline': 'node scripts/pack-offline.js',
       'pack:offline:all': 'npm run pack:offline && npm run pack:offline -- win32-x64-msvc && npm run pack:offline -- linux-x64-gnu && npm run pack:offline -- linux-arm64-gnu',
     },
@@ -188,20 +189,73 @@ function packPlatformPackage(platformTag) {
     );
   }
 
-  // Copy platform-specific DLL dependencies for Windows packages
-  if (platformTag.includes('win32')) {
+  if (platformTag.startsWith('win32') || platformTag.startsWith('linux')) {
+    const linux = platformTag.startsWith('linux');
+    const libraryName = linux ? 'libduckdb.so' : 'duckdb.dll';
+    const targetDir = path.resolve(process.env.CARGO_TARGET_DIR || path.join(root, '..', 'target'));
+    const targetTriple = {
+      'linux-x64-gnu': 'x86_64-unknown-linux-gnu',
+      'linux-arm64-gnu': 'aarch64-unknown-linux-gnu',
+    }[platformTag];
+    const releaseDirs = targetTriple
+      ? [path.join(targetDir, targetTriple, 'release'), path.join(targetDir, 'release')]
+      : [path.join(targetDir, 'release')];
+    const cargoOutputs = releaseDirs.flatMap((releaseDir) => {
+      const buildDir = path.join(releaseDir, 'build');
+      return fs.existsSync(buildDir)
+        ? fs.readdirSync(buildDir)
+          .filter((name) => name.startsWith('libduckdb-sys-'))
+          .map((name) => path.join(buildDir, name, 'output'))
+          .filter((output) => fs.existsSync(output))
+          .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs)
+        : [];
+    });
+    const cargoDuckdbPaths = cargoOutputs.flatMap((output) =>
+      fs.readFileSync(output, 'utf8').split(/\r?\n/)
+        .filter((line) => /^cargo::?rustc-link-search=native=/.test(line))
+        .map((line) => path.join(line.slice(line.indexOf('=native=') + 8), libraryName)),
+    );
     const possibleDuckdbPaths = [
-      path.join(root, '..', 'target', 'release', 'duckdb.dll'),
-      path.join(root, '..', 'target', 'release', 'deps', 'duckdb.dll'),
-      path.join(root, '..', 'target', 'debug', 'deps', 'duckdb.dll'),
+      ...cargoDuckdbPaths,
+      ...cargoOutputs.map((output) => path.join(path.dirname(output), 'out', libraryName)),
+      ...releaseDirs.flatMap((releaseDir) => [
+        path.join(releaseDir, libraryName),
+        path.join(releaseDir, 'deps', libraryName),
+      ]),
     ];
-    for (const duckdbDll of possibleDuckdbPaths) {
-      if (fs.existsSync(duckdbDll)) {
-        fs.copyFileSync(duckdbDll, path.join(staging, 'duckdb.dll'));
-        console.log(`  ✓ Bundled DuckDB dependency: duckdb.dll`);
-        break;
+    const duckdbLibrary = possibleDuckdbPaths.find((candidate) => fs.existsSync(candidate));
+    if (!duckdbLibrary) {
+      console.error(`Cannot package ${platformTag}: ${libraryName} was not found in Cargo release link paths.`);
+      fs.rmSync(staging, { recursive: true, force: true });
+      process.exit(1);
+    }
+    const stagedLibrary = path.join(staging, libraryName);
+    fs.copyFileSync(duckdbLibrary, stagedLibrary);
+    if (linux) {
+      for (const file of [path.join(staging, addon), stagedLibrary]) {
+        const header = Buffer.alloc(20);
+        const descriptor = fs.openSync(file, 'r');
+        try {
+          fs.readSync(descriptor, header, 0, header.length, 0);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+        const machine = platformTag === 'linux-x64-gnu' ? 62 : 183;
+        if (header.toString('hex', 0, 4) !== '7f454c46'
+            || header[4] !== 2 || header[5] !== 1 || header.readUInt16LE(18) !== machine) {
+          console.error(`Native library architecture does not match ${platformTag}: ${file}`);
+          fs.rmSync(staging, { recursive: true, force: true });
+          process.exit(1);
+        }
+        const patched = spawnSync('patchelf', ['--set-rpath', '$ORIGIN', file], { stdio: 'inherit' });
+        if (patched.status !== 0) {
+          console.error(`Cannot set package-relative runpath for ${file}; Linux packaging requires patchelf.`);
+          fs.rmSync(staging, { recursive: true, force: true });
+          process.exit(patched.status || 1);
+        }
       }
     }
+    console.log(`  Bundled DuckDB dependency: ${duckdbLibrary}`);
   }
 
   // Pack with npm
@@ -279,7 +333,10 @@ function packMainPackage() {
 }
 
 // Main execution
-const requestedPlatform = process.argv[2];
+const packHost = process.argv[2] === '--host';
+const requestedPlatform = packHost
+  ? `${process.platform}-${process.arch}-${process.platform === 'win32' ? 'msvc' : 'gnu'}`
+  : process.argv[2];
 
 if (requestedPlatform) {
   // Platform-specific packing mode
@@ -288,10 +345,12 @@ if (requestedPlatform) {
     console.error(`   Supported: ${PLATFORM_PACKAGES.join(', ')}`);
     process.exit(1);
   }
-  packPlatformPackage(requestedPlatform);
-} else {
-  // Main package mode
+}
+if (!requestedPlatform || packHost) {
   packMainPackage();
+}
+if (requestedPlatform) {
+  packPlatformPackage(requestedPlatform);
 }
 
 console.log('\n✅ Packaging complete!');

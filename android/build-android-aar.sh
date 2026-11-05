@@ -2,7 +2,7 @@
 set -eu
 
 GRADLE_COMMAND="${GRADLE_COMMAND:-gradle}"
-SYNCLITE_VERSION="${SYNCLITE_VERSION:-1.1.0}"
+SYNCLITE_VERSION="${SYNCLITE_VERSION:-1.2.0}"
 ANDROID_PROJECT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 command -v "$GRADLE_COMMAND" >/dev/null 2>&1 || {

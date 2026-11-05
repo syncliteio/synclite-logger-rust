@@ -19,7 +19,7 @@ use postgres::Client as PgClient;
 use rusqlite::{params, Connection, OptionalExtension};
 
 mod pg_connection;
-pub use pg_connection::{build_postgres_connection_string, connect_postgres, read_postgres_checkpoint};
+pub use pg_connection::{build_postgres_connection_string, connect_postgres, postgres_destination_conflict, read_postgres_checkpoint};
 
 const DEFAULT_DST_ALIAS: &str = "DB-1";
 

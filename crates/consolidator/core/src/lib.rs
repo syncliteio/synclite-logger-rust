@@ -338,6 +338,30 @@ where
 }
 
 impl ConsolidatorLayout {
+    pub fn initialization_conflict(&self, other: &Self) -> Option<&'static str> {
+        macro_rules! check {
+            ($($field:ident),+ $(,)?) => {
+                $(if self.$field != other.$field { return Some(stringify!($field)); })+
+            };
+        }
+        check!(
+            work_dir, device_data_root, device_work_dir, state_db_path,
+            stats_db_path, consolidator_stats_db_path, device_id, device_name,
+            device_type, database_name, dst_index, destination_apply_enabled,
+            metadata_store, dst_type, destination_sync_mode,
+            dst_idempotent_data_ingestion, all_dst_indexes, allowed_tables,
+            filter_mapper, value_mapper, dst_data_type_mapping, user_type_overrides,
+            dst_vector_extension_enabled,
+            dst_idempotent_data_ingestion_method, dst_quote_object_names,
+            dst_quote_column_names, dst_use_catalog_scope_resolution,
+            dst_use_schema_scope_resolution, dst_database, dst_schema, dst_alias,
+            dst_type_name, dst_create_table_suffix, dst_device_schema_name_policy,
+            dst_enable_triggers, dst_triggers_file, dst_triggers, pause_sentinel,
+            stage_dir,
+        );
+        None
+    }
+
     pub fn new(
         device_home: &Path,
         work_dir_override: Option<PathBuf>,
