@@ -27,10 +27,15 @@ TARGET_LIB="$DEST_DIR/$OUT_LIB"
 TARGET_HEADER="$DEST_DIR/sqlite3.h"
 TARGET_SOURCE="$DEST_DIR/sqlite3.c"
 
-if [ -f "$TARGET_LIB" ] && [ -f "$TARGET_HEADER" ] && [ -f "$TARGET_SOURCE" ]; then
+REQUESTED_VERSION="$(printf '%s\n' "$SQLITE_VERSION_NUMERIC" | awk '{ printf "%d.%d.%d", substr($0,1,1), substr($0,2,2), substr($0,4,2); if (substr($0,6,2)+0 != 0) printf ".%d", substr($0,6,2) }')"
+
+if [ -f "$TARGET_LIB" ] && [ -f "$TARGET_HEADER" ] && [ -f "$TARGET_SOURCE" ] &&
+  [ "$(awk '$2 == "SQLITE_VERSION" { print $3; exit }' "$TARGET_HEADER")" = "\"$REQUESTED_VERSION\"" ]; then
   echo "SQLite native library already prepared at $TARGET_LIB"
   exit 0
 fi
+
+rm -f "$TARGET_LIB"
 
 TMP_DIR="$DEST_DIR/_tmp"
 rm -rf "$TMP_DIR"

@@ -1727,7 +1727,10 @@ fn build_add_column_sql(
                 format!("ALTER TABLE {qtable} ADD COLUMN {qcol} {mapped_type}")
             }
         }
-        DstType::DuckDb | DstType::Postgres => {
+        DstType::DuckDb => {
+            format!("ALTER TABLE {qtable} ADD COLUMN IF NOT EXISTS {qcol} {mapped_type}")
+        }
+        DstType::Postgres => {
             format!("ALTER TABLE {qtable} ADD COLUMN {qcol} {mapped_type}")
         }
     }
@@ -2013,6 +2016,7 @@ enum Msg {
         metadata_path: PathBuf,
     },
     StagePathReady(PathBuf),
+    UpdateRuntime(Box<ConsolidatorLayout>),
     Shutdown,
 }
 
@@ -2022,6 +2026,7 @@ pub struct Consolidator {
     tx: Arc<Sender<Msg>>,
     join: Mutex<Option<JoinHandle<()>>>,
     layout: ConsolidatorLayout,
+    runtime_layout: Mutex<ConsolidatorLayout>,
     shutdown_requested: AtomicBool,
     exited: Arc<AtomicBool>,
     // Set on shutdown so the worker abandons any in-progress /
@@ -2043,14 +2048,44 @@ impl Consolidator {
         let mut workers = CONSOLIDATOR_WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
             .lock().map_err(|_| Error::Internal("consolidator registry mutex poisoned".into()))?;
         workers.retain(|_, worker| worker.strong_count() > 0);
-        if let Some(worker) = workers.get(&key).and_then(Weak::upgrade) {
+        let existing = workers.get(&key).and_then(Weak::upgrade).or_else(|| {
+            workers.values().filter_map(Weak::upgrade).find(|worker| {
+                worker.layout.device_id == layout.device_id
+                    && worker.layout.device_data_root == layout.device_data_root
+                    && worker.layout.dst_index == layout.dst_index
+                    && !worker.exited.load(Ordering::SeqCst)
+            })
+        });
+        if let Some(worker) = existing {
             if !worker.exited.load(Ordering::SeqCst) {
                 if worker.shutdown_requested.load(Ordering::SeqCst) {
                     return Err(Error::Config("consolidator is still stopping; retry after it exits".into()));
                 }
-                if worker.layout != layout {
-                    return Err(Error::Config("a consolidator with different configuration already owns this device destination; stop it before reconfiguring".into()));
+                if let Some(field) = worker.layout.initialization_conflict(&layout) {
+                    return Err(Error::Config(format!("a consolidator with different configuration already owns this device destination: {field} requires explicit reinitialization")));
                 }
+                if worker.layout.dst_connection_string != layout.dst_connection_string
+                    || worker.layout.dst_user != layout.dst_user
+                {
+                    let conflict = if layout.dst_type == DstType::Postgres {
+                        consolidator_state::postgres_destination_conflict(&worker.layout, &layout)?
+                    } else if worker.layout.dst_connection_string != layout.dst_connection_string {
+                        Some("dst_connection_string")
+                    } else {
+                        None
+                    };
+                    if let Some(field) = conflict {
+                        return Err(Error::Config(format!("a consolidator with different configuration already owns this device destination: {field} requires explicit reinitialization")));
+                    }
+                }
+                let mut current = worker.runtime_layout.lock()
+                    .map_err(|_| Error::Internal("consolidator configuration mutex poisoned".into()))?;
+                if *current != layout {
+                    worker.tx.send(Msg::UpdateRuntime(Box::new(layout.clone())))
+                        .map_err(|_| Error::Internal("consolidator worker exited during configuration update".into()))?;
+                    *current = layout;
+                }
+                drop(current);
                 return Ok((worker, false));
             }
         }
@@ -2072,6 +2107,7 @@ impl Consolidator {
             tx: tx_keepalive,
             join: Mutex::new(None),
             layout: layout.clone(),
+            runtime_layout: Mutex::new(layout.clone()),
             shutdown_requested: AtomicBool::new(false),
             exited,
             stopping,
@@ -2339,7 +2375,7 @@ fn destination_snapshot_completed(layout: &ConsolidatorLayout, baseline: i64) ->
     }
 }
 
-fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Arc<AtomicBool>) {
+fn worker_loop(rx: mpsc::Receiver<Msg>, mut layout: ConsolidatorLayout, stopping: Arc<AtomicBool>) {
     let cleanup_progress = CleanupProgress::register(&layout);
     // Java parity: open per-device trace file under the consolidator's per-device
     // work directory (`<workDir>/synclite-<device>-<id>/synclite_device.trace`).
@@ -2464,17 +2500,46 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
         return;
     }
     let mut pending_stage_paths: Vec<PathBuf> = Vec::new();
-    let poll_interval = std::time::Duration::from_millis(layout.device_polling_interval_ms.max(1));
+    let mut poll_interval = std::time::Duration::from_millis(layout.device_polling_interval_ms.max(1));
     let mut shutdown_after_bootstrap = false;
     let mut pending_bootstrap: Option<(PathBuf, PathBuf)> = None;
     let mut last_bootstrap_attempt: Option<std::time::Instant> = None;
+    let mut pending_object_init_mode = None;
 
     loop {
+        if bootstrap_initialized {
+            if let Some(mode) = pending_object_init_mode.take() {
+                layout.dst_object_init_mode = mode;
+            }
+        }
         let mut msg: Option<Msg> = match rx.recv_timeout(poll_interval) {
             Ok(msg) => Some(msg),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+
+        if let Some(Msg::UpdateRuntime(updated)) = msg.as_ref() {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            if layout.trace_level != updated.trace_level {
+                let level = updated.trace_level.as_deref()
+                    .and_then(|value| TraceLevel::parse(value).ok())
+                    .unwrap_or(TraceLevel::Info);
+                if let Ok(tracer) = Tracer::for_consolidator_device(&layout.device_work_dir, level) {
+                    DEVICE_TRACER.with(|cell| *cell.borrow_mut() = Some(tracer));
+                }
+            }
+            let initial_mode = layout.dst_object_init_mode;
+            layout = updated.as_ref().clone();
+            if !bootstrap_initialized {
+                pending_object_init_mode = Some(layout.dst_object_init_mode);
+                layout.dst_object_init_mode = initial_mode;
+            }
+            poll_interval = std::time::Duration::from_millis(layout.device_polling_interval_ms.max(1));
+            trace_workflow_step("configuration", "Runtime configuration updated");
+            continue;
+        }
 
         // A short-lived logger can close before the first polling tick. Its
         // backup and metadata may already be staged, but the worker has not
@@ -2855,6 +2920,7 @@ fn worker_loop(rx: mpsc::Receiver<Msg>, layout: ConsolidatorLayout, stopping: Ar
                     // not this (possibly later) notification path.
                 }
             }
+            Msg::UpdateRuntime(_) => continue,
             Msg::Shutdown => break,
         }
     }
@@ -10819,6 +10885,33 @@ mod tests {
         assert!(retained.upgrade().is_some());
         let (worker, created) = Consolidator::spawn_or_reuse(layout.clone()).unwrap();
         assert!(!created);
+        let mut tuned = layout.clone();
+        tuned.trace_level = Some("DEBUG".into());
+        tuned.dst_oper_retry_count = 7;
+        tuned.dst_oper_retry_interval_ms = 25;
+        tuned.dst_insert_batch_size = 17;
+        tuned.dst_update_batch_size = 19;
+        tuned.dst_delete_batch_size = 23;
+        tuned.dst_connection_timeout_s = 5;
+        tuned.device_polling_interval_ms = 10;
+        tuned.dst_oper_predicate_optimization = !layout.dst_oper_predicate_optimization;
+        tuned.dst_user = Some("rotated-user".into());
+        tuned.dst_password = Some("rotated-secret".into());
+        let (updated, created) = Consolidator::spawn_or_reuse(tuned.clone()).unwrap();
+        assert!(!created);
+        assert!(Arc::ptr_eq(&worker, &updated));
+        assert_eq!(*worker.runtime_layout.lock().unwrap(), tuned);
+        let trace_path = layout.device_work_dir.join("synclite_device.trace");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&trace_path).unwrap_or_default().contains("Runtime configuration updated") {
+            assert!(std::time::Instant::now() < deadline, "worker did not apply runtime update");
+            thread::yield_now();
+        }
+        let mut relocated = tuned.clone();
+        relocated.work_dir = root.0.join("replacement-work");
+        relocated.device_work_dir = relocated.work_dir.join("device");
+        let error = Consolidator::spawn_or_reuse(relocated).err().unwrap().to_string();
+        assert!(error.contains("work_dir"));
         let mut changed = layout.clone();
         changed.dst_connection_string = "password=must-not-appear".into();
         let error = Consolidator::spawn_or_reuse(changed).err().unwrap().to_string();
@@ -10830,6 +10923,43 @@ mod tests {
         assert!(created);
         assert!(!Arc::ptr_eq(&worker, &replacement));
         replacement.shutdown();
+    }
+
+    #[test]
+    fn runtime_worker_connection_identity_allows_options_but_rejects_routing_changes() {
+        let root = RuntimeTestRoot::new("connection-identity");
+        let mut current = RuntimeTestDestination::new(&root.0, 1, "sqlite").layout;
+        current.dst_type = DstType::Postgres;
+        current.dst_connection_string = "postgresql://old:secret@localhost/app?sslmode=disable".into();
+        let mut requested = current.clone();
+        for connection in [
+            "postgresql://new:rotated@localhost:5432/app?sslmode=verify-full&sslrootcert=custom.pem&application_name=updated&connect_timeout=9",
+            "host=localhost port=5432 dbname=app user=new password=rotated sslmode=require application_name=updated",
+        ] {
+            requested.dst_connection_string = connection.into();
+            assert_eq!(current.initialization_conflict(&requested), None);
+            assert_eq!(consolidator_state::postgres_destination_conflict(&current, &requested).unwrap(), None);
+        }
+        for (connection, field) in [
+            ("postgresql://old:secret@elsewhere/app", "dst_host"),
+            ("host=localhost hostaddr=127.0.0.2 dbname=app user=old", "dst_host"),
+            ("postgresql://old:secret@localhost:5433/app", "dst_port"),
+            ("postgresql://old:secret@localhost/other", "dst_database"),
+            ("postgresql://old:secret@localhost/app?options=-c%20search_path%3Dother", "dst_schema_options"),
+        ] {
+            requested.dst_connection_string = connection.into();
+            assert_eq!(consolidator_state::postgres_destination_conflict(&current, &requested).unwrap(), Some(field));
+        }
+        requested = current.clone();
+        requested.dst_schema = Some("other".into());
+        assert_eq!(current.initialization_conflict(&requested), Some("dst_schema"));
+        current.dst_connection_string = "host=localhost user=first".into();
+        requested = current.clone();
+        requested.dst_connection_string = "host=localhost user=second".into();
+        assert_eq!(consolidator_state::postgres_destination_conflict(&current, &requested).unwrap(), Some("dst_database"));
+        requested.dst_connection_string = "postgresql://user:must-not-appear@localhost/app?unsupported_setting=1".into();
+        let error = consolidator_state::postgres_destination_conflict(&current, &requested).unwrap_err().to_string();
+        assert!(!error.contains("must-not-appear"));
     }
 
     #[test]

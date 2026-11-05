@@ -12,7 +12,7 @@ set -u
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env" 2>/dev/null || true
 export PATH="$HOME/.local/bin:$PATH"
 
-for tool in node npm cargo rustc zig; do
+for tool in node npm cargo rustc zig patchelf; do
     tool_path="$(command -v "$tool" 2>/dev/null || true)"
     if [[ -z "$tool_path" || "$tool_path" == /mnt/* ]]; then
         printf '[linux-node-launcher] SKIP: native Linux %s not found (resolved path: %s)\n' "$tool" "${tool_path:-missing}"
@@ -24,11 +24,11 @@ node_target_base="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/synclite-node-target}"
 cd "$node_dir"
 npm install && \
 CARGO_TARGET_DIR="$node_target_base/x86_64" npm run build:linux:x64 && \
-npm run pack:offline -- linux-x64-gnu && \
+CARGO_TARGET_DIR="$node_target_base/x86_64" npm run pack:offline -- linux-x64-gnu && \
 CC_aarch64_unknown_linux_gnu="$HOME/.cache/napi-rs-nodejs/zig-cc-aarch64-unknown-linux-gnu.sh" \
 CXX_aarch64_unknown_linux_gnu="$HOME/.cache/napi-rs-nodejs/zig-cxx-aarch64-unknown-linux-gnu.sh" \
 CARGO_TARGET_DIR="$node_target_base/aarch64" npm run build:linux:arm64 && \
-npm run pack:offline -- linux-arm64-gnu
+CARGO_TARGET_DIR="$node_target_base/aarch64" npm run pack:offline -- linux-arm64-gnu
 '''
 
 

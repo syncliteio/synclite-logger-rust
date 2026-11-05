@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "io.synclite"
-version = providers.gradleProperty("syncliteVersion").orElse("1.1.0").get()
+version = providers.gradleProperty("syncliteVersion").orElse("1.2.0").get()
 
 val rustWorkspace = rootProject.projectDir.resolve("..")
 val generatedJniLibs = layout.buildDirectory.dir("generated/jniLibs")
