@@ -271,20 +271,73 @@ function packPlatformPackage(platformTag) {
     );
   }
 
-  // Copy platform-specific DLL dependencies for Windows packages
-  if (platformTag.includes('win32')) {
+  if (platformTag.startsWith('win32') || platformTag.startsWith('linux')) {
+    const linux = platformTag.startsWith('linux');
+    const libraryName = linux ? 'libduckdb.so' : 'duckdb.dll';
+    const targetDir = path.resolve(process.env.CARGO_TARGET_DIR || path.join(root, '..', 'target'));
+    const targetTriple = {
+      'linux-x64-gnu': 'x86_64-unknown-linux-gnu',
+      'linux-arm64-gnu': 'aarch64-unknown-linux-gnu',
+    }[platformTag];
+    const releaseDirs = targetTriple
+      ? [path.join(targetDir, targetTriple, 'release'), path.join(targetDir, 'release')]
+      : [path.join(targetDir, 'release')];
+    const cargoOutputs = releaseDirs.flatMap((releaseDir) => {
+      const buildDir = path.join(releaseDir, 'build');
+      return fs.existsSync(buildDir)
+        ? fs.readdirSync(buildDir)
+          .filter((name) => name.startsWith('libduckdb-sys-'))
+          .map((name) => path.join(buildDir, name, 'output'))
+          .filter((output) => fs.existsSync(output))
+          .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs)
+        : [];
+    });
+    const cargoDuckdbPaths = cargoOutputs.flatMap((output) =>
+      fs.readFileSync(output, 'utf8').split(/\r?\n/)
+        .filter((line) => /^cargo::?rustc-link-search=native=/.test(line))
+        .map((line) => path.join(line.slice(line.indexOf('=native=') + 8), libraryName)),
+    );
     const possibleDuckdbPaths = [
-      path.join(root, '..', 'target', 'release', 'duckdb.dll'),
-      path.join(root, '..', 'target', 'release', 'deps', 'duckdb.dll'),
-      path.join(root, '..', 'target', 'debug', 'deps', 'duckdb.dll'),
+      ...cargoDuckdbPaths,
+      ...cargoOutputs.map((output) => path.join(path.dirname(output), 'out', libraryName)),
+      ...releaseDirs.flatMap((releaseDir) => [
+        path.join(releaseDir, libraryName),
+        path.join(releaseDir, 'deps', libraryName),
+      ]),
     ];
-    for (const duckdbDll of possibleDuckdbPaths) {
-      if (fs.existsSync(duckdbDll)) {
-        fs.copyFileSync(duckdbDll, path.join(staging, 'duckdb.dll'));
-        console.log(`  ✓ Bundled DuckDB dependency: duckdb.dll`);
-        break;
+    const duckdbLibrary = possibleDuckdbPaths.find((candidate) => fs.existsSync(candidate));
+    if (!duckdbLibrary) {
+      console.error(`Cannot package ${platformTag}: ${libraryName} was not found in Cargo release link paths.`);
+      fs.rmSync(staging, { recursive: true, force: true });
+      process.exit(1);
+    }
+    const stagedLibrary = path.join(staging, libraryName);
+    fs.copyFileSync(duckdbLibrary, stagedLibrary);
+    if (linux) {
+      for (const file of [path.join(staging, addon), stagedLibrary]) {
+        const header = Buffer.alloc(20);
+        const descriptor = fs.openSync(file, 'r');
+        try {
+          fs.readSync(descriptor, header, 0, header.length, 0);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+        const machine = platformTag === 'linux-x64-gnu' ? 62 : 183;
+        if (header.toString('hex', 0, 4) !== '7f454c46'
+            || header[4] !== 2 || header[5] !== 1 || header.readUInt16LE(18) !== machine) {
+          console.error(`Native library architecture does not match ${platformTag}: ${file}`);
+          fs.rmSync(staging, { recursive: true, force: true });
+          process.exit(1);
+        }
+        const patched = spawnSync('patchelf', ['--set-rpath', '$ORIGIN', file], { stdio: 'inherit' });
+        if (patched.status !== 0) {
+          console.error(`Cannot set package-relative runpath for ${file}; Linux packaging requires patchelf.`);
+          fs.rmSync(staging, { recursive: true, force: true });
+          process.exit(patched.status || 1);
+        }
       }
     }
+    console.log(`  Bundled DuckDB dependency: ${duckdbLibrary}`);
   }
 
   if (platformTag.startsWith('linux-')) {
@@ -366,7 +419,10 @@ function packMainPackage() {
 }
 
 // Main execution
-const requestedPlatform = process.argv[2];
+const packHost = process.argv[2] === '--host';
+const requestedPlatform = packHost
+  ? `${process.platform}-${process.arch}-${process.platform === 'win32' ? 'msvc' : 'gnu'}`
+  : process.argv[2];
 
 if (requestedPlatform === '--host') {
   const hostPlatform = PLATFORM_PACKAGES.find(platform =>
@@ -386,10 +442,12 @@ if (requestedPlatform === '--host') {
     console.error(`   Supported: ${PLATFORM_PACKAGES.join(', ')}`);
     process.exit(1);
   }
-  packPlatformPackage(requestedPlatform);
-} else {
-  // Main package mode
+}
+if (!requestedPlatform || packHost) {
   packMainPackage();
+}
+if (requestedPlatform) {
+  packPlatformPackage(requestedPlatform);
 }
 
 console.log('\n✅ Packaging complete!');

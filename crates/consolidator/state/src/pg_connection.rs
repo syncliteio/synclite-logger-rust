@@ -58,6 +58,39 @@ fn parse_config(connection_string: &str) -> Result<Config> {
     })
 }
 
+pub fn postgres_destination_conflict(
+    current: &ConsolidatorLayout,
+    requested: &ConsolidatorLayout,
+) -> Result<Option<&'static str>> {
+    let current = parse_config(&build_postgres_connection_string(current))?;
+    let requested = parse_config(&build_postgres_connection_string(requested))?;
+    if current.get_hosts() != requested.get_hosts()
+        || current.get_hostaddrs() != requested.get_hostaddrs()
+    {
+        return Ok(Some("dst_host"));
+    }
+    let ports = |config: &Config| {
+        let count = config.get_hosts().len().max(config.get_hostaddrs().len()).max(1);
+        match config.get_ports() {
+            [] => vec![5432; count],
+            [port] => vec![*port; count],
+            ports => ports.to_vec(),
+        }
+    };
+    if ports(&current) != ports(&requested) {
+        return Ok(Some("dst_port"));
+    }
+    let current_database = current.get_dbname().or_else(|| current.get_user());
+    let requested_database = requested.get_dbname().or_else(|| requested.get_user());
+    if current_database != requested_database {
+        return Ok(Some("dst_database"));
+    }
+    if current.get_options() != requested.get_options() {
+        return Ok(Some("dst_schema_options"));
+    }
+    Ok(None)
+}
+
 pub fn read_postgres_checkpoint(
     connection_string: &str,
     checkpoint_table: &str,

@@ -91,7 +91,10 @@ custom CDC library for both ABIs. A clean build is not runnable until matching
 ABI-specific `libsynclite_jni.so` files are supplied; an incremental build may
 reuse existing JNI outputs, so this flag is not release validation.
 
-The resulting AAR is written under `build/outputs/aar/`. To publish to the local Maven repository, run:
+The resulting AAR is written under `build/outputs/aar/`. Application developers
+should consume `io.synclite:synclite-android:1.2.0` from Maven Central, without
+building the AAR. The local publication workflow below is for maintainer testing.
+To publish to the local Maven repository, run:
 
 ```text
 gradle publishReleasePublicationToMavenLocal
@@ -146,7 +149,21 @@ POM, module metadata, sources/Javadoc artifacts if required by the repository,
 and the Android AAR with both `arm64-v8a` and `x86_64` JNI libraries. The AAR
 must be built without `skipAndroidRust` for developer consumption.
 
-## Consume from Kotlin
+## Consume from Maven Central (Kotlin)
+
+Configure the application's `settings.gradle.kts` dependency repositories:
+
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+```
+
+Add the following dependency to `app/build.gradle.kts` once release `1.2.0`
+has been published to Maven Central:
 
 ```kotlin
 implementation("io.synclite:synclite-android:1.2.0")

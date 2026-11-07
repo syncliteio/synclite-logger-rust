@@ -14,8 +14,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 #
 #   Option B — consume a prebuilt SDK with this layout:
 #       <SYNCLITE_SDK_DIR>/include/synclite.{h,hpp}
-#       <SYNCLITE_SDK_DIR>/lib/synclite_1_0_0.{dll,lib} (Windows)
-#       <SYNCLITE_SDK_DIR>/lib/libsynclite_1_0_0.{so,dylib} (Linux/macOS)
+#       <SYNCLITE_SDK_DIR>/lib/synclite_1_2_0.{dll,lib} (Windows)
+#       <SYNCLITE_SDK_DIR>/lib/libsynclite_1_2_0.{so,dylib} (Linux/macOS)
 #       cmake -S . -B build -DSYNCLITE_SDK_DIR=C:/path/to/synclite-c-sdk
 # ----------------------------------------------------------------------
 
@@ -54,7 +54,7 @@ if(WIN32)
     endif()
 elseif(APPLE)
     # On Unix Cargo adds the conventional 'lib' prefix to the crate name
-    # (synclite_1_0_0), so the on-disk cdylib is libsynclite_1_0_0.dylib.
+    # (synclite_1_2_0), so the on-disk cdylib is libsynclite_1_2_0.dylib.
     file(GLOB _synclite_versioned_libs_underscore
         RELATIVE "${SYNCLITE_LIB_DIR}"
         "${SYNCLITE_LIB_DIR}/libsynclite_*_*.dylib")
@@ -66,7 +66,7 @@ elseif(APPLE)
             "${SYNCLITE_LIB_DIR}/libsynclite_*.dylib")
     endif()
 else()
-    # See APPLE note: on Linux the file is libsynclite_1_0_0.so.
+    # See APPLE note: on Linux the file is libsynclite_1_2_0.so.
     file(GLOB _synclite_versioned_libs_underscore
         RELATIVE "${SYNCLITE_LIB_DIR}"
         "${SYNCLITE_LIB_DIR}/libsynclite_*_*.so")
@@ -158,7 +158,7 @@ if(WIN32)
     endif()
 else()
     # On Unix the cdylib we linked against IS the runtime shared object, so we
-    # stage that exact file (e.g. libsynclite_1_0_0.so / .dylib) next to the
+    # stage that exact file (e.g. libsynclite_1_2_0.so / .dylib) next to the
     # sample so developers do not have to fiddle with LD_LIBRARY_PATH.
     set(SYNCLITE_RUNTIME_LIB "${SYNCLITE_LIB}")
 

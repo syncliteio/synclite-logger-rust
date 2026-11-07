@@ -69,10 +69,19 @@ $sqliteLib = Join-Path $dest "sqlite3.lib"
 $sqliteHeader = Join-Path $dest "sqlite3.h"
 $sqliteSource = Join-Path $dest "sqlite3.c"
 
-if ((Test-Path $sqliteLib) -and (Test-Path $sqliteHeader) -and (Test-Path $sqliteSource)) {
+$requestedVersion = "{0}.{1}.{2}" -f $VersionNumeric.Substring(0, 1), [int]$VersionNumeric.Substring(1, 2), [int]$VersionNumeric.Substring(3, 2)
+if ([int]$VersionNumeric.Substring(5, 2) -ne 0) {
+    $requestedVersion += "." + [int]$VersionNumeric.Substring(5, 2)
+}
+$versionPattern = '^#define SQLITE_VERSION\s+"' + [regex]::Escape($requestedVersion) + '"$'
+
+if ((Test-Path $sqliteLib) -and (Test-Path $sqliteHeader) -and (Test-Path $sqliteSource) -and
+    (Select-String -Path $sqliteHeader -Pattern $versionPattern -Quiet)) {
     Write-Host "SQLite native artifacts already prepared in $dest"
     exit 0
 }
+
+Remove-Item -Path $sqliteLib -Force -ErrorAction SilentlyContinue
 
 $tmpRoot = Join-Path $dest "_tmp"
 Remove-Item -Path $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -90,6 +90,67 @@ spins up the logger, the shipper, the consolidator workers, and the
 Prometheus publisher according to the config — and shuts them all down
 cleanly on `close()`.
 
+## Step through the Rust pipeline in VS Code (Windows)
+
+The [pipeline debug sample](crates/synclite/examples/pipeline_debug.rs) runs the
+real SQLite logger, filesystem shipper, and embedded consolidator in one process.
+No PostgreSQL, Docker, credentials, or external services are needed. It verifies
+initial synchronization, then commits an UPDATE, DELETE, and INSERT and checks
+the exact destination rows again.
+
+Prerequisites: Rust's stable MSVC toolchain, Visual Studio C++ build tools,
+and VS Code extensions **Rust Analyzer** (`rust-lang.rust-analyzer`) and
+**CodeLLDB** (`vadimcn.vscode-lldb`). Install standard-library sources with
+`rustup component add rust-src` for stepping into Rust library code.
+
+1. Open the parent **SyncLite** repository folder in VS Code. Its
+   `.vscode/launch.json` contains **Rust: logger -> shipper -> consolidator**.
+2. Select that configuration in Run and Debug and press **F5**. The pre-launch
+   task builds an unoptimized sample with full debug symbols and copies the
+   Cargo-selected DuckDB runtime DLL beside the executable (required even for
+   SQLite because the facade links DuckDB).
+3. Use **F10** to step over, **F11** to step into, **Shift+F11** to step out,
+   and **F5** to continue to the next pipeline breakpoint.
+
+The launch configuration installs these function breakpoints automatically:
+
+| Stop | What to inspect / step into |
+|---|---|
+| `pipeline_debug::seed_source` | `Connection::execute`, `Logger::execute`, SQLite device execution and commit |
+| `pipeline_debug::write_changes` | `Value` parameters, transaction boundaries, source rows |
+| SQLite device, before `log_record` | Executed source SQL and its parameters entering the logger |
+| Command-log `stmt.raw_execute()` | Actual row insertion into the `.sqllog` command log |
+| `LogSegmentWriter::finalize_internal` | Commit command-log contents and mark ready for shipping |
+| `logger_shipper::ship_one` | `path`, archivers, filesystem publication, shipped callback |
+| `consolidator_runtime::process_stage_path_ready` | `stage_path`, `layout`, work copy, CDC processing and destination apply |
+| `replay_segment_with_native_cdc` | Replay command logs against the replica to generate CDC |
+| `native_change_callback` | Native change capture callback, including before/after values |
+| `NativeCdcLogWriter::write_dml_record` | CDC operation, table, commit ID and before/after pointers |
+| `NativeCdcLogWriter::step_insert` / `commit_tran` | Write CDC rows and commit the CDC log file |
+| `apply_to_sqlite_destination` | CDC-derived entries entering destination apply |
+| Destination `dst_conn.execute(...)` / `COMMIT` | Actual destination DML execution and durable transaction commit |
+| `pipeline_debug::verify_destination` | `expected`, `destination_rows`, destination database |
+
+Initialization can hit background breakpoints before `seed_source`; this is
+normal bootstrap work. Logger, shipper, and consolidator use different threads:
+step-into does **not** follow a channel notification into another worker.
+Continue to its breakpoint, then inspect the selected thread in Call Stack.
+All threads pause together; do not freeze other threads while waiting for sync.
+The sample allows 30 minutes per sync wait for interactive stepping.
+
+Each run prints a fresh directory under `target\debug-pipeline` containing
+`source.db`, `destination.db`, local/uploaded staging, work state, and DEBUG
+trace files. Nothing is deleted or shared with normal application data.
+Processed segment files may be removed by the runtime's normal cleaner.
+
+To run without the debugger, from this Rust repository:
+
+```powershell
+cargo run --locked --package synclite-rs --example pipeline_debug
+```
+
+Successful output ends with `PASS` and destination rows Alice/150 and Carol/300.
+
 ## Supported Device Types
 
 - `SQLITE`, `DUCKDB` — **SQL devices**: full DML and DDL surface for
@@ -198,7 +259,7 @@ synclite = { path = "path/to/synclite-logger-rust/crates/synclite" }
 synclite = { git = "https://github.com/syncliteio/SyncLite.git", branch = "main" }
 
 # Pin to a release tag (recommended for reproducible builds)
-synclite = { git = "https://github.com/syncliteio/SyncLite.git", tag = "v1.0.0" }
+synclite = { git = "https://github.com/syncliteio/SyncLite.git", tag = "v1.2.0" }
 
 # Pin to an exact commit
 synclite = { git = "https://github.com/syncliteio/SyncLite.git", rev = "abc1234" }

@@ -2,6 +2,12 @@
 
 This document describes the dual-mode npm packaging system for SyncLite Node.js N-API bindings.
 
+Applications normally consume `synclite@1.2.0` from npm. The main and matching
+native packages must be published before that version can be installed.
+The [sample guide](../../synclite-code-samples/nodejs/README.md) also retains
+bundled-release testing. Android applications consume the Maven Central AAR
+`io.synclite:synclite-android:1.2.0`, not an Android Node addon.
+
 ## Architecture Overview
 
 The packaging follows the standard **npm optional-dependencies pattern** used by projects like `sqlite3`, `canvas`, and other native modules:
@@ -9,7 +15,7 @@ The packaging follows the standard **npm optional-dependencies pattern** used by
 ```
 Main Package (synclite@1.2.0)
 │
-├─ Includes: synclite.js, index.js, all .node files (for manual cross-platform use)
+├─ Includes: synclite.js, synclite.d.ts, index.js, index.d.ts, README.md
 ├─ Optional Dependencies:
 │  ├─ @synclite/synclite-win32-x64-msvc@1.2.0
 │  ├─ @synclite/synclite-linux-x64-gnu@1.2.0
@@ -18,17 +24,17 @@ Main Package (synclite@1.2.0)
 │
 └─ Loading Strategy (index.js):
    1. Try local .node file (synclite.js loads index.js → resolves platform-specific addon)
-   2. Fall back to optional dependency package @synclite/synclite-{platform}
+   2. Fall back to optional dependency package @synclite/native-{platform}
    3. Bundled binaries load without rebuild on target platform
 ```
 
 Platform-specific packages are **scoped** (`@synclite/*`) and only contain:
 - A single `.node` file for their platform
 - `index.js` (the N-API binding interface)
-- Platform-specific DLLs (Windows only)
+- Matching DuckDB runtime (`duckdb.dll` on Windows, `libduckdb.so` on Linux)
 - Minimal metadata
 
-## Packing & Publishing
+## Maintainer Packing & Publishing
 
 ### 1. Build binaries for all platforms (or your subset)
 
@@ -51,13 +57,19 @@ This creates `.node` files like:
 
 ### 2. Pack into distribution tarballs
 
+Linux packages must be packed on Linux or WSL with `patchelf` available. The
+packer bundles the matching DuckDB shared library and sets `$ORIGIN` runpaths
+on the staged addon and library. Missing libraries or mismatched architectures
+fail packaging rather than producing an incomplete tarball. Pass the same
+`CARGO_TARGET_DIR` used for each build to its packaging command.
+
 **Single-platform pack:**
 ```bash
 npm run pack:offline -- win32-x64-msvc
 # Creates: dist/synclite-synclite-win32-x64-msvc-1.2.0.tgz
 ```
 
-**All supported platforms + main package:**
+**All supported platforms + main package (Linux, with all build outputs in one Cargo target tree):**
 ```bash
 npm run pack:offline:all
 # Creates:
@@ -93,7 +105,7 @@ All platform packages are published with the **@synclite** scope, allowing:
 ### Standard npm install (recommended for end users)
 
 ```bash
-npm install synclite
+npm install synclite@1.2.0
 ```
 
 **What happens:**
@@ -106,10 +118,7 @@ npm install synclite
 **Result:** A single command, automatic platform detection, no rebuild, no user configuration.
 
 ```javascript
-const { initialize, open } = require('synclite');
-
-// Identical API on all platforms
-const db = open(':memory:');
+const synclite = require('synclite');
 ```
 
 ### Manual cross-platform distribution
@@ -146,13 +155,7 @@ synclite-1.2.0/
 ├── synclite.d.ts                   (TypeScript definitions)
 ├── index.js                        (NAPI generated, multi-platform loader)
 ├── index.d.ts                      (Low-level NAPI types)
-├── index.win32-x64-msvc.node       (All platforms included)
-├── index.linux-x64-gnu.node
-├── index.linux-arm64-gnu.node
-├── ... (other platforms)
-├── README.md
-└── scripts/
-    └── ensure-dlls.js              (Windows DLL workaround)
+└── README.md
 ```
 
 ### Platform-specific package (`synclite-synclite-win32-x64-msvc-1.2.0.tgz`)
@@ -186,7 +189,7 @@ if (existsSync(localPath)) {
 
 // 2. Fall back to optional dependency package
 if (!nativeBinding) {
-  nativeBinding = require(`@synclite/synclite-${platform}-${arch}-${abi}`);
+  nativeBinding = require(`@synclite/native-${platform}-${arch}-${abi}`);
 }
 
 // Export the resolved binding
@@ -202,15 +205,8 @@ The `pack-offline.js` script supports:
 | Platform Tag | Platform | Architecture | ABI |
 |---|---|---|---|
 | `win32-x64-msvc` | Windows | x64 | MSVC |
-| `win32-ia32-msvc` | Windows | IA32 | MSVC |
-| `win32-arm64-msvc` | Windows | ARM64 | MSVC |
 | `linux-x64-gnu` | Linux | x64 | glibc |
-| `linux-x64-musl` | Linux | x64 | musl |
 | `linux-arm64-gnu` | Linux | ARM64 | glibc |
-| `linux-arm64-musl` | Linux | ARM64 | musl |
-| `darwin-universal` | macOS | Universal (x64+ARM64) | - |
-| `android-arm64` | Android | ARM64 | - |
-| `android-arm-eabi` | Android | ARM | EABI |
 
 Add or remove platforms by editing the `PLATFORM_PACKAGES` array in `pack-offline.js`.
 
@@ -236,8 +232,8 @@ npm run build:linux:arm64
 Edit `pack-offline.js`:
 
 ```javascript
-const SCOPE = 'synclite';  // Change to your organization/scope
-const MAIN_PACKAGE_NAME = 'synclite';  // Package name
+const PLATFORM_PACKAGE_SCOPE = '@synclite';
+const PLATFORM_PACKAGE_NAME = 'native';
 ```
 
 Then republish under the new scope:
@@ -252,7 +248,7 @@ Platform packages inherit from `getPlatformPackageJson()` in `pack-offline.js`. 
 ```javascript
 function getPlatformPackageJson(platformTag) {
   return {
-    name: `@${SCOPE}/${MAIN_PACKAGE_NAME}-${platformTag}`,
+    name: `${PLATFORM_PACKAGE_SCOPE}/${PLATFORM_PACKAGE_NAME}-${platformTag}`,
     // ... add os, cpu fields if needed:
     os: [platformTag.split('-')[0]],
     cpu: [platformTag.split('-')[1]],
@@ -267,17 +263,17 @@ function getPlatformPackageJson(platformTag) {
 1. Check if the `.node` file exists:
    ```bash
    ls node_modules/synclite/*.node
-   ls node_modules/@synclite/synclite-{platform}/*.node
+   ls node_modules/@synclite/native-{platform}/*.node
    ```
 
 2. On Windows, verify `duckdb.dll` is present:
    ```bash
-   ls node_modules/synclite/duckdb.dll
+  ls node_modules/@synclite/native-win32-x64-msvc/duckdb.dll
    ```
 
 3. Check `npm list` for optional dependencies:
    ```bash
-   npm list @synclite/synclite-${platform}
+   npm list @synclite/native-${platform}
    ```
 
 ### Optional dependency not installed
@@ -310,7 +306,8 @@ npm run pack:offline
 npm install file:../dist/synclite-1.2.0.tgz
 ```
 
-Test in a separate directory:
+Test in a separate sample directory using the release installer or npm.
+For registry testing after publishing to a staging registry:
 ```bash
 cd /tmp/test-synclite
 npm install /path/to/synclite-1.2.0.tgz
@@ -326,7 +323,13 @@ build-matrixed:
   runs-on: ${{ matrix.os }}
   strategy:
     matrix:
-      os: [ubuntu-latest, windows-latest, macos-latest]
+      include:
+        - os: windows-latest
+          platform: win32-x64-msvc
+        - os: ubuntu-latest
+          platform: linux-x64-gnu
+        - os: ubuntu-24.04-arm
+          platform: linux-arm64-gnu
   steps:
     - uses: actions/checkout@v3
     - uses: actions/setup-node@v3
@@ -334,9 +337,9 @@ build-matrixed:
         node-version: 18
     - run: |
         cd synclite-logger-rust/nodejs
-        npm ci
+        npm install
         npm run build
-        npm run pack:offline -- ${{ matrix.platform }}
+        npm run pack:offline
     - uses: actions/upload-artifact@v3
       with:
         name: packages-${{ matrix.os }}
