@@ -17,10 +17,10 @@ Main Package (synclite@1.2.0)
 │
 ├─ Includes: synclite.js, synclite.d.ts, index.js, index.d.ts, README.md
 ├─ Optional Dependencies:
-│  ├─ @synclite/native-win32-x64-msvc@1.2.0
-│  ├─ @synclite/native-linux-x64-gnu@1.2.0
-│  ├─ @synclite/native-linux-arm64-gnu@1.2.0
-│  └─ Only these three platforms are advertised by the current manifest
+│  ├─ @synclite/synclite-win32-x64-msvc@1.2.0
+│  ├─ @synclite/synclite-linux-x64-gnu@1.2.0
+│  ├─ @synclite/synclite-linux-arm64-gnu@1.2.0
+│  └─ ... (10 platforms total)
 │
 └─ Loading Strategy (index.js):
    1. Try local .node file (synclite.js loads index.js → resolves platform-specific addon)
@@ -66,7 +66,7 @@ fail packaging rather than producing an incomplete tarball. Pass the same
 **Single-platform pack:**
 ```bash
 npm run pack:offline -- win32-x64-msvc
-# Creates: dist/synclite-native-win32-x64-msvc-1.2.0.tgz
+# Creates: dist/synclite-synclite-win32-x64-msvc-1.2.0.tgz
 ```
 
 **All supported platforms + main package (Linux, with all build outputs in one Cargo target tree):**
@@ -74,26 +74,31 @@ npm run pack:offline -- win32-x64-msvc
 npm run pack:offline:all
 # Creates:
 #   dist/synclite-1.2.0.tgz                    (main)
-#   dist/synclite-native-win32-x64-msvc-1.2.0.tgz
-#   dist/synclite-native-linux-x64-gnu-1.2.0.tgz
-#   dist/synclite-native-linux-arm64-gnu-1.2.0.tgz
+#   dist/synclite-synclite-win32-x64-msvc-1.2.0.tgz
+#   dist/synclite-synclite-linux-x64-gnu-1.2.0.tgz
+#   dist/synclite-synclite-linux-arm64-gnu-1.2.0.tgz
+#   dist/synclite-synclite-darwin-universal-1.2.0.tgz
+#   ... (all platforms defined in pack-offline.js)
 ```
 
 ### 3. Publish to npm
 
-Publish platform-specific packages first, then the main package, so npm can
-resolve all advertised native dependencies immediately:
+**Publish main package:**
 ```bash
-npm publish dist/synclite-native-win32-x64-msvc-1.2.0.tgz --access public
-npm publish dist/synclite-native-linux-x64-gnu-1.2.0.tgz --access public
-npm publish dist/synclite-native-linux-arm64-gnu-1.2.0.tgz --access public
 npm publish dist/synclite-1.2.0.tgz
+```
+
+**Publish platform-specific packages:**
+```bash
+npm publish dist/synclite-synclite-win32-x64-msvc-1.2.0.tgz
+npm publish dist/synclite-synclite-linux-x64-gnu-1.2.0.tgz
+npm publish dist/synclite-synclite-linux-arm64-gnu-1.2.0.tgz
 # ... etc
 ```
 
 All platform packages are published with the **@synclite** scope, allowing:
 - Main package namespace: `synclite@1.2.0` (no scope)
-- Platform packages: `@synclite/native-win32-x64-msvc@1.2.0` (scoped)
+- Platform packages: `@synclite/synclite-win32-x64-msvc@1.2.0` (scoped)
 
 ## Installation & Usage
 
@@ -106,7 +111,7 @@ npm install synclite@1.2.0
 **What happens:**
 1. npm installs `synclite@1.2.0` (main package)
 2. npm checks `optionalDependencies` against the current platform
-3. If a match exists, npm automatically installs `@synclite/native-{your-platform}@1.2.0`
+3. If a match exists, npm automatically installs `@synclite/synclite-{your-platform}@1.2.0`
 4. At runtime, `index.js` tries to load the local platform-specific `.node` file first
 5. Falls back to loading the optional dependency package if no local file found
 
@@ -116,17 +121,29 @@ npm install synclite@1.2.0
 const synclite = require('synclite');
 ```
 
-### Private registries and bundled sample testing
+### Manual cross-platform distribution
 
-For private or air-gapped deployments, mirror the main package and matching
-native packages into a private npm registry. Applications still use
-`npm install synclite@1.2.0` with the configured registry.
+For environments where optional dependencies don't work (e.g., monorepos, custom CI):
 
-To test a packaged platform release without publishing it, use
-`node install-synclite.js` from its `sample-apps/nodejs/` directory. The
-installer selects the bundled main and native tarballs. The main tarball does
-not contain all platform binaries. Never install these artifacts into the SDK
-source package directory, which would create a circular build dependency.
+**Ship the main tarball with all .node files:**
+```bash
+tar -tzf dist/synclite-1.2.0.tgz | grep "\.node"
+# Extracts all platform binaries:
+# index.win32-x64-msvc.node
+# index.linux-x64-gnu.node
+# index.linux-arm64-gnu.node
+# ... (all platforms)
+```
+
+**Consumer can:**
+1. Use one tarball across all platforms
+2. `npm install file:../dist/synclite-1.2.0.tgz`
+3. `index.js` auto-selects the correct `.node` file at runtime based on platform/arch
+
+**Or distribute platform-specific tarballs separately:**
+- Dev team publishes `dist/synclite-synclite-{platform}-1.2.0.tgz` to internal artifact store
+- CI/Deployment automatically pulls the matching tarball
+- Example: Linux x64 Docker container pulls `synclite-synclite-linux-x64-gnu-1.2.0.tgz`
 
 ## File Structure
 
@@ -141,10 +158,10 @@ synclite-1.2.0/
 └── README.md
 ```
 
-### Platform-specific package (`synclite-native-win32-x64-msvc-1.2.0.tgz`)
+### Platform-specific package (`synclite-synclite-win32-x64-msvc-1.2.0.tgz`)
 ```
-synclite-native-win32-x64-msvc-1.2.0/
-├── package.json                    (@synclite/native-win32-x64-msvc)
+synclite-synclite-win32-x64-msvc-1.2.0/
+├── package.json                    (@synclite/synclite-win32-x64-msvc)
 ├── index.js                        (Same loader as main package)
 ├── index.d.ts
 ├── index.win32-x64-msvc.node       (Single platform)
@@ -267,11 +284,16 @@ npm skips optional dependencies if they:
 
 Manually install a specific platform package:
 ```bash
-npm install @synclite/native-linux-x64-gnu@1.2.0
+npm install @synclite/synclite-linux-x64-gnu@1.2.0
 ```
 
-Install dependencies on the deployment target platform; do not copy another
-operating system's native addon or omit optional dependencies.
+### Cross-platform tarball usage
+
+If using the main tarball with all binaries included, ensure your extraction preserves file permissions (especially on Linux/macOS):
+
+```bash
+tar -xzf synclite-1.2.0.tgz --preserve
+```
 
 ## Development & Testing
 
@@ -281,14 +303,14 @@ Build and pack for current platform:
 ```bash
 npm run build
 npm run pack:offline
+npm install file:../dist/synclite-1.2.0.tgz
 ```
 
 Test in a separate sample directory using the release installer or npm.
 For registry testing after publishing to a staging registry:
 ```bash
 cd /tmp/test-synclite
-npm init -y
-npm install synclite@1.2.0
+npm install /path/to/synclite-1.2.0.tgz
 node -e "const {initialize} = require('synclite'); console.log('✓ Loaded successfully');"
 ```
 
@@ -329,10 +351,8 @@ publish:
   steps:
     - uses: actions/download-artifact@v3
     - run: |
-        for package in dist/synclite-native-*.tgz; do
-          npm publish "$package" --access public
-        done
         npm publish dist/synclite-1.2.0.tgz --access public
+        npm publish dist/synclite-synclite-*.tgz --access public
 ```
 
 ## References

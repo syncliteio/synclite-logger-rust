@@ -149,6 +149,88 @@ function getMainPackageJson() {
   };
 }
 
+function linuxElfMachine(file) {
+  const header = Buffer.alloc(20);
+  const descriptor = fs.openSync(file, 'r');
+  try {
+    fs.readSync(descriptor, header, 0, header.length, 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  if (header.toString('hex', 0, 4) !== '7f454c46' || header[4] !== 2 || header[5] !== 1) {
+    return null;
+  }
+  return header.readUInt16LE(18);
+}
+
+function bundleLinuxDuckdb(staging, platformTag) {
+  const triple = platformTag === 'linux-x64-gnu'
+    ? 'x86_64-unknown-linux-gnu'
+    : 'aarch64-unknown-linux-gnu';
+  const machine = platformTag === 'linux-x64-gnu' ? 62 : 183;
+  const addon = path.join(staging, `index.${platformTag}.node`);
+  if (linuxElfMachine(addon) !== machine) {
+    throw new Error(`Wrong ELF architecture for ${platformTag}: ${addon}`);
+  }
+
+  const targetRoots = new Set([
+    path.resolve(process.env.CARGO_TARGET_DIR || path.join(root, '..', 'target')),
+    path.resolve(root, '..', 'target'),
+  ]);
+  const libraryDirectories = [];
+  for (const targetRoot of targetRoots) {
+    for (const release of [path.join(targetRoot, triple, 'release'), path.join(targetRoot, 'release')]) {
+      const build = path.join(release, 'build');
+      if (fs.existsSync(build)) {
+        const outputs = fs.readdirSync(build)
+          .filter(name => name.startsWith('libduckdb-sys-'))
+          .map(name => path.join(build, name, 'output'))
+          .filter(output => fs.existsSync(output))
+          .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+        for (const output of outputs) {
+          for (const line of fs.readFileSync(output, 'utf8').split(/\r?\n/)) {
+            const match = line.match(/^cargo:{1,2}rustc-link-search=native=(.+)$/);
+            if (match) libraryDirectories.push(match[1]);
+          }
+          libraryDirectories.push(path.join(path.dirname(output), 'out'));
+        }
+      }
+      libraryDirectories.push(path.join(release, 'deps'), release);
+    }
+  }
+
+  let bundledLibraries = [];
+  for (const directory of new Set(libraryDirectories)) {
+    if (!fs.existsSync(directory) || !fs.statSync(directory).isDirectory()) continue;
+    const libraries = fs.readdirSync(directory)
+      .filter(name => /^libduckdb\.so(?:\..+)?$/.test(name))
+      .map(name => path.join(directory, name))
+      .filter(file => fs.existsSync(file) && linuxElfMachine(file) === machine);
+    if (libraries.length === 0) continue;
+    for (const library of libraries) {
+      const destination = path.join(staging, path.basename(library));
+      fs.copyFileSync(library, destination);
+      bundledLibraries.push(destination);
+    }
+    const canonicalLibrary = path.join(staging, 'libduckdb.so');
+    if (!fs.existsSync(canonicalLibrary)) {
+      fs.copyFileSync(libraries[0], canonicalLibrary);
+      bundledLibraries.push(canonicalLibrary);
+    }
+    break;
+  }
+  if (bundledLibraries.length === 0) {
+    throw new Error(`No matching libduckdb.so found for ${platformTag}; set CARGO_TARGET_DIR to the target directory used to build this addon.`);
+  }
+  for (const file of [addon, ...bundledLibraries]) {
+    const result = spawnSync('patchelf', ['--set-rpath', '$ORIGIN', file], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      throw new Error(`patchelf failed for ${file}: ${result.error?.message || result.stderr || result.status}`);
+    }
+  }
+  console.log(`  Bundled Linux DuckDB dependency for ${platformTag} with $ORIGIN lookup`);
+}
+
 function packPlatformPackage(platformTag) {
   console.log(`\n📦 Packing platform package: ${PLATFORM_PACKAGE_SCOPE}/${PLATFORM_PACKAGE_NAME}-${platformTag}@${VERSION}`);
 
@@ -258,6 +340,10 @@ function packPlatformPackage(platformTag) {
     console.log(`  Bundled DuckDB dependency: ${duckdbLibrary}`);
   }
 
+  if (platformTag.startsWith('linux-')) {
+    bundleLinuxDuckdb(staging, platformTag);
+  }
+
   // Pack with npm
   const result = runNpmPack(staging);
 
@@ -338,7 +424,18 @@ const requestedPlatform = packHost
   ? `${process.platform}-${process.arch}-${process.platform === 'win32' ? 'msvc' : 'gnu'}`
   : process.argv[2];
 
-if (requestedPlatform) {
+if (requestedPlatform === '--host') {
+  const hostPlatform = PLATFORM_PACKAGES.find(platform =>
+    platform.startsWith(`${process.platform}-${process.arch}-`),
+  );
+  if (!hostPlatform) {
+    console.error(`Unsupported host: ${process.platform}-${process.arch}`);
+    console.error(`   Supported: ${PLATFORM_PACKAGES.join(', ')}`);
+    process.exit(1);
+  }
+  packPlatformPackage(hostPlatform);
+  packMainPackage();
+} else if (requestedPlatform) {
   // Platform-specific packing mode
   if (!PLATFORM_PACKAGES.includes(requestedPlatform)) {
     console.error(`❌ Unknown platform: ${requestedPlatform}`);

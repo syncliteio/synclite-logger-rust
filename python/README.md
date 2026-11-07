@@ -173,9 +173,10 @@ with engine.begin() as connection:
 engine.dispose()
 ```
 
-`sqlite+synclite` means SQLite SQL with SyncLite's logged driver, **not** a
-direct connection to the PostgreSQL destination. For DuckDB, initialize a
-`DUCKDB` device and use `duckdb+synclite:///myapp.duckdb`. The dialects use
+`sqlite+synclite` connects SQLAlchemy to the local SQLite database. SyncLite
+replicates committed changes to the PostgreSQL destination configured in
+`sl.initialize(...)`. For DuckDB, initialize a `DUCKDB` device and use
+`duckdb+synclite:///myapp.duckdb`. The dialects use
 `NullPool` because native connections are thread-affine; savepoints, two-phase
 transactions, and autocommit isolation are unsupported. SQLAlchemy commits
 locally; use SyncLite `flush()` and `await_sync()` separately when a short-lived

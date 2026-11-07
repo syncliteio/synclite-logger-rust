@@ -233,7 +233,7 @@ The `sample` module is a runnable Android application. It provides editable Post
 gradle :sample:installDebug
 ```
 
-Start **SyncLite Android Sample** on an `arm64-v8a` device or `x86_64` emulator. For PostgreSQL running on the development computer, the Android emulator reaches the host at `10.0.2.2`; a physical device needs a network-reachable hostname or IP address.
+Start **SyncLite Android Sample** and configure your PostgreSQL hostname or IP address.
 
 An instrumentation smoke test uses a second SQLite file as the destination and therefore requires no external server:
 

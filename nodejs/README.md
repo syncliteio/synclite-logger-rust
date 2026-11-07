@@ -53,11 +53,16 @@ the whole array first and initializes destinations sequentially. If a later
 destination cannot start, workers already started by that call are stopped
 before the initialization error is returned.
 
-Applications should install the main package from npm, not copy a native addon
-or install SDK build-output tarballs. The main and matching native packages
-must both be published at `1.2.0` before consumers can install that release.
-For air-gapped deployments, use a private npm registry populated with those
-same packages.
+For an extracted SyncLite platform/runtime release, run the platform-detecting
+installer from `sample-apps/nodejs/` instead:
+
+```text
+node install-synclite.js
+```
+
+It installs `lib/nodejs/synclite-1.2.0.tgz` and the matching
+`lib/nodejs/synclite-native-<platform>-1.2.0.tgz` without accessing an npm
+registry.
 
 ## Maintainers
 
@@ -76,11 +81,17 @@ native artifact with:
 npm run pack:offline -- --host
 ```
 
-Linux packaging runs on Linux or WSL and requires `patchelf`. Each native
-package bundles its matching `libduckdb.so`; both binaries use `$ORIGIN`
-runpaths, so consumers do not need `LD_LIBRARY_PATH`. If the build uses
-`CARGO_TARGET_DIR`, pass the same value to the corresponding packaging command.
-The Maven Linux launcher does this separately for x64 and ARM64.
+Build and package both Linux architectures on Linux or through WSL on Windows:
+
+```text
+python scripts/build_linux_packages_launcher.py
+```
+
+The Linux build requires native Node.js, npm, Cargo, rustc, Zig, and `patchelf`.
+Linux native packages bundle the matching `libduckdb.so` with `$ORIGIN` lookup;
+consumers do not need a separate DuckDB installation. When packing an existing
+Linux addon manually, run the packer on Linux with the same `CARGO_TARGET_DIR`
+used for its build.
 
 Publish the three `@synclite/native-*` packages before publishing
 `synclite@1.2.0`, so its optional dependencies can resolve immediately.

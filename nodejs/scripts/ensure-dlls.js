@@ -11,7 +11,7 @@ const path = require('path');
  *
  * Works with both:
  * 1. Main package (synclite@1.2.0) — multiple .node files included
- * 2. Platform-specific packages (@synclite/native-{platform}@1.2.0) — single .node file
+ * 2. Platform-specific packages (@synclite/synclite-{platform}@1.2.0) — single .node file
  *
  * For platform-specific packages, duckdb.dll is bundled and extracted by npm pack.
  * For the main package, this script looks for DLLs alongside the installed addon.
