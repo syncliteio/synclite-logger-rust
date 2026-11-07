@@ -10,8 +10,8 @@ const path = require('path');
  * Windows file locking. This script verifies DLL presence after extraction.
  *
  * Works with both:
- * 1. Main package (synclite@1.1.0) — multiple .node files included
- * 2. Platform-specific packages (@synclite/synclite-{platform}@1.1.0) — single .node file
+ * 1. Main package (synclite@1.2.0) — multiple .node files included
+ * 2. Platform-specific packages (@synclite/synclite-{platform}@1.2.0) — single .node file
  *
  * For platform-specific packages, duckdb.dll is bundled and extracted by npm pack.
  * For the main package, this script looks for DLLs alongside the installed addon.

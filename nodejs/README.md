@@ -13,7 +13,7 @@ dependency automatically:
 Install from npm:
 
 ```text
-npm install synclite@1.1.0
+npm install synclite@1.2.0
 ```
 
 No Rust toolchain or native rebuild is required on a supported platform.
@@ -60,8 +60,8 @@ installer from `sample-apps/nodejs/` instead:
 node install-synclite.js
 ```
 
-It installs `lib/nodejs/synclite-1.1.0.tgz` and the matching
-`lib/nodejs/synclite-native-<platform>-1.1.0.tgz` without accessing an npm
+It installs `lib/nodejs/synclite-1.2.0.tgz` and the matching
+`lib/nodejs/synclite-native-<platform>-1.2.0.tgz` without accessing an npm
 registry.
 
 ## Maintainers
@@ -74,12 +74,24 @@ npm run build
 ```
 
 This creates an `index.<platform>.node` file, such as
-`index.win32-x64-msvc.node`. Package the main loader and the three already-built
-native artifacts with:
+`index.win32-x64-msvc.node`. Package the main loader and the current host's
+native artifact with:
 
 ```text
-npm run pack:offline:all
+npm run pack:offline -- --host
 ```
 
+Build and package both Linux architectures on Linux or through WSL on Windows:
+
+```text
+python scripts/build_linux_packages_launcher.py
+```
+
+The Linux build requires native Node.js, npm, Cargo, rustc, Zig, and `patchelf`.
+Linux native packages bundle the matching `libduckdb.so` with `$ORIGIN` lookup;
+consumers do not need a separate DuckDB installation. When packing an existing
+Linux addon manually, run the packer on Linux with the same `CARGO_TARGET_DIR`
+used for its build.
+
 Publish the three `@synclite/native-*` packages before publishing
-`synclite@1.1.0`, so its optional dependencies can resolve immediately.
+`synclite@1.2.0`, so its optional dependencies can resolve immediately.

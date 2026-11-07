@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "consolidator-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde_json",
  "tracing",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "consolidator-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "consolidator-core",
  "consolidator-state",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "consolidator-state"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "consolidator-core",
  "duckdb",
@@ -2450,7 +2450,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "logger-archiver"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "logger-bindings-python"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-config",
  "logger-core",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "logger-config"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "java-properties",
  "logger-core",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "logger-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -2499,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "logger-db-duckdb"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "duckdb",
  "logger-core",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "logger-db-sqlite"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-core",
  "logger-db-traits",
@@ -2521,14 +2521,14 @@ dependencies = [
 
 [[package]]
 name = "logger-db-traits"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-core",
 ]
 
 [[package]]
 name = "logger-log"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-core",
  "parking_lot",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "logger-metadata"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-core",
  "parking_lot",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "logger-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-config",
  "logger-core",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "logger-shipper"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-archiver",
  "logger-core",
@@ -4297,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-bindings-java"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "consolidator-core",
  "consolidator-runtime",
@@ -4307,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-bindings-node"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-core",
  "logger-db-traits",
@@ -4319,7 +4319,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-c"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "logger-core",
  "logger-db-traits",
@@ -4329,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-observability"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "file-rotate",
  "parking_lot",
@@ -4341,7 +4341,7 @@ dependencies = [
 
 [[package]]
 name = "synclite-rs"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "consolidator-core",
  "consolidator-runtime",

@@ -100,7 +100,7 @@ gradle publishReleasePublicationToMavenLocal
 The local Maven coordinates are:
 
 ```text
-io.synclite:synclite-android:1.1.0
+io.synclite:synclite-android:1.2.0
 ```
 
 An application can consume the locally published artifact with:
@@ -113,7 +113,7 @@ repositories {
 }
 
 dependencies {
-        implementation("io.synclite:synclite-android:1.1.0")
+        implementation("io.synclite:synclite-android:1.2.0")
 }
 ```
 
@@ -126,7 +126,7 @@ Gradle properties or environment variables. Do not commit credentials.
 ```text
 MAVEN_USERNAME=... MAVEN_PASSWORD=... gradle \
     -PmavenRepoUrl=https://repo.example.com/releases \
-    -PsyncliteVersion=1.1.0 \
+    -PsyncliteVersion=1.2.0 \
     publishReleasePublicationToMavenRepository
 ```
 
@@ -136,7 +136,7 @@ On Windows PowerShell:
 $env:MAVEN_USERNAME = "..."
 $env:MAVEN_PASSWORD = "..."
 gradle -PmavenRepoUrl=https://repo.example.com/releases `
-             -PsyncliteVersion=1.1.0 `
+             -PsyncliteVersion=1.2.0 `
              publishReleasePublicationToMavenRepository
 ```
 
@@ -149,7 +149,7 @@ must be built without `skipAndroidRust` for developer consumption.
 ## Consume from Kotlin
 
 ```kotlin
-implementation("io.synclite:synclite-android:1.1.0")
+implementation("io.synclite:synclite-android:1.2.0")
 ```
 
 Android loads the ABI-specific `libsynclite_jni.so` directly from the AAR. Do not use the desktop `synclite` JAR in an Android application.
@@ -216,7 +216,7 @@ The `sample` module is a runnable Android application. It provides editable Post
 gradle :sample:installDebug
 ```
 
-Start **SyncLite Android Sample** on an `arm64-v8a` device or `x86_64` emulator. For PostgreSQL running on the development computer, the Android emulator reaches the host at `10.0.2.2`; a physical device needs a network-reachable hostname or IP address.
+Start **SyncLite Android Sample** and configure your PostgreSQL hostname or IP address.
 
 An instrumentation smoke test uses a second SQLite file as the destination and therefore requires no external server:
 
