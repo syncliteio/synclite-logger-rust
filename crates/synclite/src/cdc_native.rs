@@ -10,8 +10,8 @@
 //! the loader keeps searching the workspace `native/` directory, the
 //! system loader path, and any user-supplied `SYNCLITE_CDC_LIB_DIR`.
 //!
-//! Android deliberately embeds/extracts nothing: the AAR builds the custom C
-//! sources as `libsynclitecdc.so` for each ABI. The consolidator dlopens that
+//! Android deliberately embeds/extracts nothing: the AAR packages the prebuilt
+//! `native/android/<abi>/libsynclitecdc.so`. The consolidator dlopens that
 //! SONAME through the application's native linker namespace, which supports
 //! both extracted nativeLibraryDir files and unextracted APK libraries. The
 //! bundled rusqlite SQLite is not the custom CDC library.
