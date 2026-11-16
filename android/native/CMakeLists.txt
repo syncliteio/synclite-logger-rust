@@ -26,7 +26,11 @@ if(NOT ANDROID_ABI MATCHES "^(arm64-v8a|x86_64)$")
     message(FATAL_ERROR "Unsupported SyncLite Android CDC ABI: ${ANDROID_ABI}")
 endif()
 
-set(SYNCLITE_NATIVE_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../SyncLiteNative"
+set(_synclite_native_default "${CMAKE_CURRENT_LIST_DIR}/../../../SyncLiteNative")
+if(NOT EXISTS "${_synclite_native_default}/sqlite3.c")
+    set(_synclite_native_default "${CMAKE_CURRENT_LIST_DIR}/../../../../SyncLiteNative")
+endif()
+set(SYNCLITE_NATIVE_SOURCE_DIR "${_synclite_native_default}"
     CACHE PATH "Directory containing the custom SyncLiteNative C sources")
 foreach(source sqlite3.c sqlite3.h replayer.c replayer.h rust_bindings.c rust_bindings.h)
     if(NOT EXISTS "${SYNCLITE_NATIVE_SOURCE_DIR}/${source}")
