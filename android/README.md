@@ -18,30 +18,43 @@ It deliberately does **not** package the desktop JDBC logger and does not expose
 
 ### Native CDC build reference
 
-The Android CDC sidecar is built from the sibling `SyncLiteNative` checkout's
-`sqlite3.c`, `replayer.c`, and `rust_bindings.c`, not rusqlite's stock SQLite.
-Desktop Profile A enables `SQLITE_THREADSAFE=1` and
-`SQLITE_ENABLE_PREUPDATE_HOOK`; Android must use the same definitions and export
-the `synclite_rs_*` ABI used by the consolidator. The NDK supplies JNI headers.
+The Android CDC sidecar is consumed from the Rust workspace's checked-in native
+directory, separately from the desktop libraries:
+
+```text
+native/android/arm64-v8a/libsynclitecdc.so
+native/android/x86_64/libsynclitecdc.so
+```
+
+These are Android NDK builds from `SyncLiteNative`, not desktop Linux binaries or
+rusqlite's stock SQLite. The AAR build no longer needs a `SyncLiteNative` checkout
+or recompiles the CDC C sources. `SQLITE_THREADSAFE=1` and
+`SQLITE_ENABLE_PREUPDATE_HOOK` must be enabled, and `synclite_rs_*` must be exported.
 Both supported ABIs must package `libsynclitecdc.so` alongside `libsynclite_jni.so`.
 The runtime loads this sidecar by SONAME in Android's application linker namespace,
 including applications loading unextracted libraries directly from an APK.
 It must not extract a desktop prebuilt into an Android temporary directory.
 
-Scope/decomposition: this is one atomic packaging/loading change; no scenario
-skill root, assessment, or workflow task path was supplied. The installed SDK has
-NDK 26.3.11579264, CMake 3.22.1, and both Rust Android targets. Validation should
-build both C ABIs, inspect exported symbols/dependencies, and inspect the AAR.
-Device execution remains a separate validation if no connected device is available.
+Keep SQLite symbols private to avoid binding to the JNI bridge's independently
+bundled rusqlite. The SyncLiteNative Android build uses a linker export map and
+16 KB ELF page alignment. Gradle validates the prebuilt ELF architectures before
+building Rust, packages both ABI directories, and verifies that the release AAR
+contains both native libraries and byte-for-byte copies of the CDC prebuilts.
 
-Research confirmed that desktop Profile A compiles all three C translation units
-with `SQLITE_THREADSAFE=1` and `SQLITE_ENABLE_PREUPDATE_HOOK`. The Rust ABI header
-marks `synclite_rs_*` with default visibility; `replayer.c` needs the NDK JNI
-headers. Keep all SQLite symbols private to avoid binding to the JNI bridge's
-independently bundled rusqlite. CMake owns source/header dependency tracking and
-Gradle owns ABI-specific compilation, stripping, and AAR packaging. An AAR
-verification task must check both native libraries for both ABIs, rather than
-treating a successful Rust build as proof of CDC packaging.
+To refresh the CDC binaries, build both ABIs in `SyncLiteNative`, then copy them
+from its `build/android/jniLibs` directory. From the Rust workspace on Windows:
+
+```powershell
+$source = 'C:\work\synclite\repos\SyncLiteNative\build\android\jniLibs'
+foreach ($abi in @('arm64-v8a', 'x86_64')) {
+    New-Item -ItemType Directory -Force "native\android\$abi" | Out-Null
+    Copy-Item "$source\$abi\libsynclitecdc.so" "native\android\$abi\libsynclitecdc.so"
+}
+```
+
+Do not copy the architecture-suffixed desktop `.so` files. Commit both updated
+Android binaries together. The old `android/native/CMakeLists.txt` remains
+available for manual source builds but is not used by Gradle.
 
 Install the following before building:
 
@@ -54,14 +67,15 @@ Install the following before building:
 | Rust | Rust 1.86+ via `rustup` |
 | Cargo NDK | `cargo install cargo-ndk` |
 | Rust Android targets | `rustup target add aarch64-linux-android x86_64-linux-android` |
-| CMake and Ninja | CMake 3.22.1 through Android SDK Manager; builds the custom CDC sidecar (not DuckDB) |
 
 The AAR ships these ABIs:
 
 - `arm64-v8a` for physical Android devices;
 - `x86_64` for Android emulators.
 
-Important: the native CDC sidecar is only supported on Android API 26 or newer. The Android app must set `minSdk` to 26 or higher, and the Gradle/CMake build explicitly rejects lower API levels. This is a build-time requirement for the custom native library, not a PostgreSQL connectivity issue.
+The Android AAR requires API 26 or newer. The CDC prebuilts are built for API 21
+and can run at this higher minimum; the Rust JNI bridge and Gradle module retain
+their API 26 minimum. This is not a PostgreSQL connectivity issue.
 
 ## Build
 
@@ -86,8 +100,8 @@ For a packaging/API-only check, skip the native build explicitly:
 gradle -PskipAndroidRust=true assembleRelease
 ```
 
-This skips only the Rust JNI compilation. CMake still builds and packages the
-custom CDC library for both ABIs. A clean build is not runnable until matching
+This skips only the Rust JNI compilation. Gradle still validates and packages
+the CDC prebuilts for both ABIs. A clean build is not runnable until matching
 ABI-specific `libsynclite_jni.so` files are supplied; an incremental build may
 reuse existing JNI outputs, so this flag is not release validation.
 
